@@ -1,7 +1,11 @@
 {
-    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
-    "python.testing.pytestEnabled": true,
-    "python.testing.pytestArgs": ["backend"],
-    "editor.formatOnSave": true,
-    "python.formatting.provider": "black"
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["backend"],
+  "editor.formatOnSave": true,
+  "python.formatting.provider": "black",
+  "python.analysis.extraPaths": ["${workspaceFolder}/backend/src"],
+  "terminal.integrated.env.windows": {
+    "PYTHONPATH": "src"
+  }
 }
