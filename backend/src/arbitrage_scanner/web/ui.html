@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Арбитражный сканер — Реал-тайм</title>
+  <style>
+    :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa4ad; --row:#161a20; --accent:#4aa3ff; --bad:#ff5a5f; --good:#12d67a; --link:#7ab7ff; --border:#2a2f39; }
+    [data-theme="light"] { --bg:#fff; --fg:#0f172a; --muted:#4b5563; --row:#f8fafc; --accent:#0ea5e9; --bad:#ef4444; --good:#10b981; --link:#2563eb; --border:#e5e7eb; }
+    body { background:var(--bg); color:var(--fg); font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin:0; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); }
+    h1 { font-size:18px; margin:0; }
+    .controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .card { padding:12px 16px; }
+    .table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
+    tr:nth-child(2n){ background:var(--row); }
+    a { color:var(--link); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .badge { font-size:12px; color:var(--muted); }
+    .pos { color:var(--good); }
+    .neg { color:var(--bad); }
+    input[type="number"]{ width:120px; padding:6px 8px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; }
+    label { font-size:14px; color:var(--muted); }
+    .btn { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
+    .sort { cursor:pointer; }
+    .pager { display:flex; gap:8px; align-items:center; justify-content:flex-end; padding:8px 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Арбитражный сканер — Реал-тайм</h1>
+    <div class="controls">
+      <div>
+        <label><input type="checkbox" id="ex-binance" checked> Binance</label>
+        <label><input type="checkbox" id="ex-bybit" checked> Bybit</label>
+      </div>
+      <div>
+        <label>Мин. курсовой спред (%) <input type="number" id="min-entry" step="0.01" value="0"></label>
+      </div>
+      <div>
+        <label>Мин. фандинговый спред (%) <input type="number" id="min-funding" step="0.0001" value="0"></label>
+      </div>
+      <button class="btn" id="theme-toggle">Светлая/Тёмная</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Пара</th>
+          <th>LONG</th>
+          <th>SHORT</th>
+          <th class="sort" data-sort="entry">Вход</th>
+          <th>Выход</th>
+          <th class="sort" data-sort="funding">Спред фандинга</th>
+          <th>Комиссия</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="pager">
+      <button class="btn" id="prev">Назад</button>
+      <span id="pageinfo"></span>
+      <button class="btn" id="next">Вперёд</button>
+    </div>
+  </div>
+
+  <script>
+    const PAGE_SIZE = 50;
+    let sortBy = "entry"; // "entry" | "funding"
+    let sortDir = "desc";
+    let rows = [];
+    let page = 1;
+
+    const exBinance = document.getElementById('ex-binance');
+    const exBybit = document.getElementById('ex-bybit');
+    const minEntry = document.getElementById('min-entry');
+    const minFunding = document.getElementById('min-funding');
+    const tbody = document.getElementById('tbody');
+    const pageinfo = document.getElementById('pageinfo');
+
+    function applyFilters() {
+      const enabledEx = new Set();
+      if (exBinance.checked) enabledEx.add('binance');
+      if (exBybit.checked) enabledEx.add('bybit');
+      const minE = parseFloat(minEntry.value || "0");
+      const minF = parseFloat(minFunding.value || "0");
+
+      let filtered = rows.filter(r => enabledEx.has(r.long_exchange) && enabledEx.has(r.short_exchange));
+      filtered = filtered.filter(r => r.entry_pct >= minE && Math.abs(r.funding_spread) >= minF);
+
+      filtered.sort((a,b)=>{
+        const key = sortBy === "entry" ? "entry_pct" : "funding_spread";
+        const va = a[key], vb = b[key];
+        return sortDir === "desc" ? (vb - va) : (va - vb);
+      });
+
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      if (page > totalPages) page = totalPages;
+      const start = (page - 1) * PAGE_SIZE;
+      const pageRows = filtered.slice(start, start + PAGE_SIZE);
+      render(pageRows);
+      pageinfo.textContent = `Страница ${page} из ${totalPages} (всего ${total})`;
+    }
+
+    function render(rs) {
+      tbody.innerHTML = rs.map(r => {
+        const pairLink = `<a href="/pair/${r.symbol}" target="_blank" rel="noopener" title="Карточка пары">${r.symbol}</a>`;
+        const exLong = `<div><a href="${exchangeUrl(r.long_exchange, r.symbol)}" target="_blank" rel="noopener">${r.long_exchange.toUpperCase()}</a><div class="badge">фандинг: ${(r.funding_long*100).toFixed(4)}% / ${r.funding_interval_long||"—"}</div></div>`;
+        const exShort = `<div><a href="${exchangeUrl(r.short_exchange, r.symbol)}" target="_blank" rel="noopener">${r.short_exchange.toUpperCase()}</a><div class="badge">фандинг: ${(r.funding_short*100).toFixed(4)}% / ${r.funding_interval_short||"—"}</div></div>`;
+        const entryCls = r.entry_pct >= 0 ? "pos" : "neg";
+        const exitCls = r.exit_pct >= 0 ? "pos" : "neg";
+        const fundCls = r.funding_spread >= 0 ? "pos" : "neg";
+        return `<tr>
+          <td>${pairLink}</td>
+          <td>${exLong}</td>
+          <td>${exShort}</td>
+          <td class="${entryCls}">${r.entry_pct.toFixed(4)}%</td>
+          <td class="${exitCls}">${r.exit_pct.toFixed(4)}%</td>
+          <td class="${fundCls}">${(r.funding_spread*100).toFixed(4)}%</td>
+          <td>${r.commission_total_pct.toFixed(4)}%</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function exchangeUrl(ex, sym) {
+      switch (ex) {
+        case "binance": return `https://www.binance.com/en/futures/${sym}`;
+        case "bybit": return `https://www.bybit.com/trade/usdt/${sym}`;
+        default: return "#";
+      }
+    }
+
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const html = document.documentElement;
+      html.setAttribute('data-theme', html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+    });
+
+    document.querySelectorAll('.sort').forEach(th => {
+      th.addEventListener('click', () => {
+        const key = th.dataset.sort;
+        if (sortBy === key) sortDir = (sortDir === "desc") ? "asc" : "desc";
+        else { sortBy = key; sortDir = "desc"; }
+        applyFilters();
+      });
+    });
+
+    document.getElementById('prev').addEventListener('click', () => { if (page>1){ page--; applyFilters(); }});
+    document.getElementById('next').addEventListener('click', () => { page++; applyFilters(); });
+
+    [exBinance, exBybit, minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
+
+    // WS
+    const wsProto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${wsProto}://${location.host}/ws/spreads`);
+    ws.onmessage = (ev) => {
+      try { rows = JSON.parse(ev.data); applyFilters(); } catch (e) {}
+    };
+    ws.onclose = ()=>{ setTimeout(()=>location.reload(), 1500); };
+  </script>
+</body>
+</html>
