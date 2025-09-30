@@ -1,12 +1,13 @@
 from __future__ import annotations
 import asyncio, json
-from typing import Sequence
+from typing import Sequence, Iterable
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
+
 from .settings import settings
 from .store import TickerStore
-from .domain import Symbol
+from .domain import Symbol, ExchangeName
 from .engine.spread_calc import compute_rows, DEFAULT_TAKER_FEES
 from .connectors.binance_futures import run_binance
 from .connectors.bybit_perp import run_bybit
@@ -16,21 +17,24 @@ app = FastAPI(title="Arbitrage Scanner API", version="1.1.0")
 
 store = TickerStore()
 _tasks: list[asyncio.Task] = []
-SYMBOLS: list[Symbol] = []  # наполним на старте
-EXCHANGES = ("binance", "bybit")
+SYMBOLS: list[Symbol] = []   # наполним на старте
+EXCHANGES: tuple[ExchangeName, ...] = ("binance", "bybit")
+
 
 @app.on_event("startup")
 async def startup():
-    # 1) Авто-дискавер пересечения пар
+    # 1) Автоматически найдём пересечение USDT-перпетуалов
     global SYMBOLS
     try:
         SYMBOLS = await discover_common_usdt_perp()
     except Exception:
-        # Фоллбек: минимальный набор
+        # Фоллбек: базовый набор
         SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-    # 2) Запуск коннекторов
+
+    # 2) Запустим ридеры бирж
     _tasks.append(asyncio.create_task(run_binance(store, SYMBOLS)))
     _tasks.append(asyncio.create_task(run_bybit(store, SYMBOLS)))
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -38,9 +42,11 @@ async def shutdown():
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "env": settings.model_dump(), "symbols": SYMBOLS}
+
 
 @app.get("/stats")
 async def stats():
@@ -51,22 +57,30 @@ async def stats():
         "exchanges": EXCHANGES,
     }
 
+
 @app.get("/ui")
 async def ui():
     from .web.ui import html
     return HTMLResponse(html())
 
+
 @app.get("/pair/{symbol}")
 async def pair_card(symbol: str):
-    # Заглушка карточки пары (откроется в новой вкладке). Реализуем на следующем этапе.
+    # Заглушка карточки пары
     return PlainTextResponse(f"Страница пары {symbol} (в разработке)")
+
 
 @app.websocket("/ws/spreads")
 async def ws_spreads(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            rows = compute_rows(store, symbols=SYMBOLS, exchanges=EXCHANGES, taker_fees=DEFAULT_TAKER_FEES)
+            rows = compute_rows(
+                store,
+                symbols=SYMBOLS,
+                exchanges=EXCHANGES,
+                taker_fees=DEFAULT_TAKER_FEES,
+            )
             payload = [r.as_dict() for r in rows]
             await ws.send_text(json.dumps(payload))
             await asyncio.sleep(1.0)
