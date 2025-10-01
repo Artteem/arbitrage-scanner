@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+
+import httpx
+import json
 import time
 from typing import Sequence
 
-import httpx
+import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+
 
 TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
@@ -22,6 +26,7 @@ def _as_float(value) -> float:
 
 
 def _to_mexc_symbol(symbol: Symbol) -> str:
+
     if "_" in symbol:
         return symbol
     if symbol.endswith("USDT"):
@@ -29,10 +34,13 @@ def _to_mexc_symbol(symbol: Symbol) -> str:
     return symbol
 
 
+
 def _from_mexc_symbol(symbol: str | None) -> Symbol | None:
+
     if not symbol:
         return None
     return symbol.replace("_", "")
+
 
 
 def _extract_bid(item) -> float:
@@ -124,3 +132,14 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
                     store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
 
             await asyncio.sleep(POLL_INTERVAL)
+
+async def _reconnect(url: str):
+    while True:
+        try:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=20, close_timeout=5
+            ) as ws:
+                yield ws
+        except Exception:
+            await asyncio.sleep(2)
+            continue
