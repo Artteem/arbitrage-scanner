@@ -1,4 +1,4 @@
-from arbitrage_scanner.connectors.bingx_perp import _iter_ws_payloads
+from arbitrage_scanner.connectors.bingx_perp import _extract_price, _iter_ws_payloads
 
 
 def test_iter_ws_payloads_handles_snapshot_action():
@@ -108,3 +108,13 @@ def test_iter_ws_payloads_handles_list_data_type():
             },
         )
     ]
+
+
+def test_extract_price_supports_short_keys():
+    payload = {"b": "123.45", "a": "123.55"}
+
+    bid = _extract_price(payload, ("bestBid", "bid", "bp", "b"))
+    ask = _extract_price(payload, ("bestAsk", "ask", "ap", "a"))
+
+    assert bid == 123.45
+    assert ask == 123.55

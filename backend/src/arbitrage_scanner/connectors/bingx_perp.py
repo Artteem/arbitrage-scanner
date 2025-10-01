@@ -162,6 +162,10 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                             "bid1",
                             "bid1Price",
                             "bp",
+                            "bidPx",
+                            "bestBidPx",
+                            "b",
+                            "buyPrice",
                         ),
                     )
                     ask = _extract_price(
@@ -174,6 +178,10 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                             "ask1",
                             "ask1Price",
                             "ap",
+                            "askPx",
+                            "bestAskPx",
+                            "a",
+                            "sellPrice",
                         ),
                     )
 
@@ -500,6 +508,10 @@ async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> Non
                         "bid1",
                         "bid1Price",
                         "bp",
+                        "bidPx",
+                        "bestBidPx",
+                        "b",
+                        "buyPrice",
                     ),
                 )
                 ask = _extract_price(
@@ -512,6 +524,10 @@ async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> Non
                         "ask1",
                         "ask1Price",
                         "ap",
+                        "askPx",
+                        "bestAskPx",
+                        "a",
+                        "sellPrice",
                     ),
                 )
                 if bid <= 0 or ask <= 0:
