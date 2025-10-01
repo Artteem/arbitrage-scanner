@@ -24,6 +24,7 @@ REQUEST_HEADERS = {
     "Origin": "https://bingx.com",
 }
 POLL_INTERVAL = 1.5
+HTTP_RELAX_INTERVAL = 6.0
 
 WS_ENDPOINTS = (
     "wss://open-api-ws.bingx.com/market",
@@ -110,15 +111,31 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not symbols:
         return
 
+    ws_ready = asyncio.Event()
+    tasks = [
+        asyncio.create_task(_poll_bingx_http(store, symbols, ws_ready)),
+        asyncio.create_task(_run_bingx_ws(store, symbols, ws_ready)),
+    ]
+
     try:
-        await _run_bingx_ws(store, symbols)
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
     except Exception:
-        await _poll_bingx_http(store, symbols)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
-async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+async def _run_bingx_ws(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+    ready_event: asyncio.Event | None = None,
+) -> None:
     wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
     if not wanted_common:
         return
@@ -197,6 +214,8 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                             ts=time.time(),
                         )
                     )
+                    if ready_event and not ready_event.is_set():
+                        ready_event.set()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -437,7 +456,11 @@ def _extract_topic_symbol(data_type) -> str | None:
     return None
 
 
-async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+async def _poll_bingx_http(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+    ws_ready: asyncio.Event | None = None,
+) -> None:
     wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
     if not wanted_common:
         return
@@ -547,4 +570,7 @@ async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> Non
                     )
                 )
 
-            await asyncio.sleep(POLL_INTERVAL)
+            if ws_ready and ws_ready.is_set():
+                await asyncio.sleep(HTTP_RELAX_INTERVAL)
+            else:
+                await asyncio.sleep(POLL_INTERVAL)
