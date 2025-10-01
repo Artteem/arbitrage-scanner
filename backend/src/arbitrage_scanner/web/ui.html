@@ -41,6 +41,13 @@
       <div>
         <label>Мин. фандинговый спред (%) <input type="number" id="min-funding" step="0.0001" value="0"></label>
       </div>
+      <div>
+        <label>Только пары с биржей
+          <select id="focus-exchange">
+            <option value="">Все</option>
+          </select>
+        </label>
+      </div>
       <button class="btn" id="theme-toggle">Светлая/Тёмная</button>
     </div>
   </header>
@@ -82,6 +89,8 @@
 
     const exchangeFiltersContainer = document.getElementById('exchange-filters');
     const exchangeInputs = new Map();
+    const focusSelect = document.getElementById('focus-exchange');
+    let focusExchange = focusSelect ? (focusSelect.value || "") : "";
  
     const minEntry = document.getElementById('min-entry');
     const minFunding = document.getElementById('min-funding');
@@ -111,6 +120,9 @@
             return longOk && shortOk;
           });
         }
+      }
+      if (focusExchange) {
+        filtered = filtered.filter(r => r.long_exchange === focusExchange || r.short_exchange === focusExchange);
       }
       filtered = filtered.filter(r => r.entry_pct >= minE && Math.abs(r.funding_spread) >= minF);
 
@@ -193,6 +205,13 @@
     document.getElementById('next').addEventListener('click', () => { page++; applyFilters(); });
 
     [minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
+    if (focusSelect) {
+      focusSelect.addEventListener('change', () => {
+        focusExchange = focusSelect.value || "";
+        page = 1;
+        applyFilters();
+      });
+    }
 
     function renderExchangeFilters(exchanges) {
       if (!Array.isArray(exchanges) || exchanges.length === 0) return;
@@ -209,6 +228,33 @@
 
       const normalized = Array.from(new Set(exchanges.map(ex => String(ex)))).sort((a, b) => a.localeCompare(b));
       const hadManualSelection = prevTotal > 0 && prevSelected.size < prevTotal;
+
+      if (focusSelect) {
+        const prevFocus = focusExchange;
+        focusSelect.innerHTML = '';
+        const defaultOption = document.createElement('option');
+        defaultOption.value = '';
+        defaultOption.textContent = 'Все';
+        focusSelect.appendChild(defaultOption);
+        normalized.forEach(ex => {
+          const option = document.createElement('option');
+          option.value = ex;
+          option.textContent = ex.toUpperCase();
+          if (prevFocus === ex) {
+            option.selected = true;
+          }
+          focusSelect.appendChild(option);
+        });
+        if (prevFocus && !normalized.includes(prevFocus)) {
+          focusExchange = '';
+          focusSelect.value = '';
+        } else if (prevFocus) {
+          focusSelect.value = prevFocus;
+          focusExchange = prevFocus;
+        } else {
+          focusExchange = focusSelect.value || '';
+        }
+      }
 
       normalized.forEach(ex => {
         const label = document.createElement('label');
