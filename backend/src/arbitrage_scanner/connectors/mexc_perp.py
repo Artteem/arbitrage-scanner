@@ -9,6 +9,8 @@ import httpx
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 
+MIN_SYMBOL_THRESHOLD = 5
+
 TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
 FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
 POLL_INTERVAL = 1.5
@@ -68,6 +70,8 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
         return
 
     wanted = {_to_mexc_symbol(sym) for sym in symbols}
+    if len(wanted) < MIN_SYMBOL_THRESHOLD:
+        wanted = set()
 
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
@@ -87,7 +91,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
                 funding_items = funding_resp.json().get("data", [])
                 for item in funding_items:
                     sym_raw = item.get("symbol")
-                    if sym_raw not in wanted:
+                    if wanted and sym_raw not in wanted:
                         continue
                     rate = _as_float(item.get("fundingRate") or item.get("rate"))
                     interval = _parse_interval(item)
@@ -97,7 +101,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 
             for item in ticker_data:
                 sym_raw = item.get("symbol")
-                if sym_raw not in wanted:
+                if wanted and sym_raw not in wanted:
                     continue
 
                 bid = _extract_bid(item)

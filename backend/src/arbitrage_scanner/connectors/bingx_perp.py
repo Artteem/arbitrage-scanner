@@ -11,6 +11,7 @@ import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .discovery import discover_bingx_usdt_perp
 
 TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
@@ -34,6 +35,7 @@ WS_ENDPOINTS = (
 )
 WS_SUB_CHUNK = 80
 WS_SUB_DELAY = 0.05
+MIN_SYMBOL_THRESHOLD = 5
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
@@ -91,7 +93,7 @@ def _from_bingx_symbol(symbol: str | None) -> Symbol | None:
     return symbol.replace("-", "").replace("_", "").upper()
 
 
-def _build_param_candidates(wanted_exchange: set[str]) -> list[dict[str, str] | None]:
+def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, str] | None]:
     candidates: list[dict[str, str] | None] = []
 
     def _add(candidate: dict[str, str] | None) -> None:
@@ -108,13 +110,26 @@ def _build_param_candidates(wanted_exchange: set[str]) -> list[dict[str, str] | 
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    if not symbols:
+    subscribe = list(dict.fromkeys(symbols))
+    http_fetch_all = False
+
+    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
+        try:
+            discovered = await discover_bingx_usdt_perp()
+        except Exception:
+            discovered = set()
+        if discovered:
+            subscribe = sorted(discovered)
+        else:
+            http_fetch_all = True
+
+    if not subscribe and not http_fetch_all:
         return
 
     ws_ready = asyncio.Event()
     tasks = [
-        asyncio.create_task(_poll_bingx_http(store, symbols, ws_ready)),
-        asyncio.create_task(_run_bingx_ws(store, symbols, ws_ready)),
+        asyncio.create_task(_poll_bingx_http(store, subscribe, ws_ready, http_fetch_all)),
+        asyncio.create_task(_run_bingx_ws(store, subscribe, ws_ready)),
     ]
 
     try:
@@ -460,12 +475,13 @@ async def _poll_bingx_http(
     store: TickerStore,
     symbols: Sequence[Symbol],
     ws_ready: asyncio.Event | None = None,
+    fetch_all: bool = False,
 ) -> None:
     wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
-    if not wanted_common:
+    if not wanted_common and not fetch_all:
         return
 
-    wanted_exchange = {_to_bingx_symbol(sym) for sym in wanted_common}
+    wanted_exchange = None if fetch_all else {_to_bingx_symbol(sym) for sym in wanted_common}
     param_candidates = _build_param_candidates(wanted_exchange)
     params_idx = 0
     url_idx = 0
@@ -515,7 +531,7 @@ async def _poll_bingx_http(
                     continue
 
                 normalized_exchange_symbol = _to_bingx_symbol(raw_symbol)
-                if normalized_exchange_symbol not in wanted_exchange:
+                if wanted_exchange is not None and normalized_exchange_symbol not in wanted_exchange:
                     normalized_common = _from_bingx_symbol(raw_symbol)
                     if not normalized_common or normalized_common not in wanted_common:
                         continue
@@ -557,7 +573,7 @@ async def _poll_bingx_http(
                     continue
 
                 common_symbol = _from_bingx_symbol(normalized_exchange_symbol)
-                if not common_symbol or common_symbol not in wanted_common:
+                if wanted_common and (not common_symbol or common_symbol not in wanted_common):
                     continue
 
                 store.upsert_ticker(
