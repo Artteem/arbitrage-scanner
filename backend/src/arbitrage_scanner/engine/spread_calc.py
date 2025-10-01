@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Iterable, Mapping
+from typing import List, Iterable, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
 from ..store import TickerStore
 
@@ -79,23 +79,68 @@ def compute_rows(
     taker_fees: Mapping[ExchangeName, float] = DEFAULT_TAKER_FEES,
 ) -> List[Row]:
     rows: List[Row] = []
-    exs = list(exchanges)
+
+    ordered_symbols: List[Symbol] = []
+    seen_symbols: set[Symbol] = set()
 
     for sym in symbols:
-        # какие биржи реально присутствуют в сторе по этой паре
-        present = [ex for ex in exs if store.get_ticker(ex, sym)]
+        sym_str = Symbol(str(sym))
+        if sym_str in seen_symbols:
+            continue
+        ordered_symbols.append(sym_str)
+        seen_symbols.add(sym_str)
+
+    for sym in store.symbols():
+        if sym in seen_symbols:
+            continue
+        ordered_symbols.append(sym)
+        seen_symbols.add(sym)
+
+    ordered_exchanges: List[ExchangeName] = list(exchanges)
+    seen_exchanges: set[ExchangeName] = set(ordered_exchanges)
+    for ex in store.exchanges():
+        if ex in seen_exchanges:
+            continue
+        ordered_exchanges.append(ex)
+        seen_exchanges.add(ex)
+
+    exchange_index: dict[ExchangeName, int] = {
+        ex: idx for idx, ex in enumerate(ordered_exchanges)
+    }
+
+    def _exchange_sort_key(ex: ExchangeName) -> tuple[int, ExchangeName]:
+        return (exchange_index.get(ex, len(exchange_index)), ex)
+
+    for sym in ordered_symbols:
+        data_by_symbol = store.by_symbol(sym)
+        if not data_by_symbol:
+            continue
+
+        present: Sequence[ExchangeName] = sorted(data_by_symbol.keys(), key=_exchange_sort_key)
+        if len(present) < 2:
+            continue
+
         for long_ex in present:
+            long_payload = data_by_symbol.get(long_ex)
+            if not long_payload:
+                continue
+            long_t = long_payload.get("ticker")
+            if not long_t:
+                continue
+
             for short_ex in present:
                 if long_ex == short_ex:
                     continue
 
-                long_t = store.get_ticker(long_ex, sym)
-                short_t = store.get_ticker(short_ex, sym)
-                if not long_t or not short_t:
+                short_payload = data_by_symbol.get(short_ex)
+                if not short_payload:
+                    continue
+                short_t = short_payload.get("ticker")
+                if not short_t:
                     continue
 
-                fl = store.get_funding(long_ex, sym)
-                fs = store.get_funding(short_ex, sym)
+                fl = long_payload.get("funding")
+                fs = short_payload.get("funding")
 
                 entry = _entry(short_t.bid, long_t.ask)
                 exitv = _exit(long_t.bid, short_t.ask)

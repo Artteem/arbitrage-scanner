@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Set
 
 from .base import ConnectorSpec
+from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -81,9 +82,7 @@ async def discover_mexc_usdt_perp() -> Set[str]:
 
 
 def _bingx_symbol_to_common(symbol: str | None) -> str | None:
-    if not symbol:
-        return None
-    return symbol.replace("-", "").replace("_", "").upper()
+    return normalize_bingx_symbol(symbol)
 
 
 async def discover_bingx_usdt_perp() -> Set[str]:
