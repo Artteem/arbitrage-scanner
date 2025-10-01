@@ -90,7 +90,9 @@
 
     function applyFilters() {
       const enabledEx = new Set();
+      const knownEx = new Set();
       exchangeInputs.forEach((input, ex) => {
+        knownEx.add(ex);
         if (input.checked) enabledEx.add(ex);
       });
       const minE = parseFloat(minEntry.value || "0");
@@ -101,7 +103,13 @@
         if (enabledEx.size === 0) {
           filtered = [];
         } else {
-          filtered = rows.filter(r => enabledEx.has(r.long_exchange) && enabledEx.has(r.short_exchange));
+          filtered = rows.filter(r => {
+            const longKnown = knownEx.has(r.long_exchange);
+            const shortKnown = knownEx.has(r.short_exchange);
+            const longOk = !longKnown || enabledEx.has(r.long_exchange);
+            const shortOk = !shortKnown || enabledEx.has(r.short_exchange);
+            return longOk && shortOk;
+          });
         }
       }
       filtered = filtered.filter(r => r.entry_pct >= minE && Math.abs(r.funding_spread) >= minF);
@@ -190,20 +198,25 @@
       if (!Array.isArray(exchanges) || exchanges.length === 0) return;
 
       const prevSelected = new Set();
-      exchangeInputs.forEach((input, ex) => { if (input.checked) prevSelected.add(ex); });
+      let prevTotal = 0;
+      exchangeInputs.forEach((input, ex) => {
+        prevTotal += 1;
+        if (input.checked) prevSelected.add(ex);
+      });
 
       exchangeFiltersContainer.innerHTML = '';
       exchangeInputs.clear();
 
       const normalized = Array.from(new Set(exchanges.map(ex => String(ex)))).sort((a, b) => a.localeCompare(b));
-      const hasPrevSelection = prevSelected.size > 0;
+      const hadManualSelection = prevTotal > 0 && prevSelected.size < prevTotal;
 
       normalized.forEach(ex => {
         const label = document.createElement('label');
         const input = document.createElement('input');
         input.type = 'checkbox';
         input.id = `ex-${ex}`;
-        input.checked = hasPrevSelection ? prevSelected.has(ex) : true;
+        const wasSelected = prevSelected.has(ex);
+        input.checked = wasSelected || !hadManualSelection;
         input.addEventListener('input', () => { page = 1; applyFilters(); });
 
         label.appendChild(input);
@@ -230,7 +243,7 @@
 
       // Фоллбек на случай ошибок запроса
       if (exchangeInputs.size === 0) {
-        renderExchangeFilters(['binance', 'bybit']);
+        renderExchangeFilters(['binance', 'bybit', 'mexc', 'bingx']);
       }
     }
 

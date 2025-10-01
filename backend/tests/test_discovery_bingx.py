@@ -1,6 +1,7 @@
 import pytest
 
 from arbitrage_scanner.connectors import discovery
+from arbitrage_scanner.connectors.bingx_utils import normalize_bingx_symbol
 
 
 class _DummyResponse:
@@ -40,3 +41,8 @@ async def test_discover_bingx_usdt_perp(monkeypatch):
     symbols = await discovery.discover_bingx_usdt_perp()
 
     assert symbols == {"BTCUSDT", "ETHUSDT"}
+
+
+def test_normalize_bingx_symbol_removes_suffixes():
+    assert normalize_bingx_symbol("btc-usdt-umcbl") == "BTCUSDT"
+    assert normalize_bingx_symbol("LTCUSDC_PERP") == "LTCUSDC"
