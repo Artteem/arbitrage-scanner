@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-"""Backward-compatible alias for the renamed BingX connector."""
-
 from .base import ConnectorSpec
 from .bingx_perp import run_bingx
 
