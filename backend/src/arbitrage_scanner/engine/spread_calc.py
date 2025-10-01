@@ -9,6 +9,8 @@ from ..store import TickerStore
 DEFAULT_TAKER_FEES: dict[ExchangeName, float] = {
     "binance": 0.0005,  # 0.05%
     "bybit":   0.0006,  # 0.06%
+    "mexc":   0.0006,  # 0.06%
+    "bingx":  0.0005,  # 0.05%
 }
 
 @dataclass

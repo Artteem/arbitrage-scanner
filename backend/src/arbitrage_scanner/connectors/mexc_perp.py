@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+
+import httpx
 import json
 import time
 from typing import Sequence
@@ -10,11 +12,21 @@ import websockets
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 
-WS = "wss://contract.mexc.com/ws"
+
+TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
+FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
+POLL_INTERVAL = 1.5
+
+
+def _as_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _to_mexc_symbol(symbol: Symbol) -> str:
-    # Биржа MEXC использует формат вида BTC_USDT, мы поддерживаем USDT-пары
+
     if "_" in symbol:
         return symbol
     if symbol.endswith("USDT"):
@@ -22,77 +34,104 @@ def _to_mexc_symbol(symbol: Symbol) -> str:
     return symbol
 
 
-def _from_mexc_symbol(symbol: str | None) -> str | None:
+
+def _from_mexc_symbol(symbol: str | None) -> Symbol | None:
+
     if not symbol:
         return None
     return symbol.replace("_", "")
 
 
-async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    mapped = [_to_mexc_symbol(str(sym)) for sym in symbols]
 
-    async for ws in _reconnect(WS):
-        try:
-            # подписываемся на тикеры и ставки финансирования
-            for idx, sym in enumerate(mapped, start=1):
-                await ws.send(
-                    json.dumps({"method": "sub.ticker", "params": [sym], "id": idx})
-                )
-                await asyncio.sleep(0.05)
-                await ws.send(
-                    json.dumps(
-                        {
-                            "method": "sub.fundingRate",
-                            "params": [sym],
-                            "id": idx + 10_000,
-                        }
-                    )
-                )
-                await asyncio.sleep(0.05)
+def _extract_bid(item) -> float:
+    for key in ("bid1", "bestBidPrice", "bestBid"):
+        val = item.get(key)
+        bid = _as_float(val)
+        if bid > 0:
+            return bid
+    return 0.0
 
-            async for raw in ws:
-                data = json.loads(raw)
 
-                if "ping" in data:
-                    await ws.send(json.dumps({"pong": data["ping"]}))
+def _extract_ask(item) -> float:
+    for key in ("ask1", "bestAskPrice", "bestAsk"):
+        val = item.get(key)
+        ask = _as_float(val)
+        if ask > 0:
+            return ask
+    return 0.0
+
+
+def _parse_interval(item) -> str:
+    interval = item.get("fundingInterval") or item.get("interval")
+    if isinstance(interval, (int, float)):
+        # значение в часах
+        return f"{interval}h"
+    if isinstance(interval, str) and interval:
+        return interval
+    return "8h"
+
+
+async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
+    if not symbols:
+        return
+
+    wanted = {_to_mexc_symbol(sym) for sym in symbols}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        while True:
+            now = time.time()
+            try:
+                ticker_resp = await client.get(TICKERS_URL)
+                ticker_resp.raise_for_status()
+                ticker_data = ticker_resp.json().get("data", [])
+            except Exception:
+                await asyncio.sleep(2.0)
+                continue
+
+            funding_map: dict[str, tuple[float, str]] = {}
+            try:
+                funding_resp = await client.get(FUNDING_URL)
+                funding_resp.raise_for_status()
+                funding_items = funding_resp.json().get("data", [])
+                for item in funding_items:
+                    sym_raw = item.get("symbol")
+                    if sym_raw not in wanted:
+                        continue
+                    rate = _as_float(item.get("fundingRate") or item.get("rate"))
+                    interval = _parse_interval(item)
+                    funding_map[sym_raw] = (rate, interval)
+            except Exception:
+                funding_map = {}
+
+            for item in ticker_data:
+                sym_raw = item.get("symbol")
+                if sym_raw not in wanted:
                     continue
 
-                channel = data.get("channel") or data.get("method")
-                if channel == "push.ticker":
-                    payload = data.get("data") or {}
-                    sym = _from_mexc_symbol(payload.get("symbol"))
-                    if not sym:
-                        continue
+                bid = _extract_bid(item)
+                ask = _extract_ask(item)
+                if bid <= 0 or ask <= 0:
+                    continue
 
-                    bid_val = payload.get("bid1") or payload.get("bid")
-                    ask_val = payload.get("ask1") or payload.get("ask")
-                    try:
-                        bid = float(bid_val)
-                        ask = float(ask_val)
-                    except (TypeError, ValueError):
-                        continue
-                    if bid <= 0 or ask <= 0:
-                        continue
-                    store.upsert_ticker(
-                        Ticker(exchange="mexc", symbol=sym, bid=bid, ask=ask, ts=time.time())
+                sym_common = _from_mexc_symbol(sym_raw)
+                if not sym_common:
+                    continue
+
+                store.upsert_ticker(
+                    Ticker(
+                        exchange="mexc",
+                        symbol=sym_common,
+                        bid=bid,
+                        ask=ask,
+                        ts=now,
                     )
+                )
 
-                elif channel == "push.fundingRate":
-                    payload = data.get("data") or {}
-                    sym = _from_mexc_symbol(payload.get("symbol"))
-                    if not sym:
-                        continue
-                    rate_val = payload.get("fundingRate") or payload.get("rate")
-                    try:
-                        rate = float(rate_val)
-                    except (TypeError, ValueError):
-                        continue
-                    interval = str(payload.get("fundingInterval") or payload.get("interval") or "8h")
-                    store.upsert_funding("mexc", sym, rate=rate, interval=interval, ts=time.time())
+                if sym_raw in funding_map:
+                    rate, interval = funding_map[sym_raw]
+                    store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
 
-        except Exception:
-            await asyncio.sleep(1)
-
+            await asyncio.sleep(POLL_INTERVAL)
 
 async def _reconnect(url: str):
     while True:

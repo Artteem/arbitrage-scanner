@@ -5,7 +5,7 @@ class Settings(BaseModel):
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     enabled_exchanges: list[str] = [
         ex.strip()
-        for ex in os.getenv("ENABLED_EXCHANGES", "binance,bybit").split(",")
+        for ex in os.getenv("ENABLED_EXCHANGES", "binance,bybit,mexc,bingx").split(",")
         if ex.strip()
     ]
     http_timeout: int = int(os.getenv("HTTP_TIMEOUT", "10"))

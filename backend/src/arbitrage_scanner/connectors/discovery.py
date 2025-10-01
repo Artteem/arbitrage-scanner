@@ -1,8 +1,10 @@
 from __future__ import annotations
 import httpx
-from typing import Iterable, List, Set
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Set
 
 from .base import ConnectorSpec
+from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
@@ -34,6 +36,24 @@ async def discover_bybit_linear_usdt() -> Set[str]:
     return out
 
 
+def _mexc_symbol_to_common(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    return symbol.replace("_", "")
+
+def _is_trading_state(state: str) -> bool:
+    if not state:
+        return True
+    st = state.strip().lower()
+    return st in {"1", "2", "trading", "online", "open"}
+
+def _is_perpetual(kind: str) -> bool:
+    if not kind:
+        return True
+    k = kind.strip().lower()
+    return "perpetual" in k or "swap" in k
+
+
 async def discover_mexc_usdt_perp() -> Set[str]:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(MEXC_CONTRACTS)
@@ -41,36 +61,69 @@ async def discover_mexc_usdt_perp() -> Set[str]:
         data = r.json()
 
     out: Set[str] = set()
-    items = data.get("data") or []
-    for it in items:
-        quote = (it.get("quoteCurrency") or it.get("settleCurrency") or "").upper()
+
+    for item in data.get("data", []):
+        sym = _mexc_symbol_to_common(item.get("symbol"))
+        quote = str(
+            item.get("quoteCurrency")
+            or item.get("quoteCoin")
+            or item.get("settleCurrency")
+            or item.get("settlementCurrency")
+            or ""
+        ).upper()
         if quote != "USDT":
             continue
-
-        state = str(it.get("state") or it.get("status") or "").lower()
-        if state and state not in {"1", "trading", "online", "enabled", "open", "normal"}:
+        if not _is_perpetual(str(item.get("contractType") or item.get("type") or "")):
             continue
-
-        sym = it.get("symbol")
-        if not sym:
+        if not _is_trading_state(str(item.get("state") or item.get("status") or "")):
             continue
-        norm = sym.replace("_", "")
-        if norm:
-            out.add(norm)
+        if sym:
+            out.add(sym)
     return out
 
-async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
-    """Вернуть отсортированное пересечение тикеров для всех коннекторов."""
 
-    discovered: List[Set[str]] = []
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """Результат авто-обнаружения тикеров."""
+
+    symbols_union: List[Symbol]
+    per_connector: Dict[ExchangeName, List[Symbol]]
+
+
+async def discover_symbols_for_connectors(connectors: Iterable[ConnectorSpec]) -> DiscoveryResult:
+    """Собрать тикеры USDT-перпетуалов для каждого коннектора.
+
+    Возвращает объединение по всем биржам и словарь вида
+    ``{"binance": [...], "bybit": [...]}``.
+    """
+
+    discovered: Dict[ExchangeName, Set[Symbol]] = {}
     for connector in connectors:
         if connector.discover_symbols is None:
             continue
         symbols = await connector.discover_symbols()
-        discovered.append({str(sym) for sym in symbols})
+        symbol_set = {Symbol(str(sym)) for sym in symbols if str(sym)}
+        if symbol_set:
+            discovered[connector.name] = symbol_set
 
     if not discovered:
+        return DiscoveryResult(symbols_union=[], per_connector={})
+
+    union = sorted(set.union(*discovered.values()))
+    per_connector = {name: sorted(values) for name, values in discovered.items()}
+    return DiscoveryResult(symbols_union=union, per_connector=per_connector)
+
+
+async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
+    """Вернуть отсортированное пересечение тикеров для всех коннекторов."""
+
+    result = await discover_symbols_for_connectors(connectors)
+    if not result.per_connector:
         return []
 
-    common = set.intersection(*discovered)
+    sets = [set(items) for items in result.per_connector.values() if items]
+    if not sets:
+        return []
+
+    common = set.intersection(*sets)
     return sorted(common)
