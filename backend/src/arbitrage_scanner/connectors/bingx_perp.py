@@ -11,6 +11,7 @@ import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .bingx_utils import normalize_bingx_symbol
 from .discovery import discover_bingx_usdt_perp
 
 TICKERS_URLS: tuple[str, ...] = (
@@ -53,10 +54,10 @@ def _extract_price(item: dict, keys: Iterable[str]) -> float:
 
 
 def _normalize_common_symbol(symbol: Symbol) -> str:
-    sym = str(symbol).upper()
-    normalized = _from_bingx_symbol(sym)
+    normalized = normalize_bingx_symbol(symbol)
     if normalized:
         return normalized
+    sym = str(symbol).upper()
     return sym.replace("-", "").replace("_", "")
 
 
@@ -88,9 +89,7 @@ def _to_bingx_ws_symbol(symbol: Symbol) -> str:
 
 
 def _from_bingx_symbol(symbol: str | None) -> Symbol | None:
-    if not symbol:
-        return None
-    return symbol.replace("-", "").replace("_", "").upper()
+    return normalize_bingx_symbol(symbol)
 
 
 def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, str] | None]:

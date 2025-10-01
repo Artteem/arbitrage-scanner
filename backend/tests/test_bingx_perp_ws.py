@@ -1,4 +1,8 @@
-from arbitrage_scanner.connectors.bingx_perp import _extract_price, _iter_ws_payloads
+from arbitrage_scanner.connectors.bingx_perp import (
+    _extract_price,
+    _from_bingx_symbol,
+    _iter_ws_payloads,
+)
 
 
 def test_iter_ws_payloads_handles_snapshot_action():
@@ -118,3 +122,8 @@ def test_extract_price_supports_short_keys():
 
     assert bid == 123.45
     assert ask == 123.55
+
+
+def test_from_bingx_symbol_strips_suffixes():
+    assert _from_bingx_symbol("BTCUSDT_UMCBL") == "BTCUSDT"
+    assert _from_bingx_symbol("eth-usdt-perp") == "ETHUSDT"
