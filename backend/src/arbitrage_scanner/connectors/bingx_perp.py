@@ -108,6 +108,143 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
     return candidates
 
 
+def _iter_http_items(payload) -> Iterable[dict]:
+    if isinstance(payload, dict):
+        for key in ("data", "result", "tickers", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                yield from (item for item in value if isinstance(item, dict))
+                return
+            if isinstance(value, dict):
+                yield from (item for item in value.values() if isinstance(item, dict))
+                return
+        yield from (
+            item for item in payload.values() if isinstance(item, dict)
+        )
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                yield item
+
+
+def _process_http_payload(
+    store: TickerStore,
+    payload,
+    wanted_common: set[str],
+    wanted_exchange: set[str] | None,
+    timestamp: float,
+) -> int:
+    processed = 0
+    for raw in _iter_http_items(payload):
+        raw_symbol = raw.get("symbol") or raw.get("market") or raw.get("instId")
+        if not raw_symbol:
+            continue
+
+        normalized_exchange_symbol = _to_bingx_symbol(raw_symbol)
+        if wanted_exchange is not None and normalized_exchange_symbol not in wanted_exchange:
+            normalized_common = _from_bingx_symbol(raw_symbol)
+            if not normalized_common or normalized_common not in wanted_common:
+                continue
+            normalized_exchange_symbol = _to_bingx_symbol(normalized_common)
+
+        bid = _extract_price(
+            raw,
+            (
+                "bestBid",
+                "bestBidPrice",
+                "bid",
+                "bidPrice",
+                "bid1",
+                "bid1Price",
+                "bp",
+                "bidPx",
+                "bestBidPx",
+                "b",
+                "buyPrice",
+            ),
+        )
+        ask = _extract_price(
+            raw,
+            (
+                "bestAsk",
+                "bestAskPrice",
+                "ask",
+                "askPrice",
+                "ask1",
+                "ask1Price",
+                "ap",
+                "askPx",
+                "bestAskPx",
+                "a",
+                "sellPrice",
+            ),
+        )
+        if bid <= 0 or ask <= 0:
+            continue
+
+        common_symbol = _from_bingx_symbol(normalized_exchange_symbol)
+        if wanted_common and (not common_symbol or common_symbol not in wanted_common):
+            continue
+        if not common_symbol:
+            continue
+
+        store.upsert_ticker(
+            Ticker(
+                exchange="bingx",
+                symbol=common_symbol,
+                bid=bid,
+                ask=ask,
+                ts=timestamp,
+            )
+        )
+        processed += 1
+
+    return processed
+
+
+async def _prime_bingx_http(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+    fetch_all: bool,
+) -> bool:
+    wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
+    if not wanted_common and not fetch_all:
+        return False
+
+    wanted_exchange = None if fetch_all else {_to_bingx_symbol(sym) for sym in wanted_common}
+    param_candidates = _build_param_candidates(wanted_exchange)
+    params_idx = 0
+    url_idx = 0
+
+    async with httpx.AsyncClient(timeout=10, headers=REQUEST_HEADERS) as client:
+        attempts = max(len(param_candidates) * len(TICKERS_URLS), 1)
+        for _ in range(attempts):
+            params = param_candidates[params_idx]
+            url = TICKERS_URLS[url_idx]
+            params_idx = (params_idx + 1) % len(param_candidates)
+            url_idx = (url_idx + 1) % len(TICKERS_URLS)
+
+            try:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+            except Exception:
+                continue
+
+            processed = _process_http_payload(
+                store,
+                data,
+                wanted_common,
+                wanted_exchange,
+                time.time(),
+            )
+            if processed:
+                return True
+
+    return False
+
+
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     subscribe = list(dict.fromkeys(symbols))
     http_fetch_all = False
@@ -124,6 +261,11 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
     if not subscribe and not http_fetch_all:
         return
+
+    try:
+        await _prime_bingx_http(store, subscribe, http_fetch_all)
+    except Exception:
+        pass
 
     ws_ready = asyncio.Event()
     tasks = [
@@ -506,84 +648,13 @@ async def _poll_bingx_http(
                 await asyncio.sleep(2.0)
                 continue
 
-            items: Iterable[dict] = []
-            if isinstance(data, dict):
-                for key in ("data", "result", "tickers", "items"):
-                    value = data.get(key)
-                    if isinstance(value, list):
-                        items = value
-                        break
-                    if isinstance(value, dict):
-                        items = value.values()
-                        break
-                else:
-                    items = list(data.values()) if isinstance(data, dict) else []
-            elif isinstance(data, list):
-                items = data
-
-            for raw in items:
-                if not isinstance(raw, dict):
-                    continue
-
-                raw_symbol = raw.get("symbol") or raw.get("market") or raw.get("instId")
-                if not raw_symbol:
-                    continue
-
-                normalized_exchange_symbol = _to_bingx_symbol(raw_symbol)
-                if wanted_exchange is not None and normalized_exchange_symbol not in wanted_exchange:
-                    normalized_common = _from_bingx_symbol(raw_symbol)
-                    if not normalized_common or normalized_common not in wanted_common:
-                        continue
-                    normalized_exchange_symbol = _to_bingx_symbol(normalized_common)
-
-                bid = _extract_price(
-                    raw,
-                    (
-                        "bestBid",
-                        "bestBidPrice",
-                        "bid",
-                        "bidPrice",
-                        "bid1",
-                        "bid1Price",
-                        "bp",
-                        "bidPx",
-                        "bestBidPx",
-                        "b",
-                        "buyPrice",
-                    ),
-                )
-                ask = _extract_price(
-                    raw,
-                    (
-                        "bestAsk",
-                        "bestAskPrice",
-                        "ask",
-                        "askPrice",
-                        "ask1",
-                        "ask1Price",
-                        "ap",
-                        "askPx",
-                        "bestAskPx",
-                        "a",
-                        "sellPrice",
-                    ),
-                )
-                if bid <= 0 or ask <= 0:
-                    continue
-
-                common_symbol = _from_bingx_symbol(normalized_exchange_symbol)
-                if wanted_common and (not common_symbol or common_symbol not in wanted_common):
-                    continue
-
-                store.upsert_ticker(
-                    Ticker(
-                        exchange="bingx",
-                        symbol=common_symbol,
-                        bid=bid,
-                        ask=ask,
-                        ts=now,
-                    )
-                )
+            _process_http_payload(
+                store,
+                data,
+                wanted_common,
+                wanted_exchange,
+                now,
+            )
 
             if ws_ready and ws_ready.is_set():
                 await asyncio.sleep(HTTP_RELAX_INTERVAL)
