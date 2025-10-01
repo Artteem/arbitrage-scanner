@@ -11,13 +11,14 @@ from .domain import Symbol, ExchangeName
 from .engine.spread_calc import compute_rows, DEFAULT_TAKER_FEES
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
-from .connectors.discovery import discover_common_symbols
+from .connectors.discovery import discover_common_symbols, discover_symbols_for_connectors
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.1.0")
 
 store = TickerStore()
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
+CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
 
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
@@ -33,17 +34,24 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 @app.on_event("startup")
 async def startup():
     # 1) Автоматически найдём пересечение USDT-перпетуалов
-    global SYMBOLS
+    global SYMBOLS, CONNECTOR_SYMBOLS
     try:
-        discovered = await discover_common_symbols(CONNECTORS)
-        SYMBOLS = discovered or FALLBACK_SYMBOLS
+        discovery = await discover_symbols_for_connectors(CONNECTORS)
+        if discovery.symbols_union:
+            SYMBOLS = discovery.symbols_union
+            CONNECTOR_SYMBOLS = discovery.per_connector
+        else:
+            SYMBOLS = FALLBACK_SYMBOLS
+            CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
     except Exception:
         # Фоллбек: базовый набор
         SYMBOLS = FALLBACK_SYMBOLS
+        CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
     # 2) Запустим ридеры бирж
     for connector in CONNECTORS:
-        _tasks.append(asyncio.create_task(connector.run(store, SYMBOLS)))
+        symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
+        _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
 
 
 @app.on_event("shutdown")
