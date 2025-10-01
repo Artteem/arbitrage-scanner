@@ -35,6 +35,7 @@
         <label><input type="checkbox" id="ex-binance" checked> Binance</label>
         <label><input type="checkbox" id="ex-bybit" checked> Bybit</label>
         <label><input type="checkbox" id="ex-mexc" checked> MEXC</label>
+        <label><input type="checkbox" id="ex-bigx" checked> BigX</label>
       </div>
       <div>
         <label>Мин. курсовой спред (%) <input type="number" id="min-entry" step="0.01" value="0"></label>
@@ -78,6 +79,7 @@
     const exBinance = document.getElementById('ex-binance');
     const exBybit = document.getElementById('ex-bybit');
     const exMexc = document.getElementById('ex-mexc');
+    const exBigx = document.getElementById('ex-bigx');
     const minEntry = document.getElementById('min-entry');
     const minFunding = document.getElementById('min-funding');
     const tbody = document.getElementById('tbody');
@@ -88,6 +90,7 @@
       if (exBinance.checked) enabledEx.add('binance');
       if (exBybit.checked) enabledEx.add('bybit');
       if (exMexc.checked) enabledEx.add('mexc');
+      if (exBigx.checked) enabledEx.add('bigx');
       const minE = parseFloat(minEntry.value || "0");
       const minF = parseFloat(minFunding.value || "0");
 
@@ -137,6 +140,8 @@
           const mexcSym = sym.replace(/USDT$/, '_USDT');
           return `https://www.mexc.com/futures/${mexcSym}`;
         }
+        case "bigx":
+          return `https://bigx.com/trade/${sym}`;
         default: return "#";
       }
     }
@@ -158,7 +163,7 @@
     document.getElementById('prev').addEventListener('click', () => { if (page>1){ page--; applyFilters(); }});
     document.getElementById('next').addEventListener('click', () => { page++; applyFilters(); });
 
-    [exBinance, exBybit, exMexc, minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
+    [exBinance, exBybit, exMexc, exBigx, minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
 
     // WS
     const wsProto = location.protocol === "https:" ? "wss" : "ws";
