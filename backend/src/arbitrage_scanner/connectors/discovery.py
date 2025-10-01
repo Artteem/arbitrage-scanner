@@ -35,6 +35,7 @@ async def discover_bybit_linear_usdt() -> Set[str]:
             if sym: out.add(sym)
     return out
 
+
 def _mexc_symbol_to_common(symbol: str | None) -> str | None:
     if not symbol:
         return None
@@ -52,6 +53,7 @@ def _is_perpetual(kind: str) -> bool:
     k = kind.strip().lower()
     return "perpetual" in k or "swap" in k
 
+
 async def discover_mexc_usdt_perp() -> Set[str]:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(MEXC_CONTRACTS)
@@ -59,6 +61,7 @@ async def discover_mexc_usdt_perp() -> Set[str]:
         data = r.json()
 
     out: Set[str] = set()
+
     for item in data.get("data", []):
         sym = _mexc_symbol_to_common(item.get("symbol"))
         quote = str(
@@ -77,6 +80,7 @@ async def discover_mexc_usdt_perp() -> Set[str]:
         if sym:
             out.add(sym)
     return out
+
 
 @dataclass(frozen=True)
 class DiscoveryResult:
