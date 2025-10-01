@@ -90,7 +90,9 @@
 
     function applyFilters() {
       const enabledEx = new Set();
+      const knownEx = new Set();
       exchangeInputs.forEach((input, ex) => {
+        knownEx.add(ex);
         if (input.checked) enabledEx.add(ex);
       });
       const minE = parseFloat(minEntry.value || "0");
@@ -101,7 +103,13 @@
         if (enabledEx.size === 0) {
           filtered = [];
         } else {
-          filtered = rows.filter(r => enabledEx.has(r.long_exchange) && enabledEx.has(r.short_exchange));
+          filtered = rows.filter(r => {
+            const longKnown = knownEx.has(r.long_exchange);
+            const shortKnown = knownEx.has(r.short_exchange);
+            const longOk = !longKnown || enabledEx.has(r.long_exchange);
+            const shortOk = !shortKnown || enabledEx.has(r.short_exchange);
+            return longOk && shortOk;
+          });
         }
       }
       filtered = filtered.filter(r => r.entry_pct >= minE && Math.abs(r.funding_spread) >= minF);
@@ -235,7 +243,7 @@
 
       // Фоллбек на случай ошибок запроса
       if (exchangeInputs.size === 0) {
-        renderExchangeFilters(['binance', 'bybit']);
+        renderExchangeFilters(['binance', 'bybit', 'mexc', 'bingx']);
       }
     }
 
