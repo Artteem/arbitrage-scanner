@@ -152,38 +152,38 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
-    bid = _extract_price(
-        payload,
-        (
-            "bestBid",
-            "bestBidPrice",
-            "bid",
-            "bidPrice",
-            "bid1",
-            "bid1Price",
-            "bp",
-            "bidPx",
-            "bestBidPx",
-            "b",
-            "buyPrice",
-        ),
-    )
-    ask = _extract_price(
-        payload,
-        (
-            "bestAsk",
-            "bestAskPrice",
-            "ask",
-            "askPrice",
-            "ask1",
-            "ask1Price",
-            "ap",
-            "askPx",
-            "bestAskPx",
-            "a",
-            "sellPrice",
-        ),
-    )
+                    bid = _extract_price(
+                        payload,
+                        (
+                            "bestBid",
+                            "bestBidPrice",
+                            "bid",
+                            "bidPrice",
+                            "bid1",
+                            "bid1Price",
+                            "bp",
+                            "bidPx",
+                            "bestBidPx",
+                            "b",
+                            "buyPrice",
+                        ),
+                    )
+                    ask = _extract_price(
+                        payload,
+                        (
+                            "bestAsk",
+                            "bestAskPrice",
+                            "ask",
+                            "askPrice",
+                            "ask1",
+                            "ask1Price",
+                            "ap",
+                            "askPx",
+                            "bestAskPx",
+                            "a",
+                            "sellPrice",
+                        ),
+                    )
 
                     if bid <= 0 or ask <= 0:
                         continue
