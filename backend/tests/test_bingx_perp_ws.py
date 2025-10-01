@@ -62,3 +62,49 @@ def test_iter_ws_payloads_supports_alternative_keys():
             },
         )
     ]
+
+
+def test_iter_ws_payloads_uses_data_type_symbol():
+    message = {
+        "dataType": "swap/ticker:BTC-USDT",
+        "data": {
+            "bp": "63000",
+            "ap": "63010",
+        },
+    }
+
+    items = list(_iter_ws_payloads(message))
+
+    assert items == [
+        (
+            "BTC-USDT",
+            {
+                "bp": "63000",
+                "ap": "63010",
+            },
+        )
+    ]
+
+
+def test_iter_ws_payloads_handles_list_data_type():
+    message = {
+        "dataType": ["swap/ticker:ETH-USDT"],
+        "data": {
+            "pair": "ETH-USDT",
+            "bid1Price": "3500",
+            "ask1Price": "3501",
+        },
+    }
+
+    items = list(_iter_ws_payloads(message))
+
+    assert items == [
+        (
+            "ETH-USDT",
+            {
+                "pair": "ETH-USDT",
+                "bid1Price": "3500",
+                "ask1Price": "3501",
+            },
+        )
+    ]

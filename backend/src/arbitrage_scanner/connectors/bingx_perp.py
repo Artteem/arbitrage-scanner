@@ -12,7 +12,11 @@ import websockets
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 
-TICKERS_URL = "https://bingx.com/api/v3/contract/tickers"
+TICKERS_URLS: tuple[str, ...] = (
+    "https://bingx.com/api/v3/contract/tickers",
+    "https://open-api.bingx.com/openApi/swap/v2/market/getLatest",
+    "https://open-api.bingx.com/openApi/swap/v3/market/getLatest",
+)
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -24,6 +28,8 @@ POLL_INTERVAL = 1.5
 WS_ENDPOINTS = (
     "wss://open-api-ws.bingx.com/market",
     "wss://open-api-ws.bingx.com/market?compress=false",
+    "wss://open-api-swap.bingx.com/swap-market",
+    "wss://open-api-swap.bingx.com/swap-market?compress=false",
 )
 WS_SUB_CHUNK = 80
 WS_SUB_DELAY = 0.05
@@ -209,21 +215,31 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
     if not symbols:
         return
 
+    def _next_id() -> str:
+        return str(int(time.time() * 1_000))
+
     payloads = [
         {
-            "id": str(int(time.time() * 1_000)),
+            "id": _next_id(),
             "action": "subscribe",
             "params": {"channel": "ticker", "instId": list(symbols)},
         },
         {
-            "id": str(int(time.time() * 1_000)),
+            "id": _next_id(),
             "action": "subscribe",
             "params": {"channel": "ticker", "symbols": list(symbols)},
         },
     ]
 
     market_topics = [f"market.{sym}.ticker" for sym in symbols]
-    payloads.append({"id": str(int(time.time() * 1_000)), "reqType": "sub", "dataType": market_topics})
+    payloads.append({"id": _next_id(), "reqType": "sub", "dataType": market_topics})
+
+    swap_topics = [f"swap/ticker:{sym}" for sym in symbols]
+    payloads.append({"id": _next_id(), "reqType": "sub", "dataType": swap_topics})
+    payloads.extend(
+        {"id": _next_id(), "reqType": "sub", "dataType": topic}
+        for topic in swap_topics
+    )
 
     for payload in payloads:
         try:
@@ -319,6 +335,10 @@ def _iter_ws_payloads(message: dict) -> Iterable[tuple[str, dict]]:
         if isinstance(candidate, str):
             default_symbol = candidate
 
+    topic_symbol = _extract_topic_symbol(message.get("dataType"))
+    if topic_symbol:
+        default_symbol = topic_symbol
+
     return list(_iter_payload_items(payload, default_symbol))
 
 
@@ -357,7 +377,7 @@ def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[s
 
 
 def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str | None) -> str | None:
-    for key in ("symbol", "instId", "s", "market"):
+    for key in ("symbol", "instId", "s", "market", "pair"):
         val = payload.get(key)
         if isinstance(val, str) and val:
             return val
@@ -376,6 +396,39 @@ def _normalize_ws_symbol(symbol: str) -> str:
     return sym
 
 
+def _extract_topic_symbol(data_type) -> str | None:
+    if isinstance(data_type, (list, tuple, set)):
+        for item in data_type:
+            symbol = _extract_topic_symbol(item)
+            if symbol:
+                return symbol
+        return None
+
+    if isinstance(data_type, str) and data_type:
+        segments: list[str] = []
+        if ":" in data_type:
+            segments.extend(part for part in data_type.split(":") if part)
+        if not segments:
+            segments = [data_type]
+
+        for segment in segments:
+            candidate = segment.strip()
+            if not candidate:
+                continue
+            if "/" in candidate:
+                candidate = candidate.split("/", maxsplit=1)[-1]
+            if candidate.lower().startswith("swap/ticker") and ":" in candidate:
+                candidate = candidate.split(":", maxsplit=1)[-1]
+            if candidate.lower().startswith("ticker."):
+                candidate = candidate.split(".", maxsplit=1)[-1]
+            if "." in candidate and "-" in candidate.split(".")[-1]:
+                candidate = candidate.split(".")[-1]
+            candidate = candidate.replace("_", "-")
+            if "-" in candidate:
+                return candidate.upper()
+    return None
+
+
 async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
     if not wanted_common:
@@ -384,22 +437,26 @@ async def _poll_bingx_http(store: TickerStore, symbols: Sequence[Symbol]) -> Non
     wanted_exchange = {_to_bingx_symbol(sym) for sym in wanted_common}
     param_candidates = _build_param_candidates(wanted_exchange)
     params_idx = 0
+    url_idx = 0
 
     async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
         while True:
             now = time.time()
             params = param_candidates[params_idx]
+            url = TICKERS_URLS[url_idx]
             try:
-                response = await client.get(TICKERS_URL, params=params)
+                response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
             except httpx.HTTPStatusError:
                 params_idx = (params_idx + 1) % len(param_candidates)
+                url_idx = (url_idx + 1) % len(TICKERS_URLS)
                 await asyncio.sleep(1.5)
                 continue
             except asyncio.CancelledError:
                 raise
             except Exception:
+                url_idx = (url_idx + 1) % len(TICKERS_URLS)
                 await asyncio.sleep(2.0)
                 continue
 
