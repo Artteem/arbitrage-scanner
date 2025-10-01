@@ -291,10 +291,24 @@ def _iter_ws_payloads(message: dict) -> Iterable[tuple[str, dict]]:
         return []
 
     action = message.get("action")
-    if isinstance(action, str) and action.lower() != "push":
-        return []
+    if isinstance(action, str):
+        normalized = action.strip().lower()
+        # Сообщения о подписке/ошибке не содержат рыночных данных и могут
+        # безболезненно игнорироваться. BingX в последнее время стал
+        # использовать значения вроде "snapshot"/"update" для тикеров, так что
+        # фильтруем только явные служебные статусы.
+        if normalized in {"subscribe", "sub", "unsubscribe", "unsub", "error"}:
+            return []
 
     payload = message.get("data")
+    if payload is None:
+        # На всякий случай поддерживаем альтернативные ключи, которые BingX
+        # возвращает в ряде эндпоинтов.
+        for key in ("tickers", "items", "result"):
+            cand = message.get(key)
+            if cand is not None:
+                payload = cand
+                break
     default_symbol: str | None = None
 
     arg = message.get("arg")
