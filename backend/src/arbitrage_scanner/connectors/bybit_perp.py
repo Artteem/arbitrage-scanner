@@ -4,17 +4,32 @@ from typing import Sequence, List
 import websockets
 from ..domain import Ticker, Symbol
 from ..store import TickerStore
+from .discovery import discover_bybit_linear_usdt
 
 WS = "wss://stream.bybit.com/v5/public/linear"
 CHUNK = 100  # безопасный размер по числу подписок
 
+MIN_SYMBOL_THRESHOLD = 5
+
 async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]):
+    subscribe = list(dict.fromkeys(symbols))
+    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
+        try:
+            discovered = await discover_bybit_linear_usdt()
+        except Exception:
+            discovered = set()
+        if discovered:
+            subscribe = sorted(discovered)
+
+    if not subscribe:
+        return
+
     # По Bybit v5: подписка вида args=["tickers.BTCUSDT","tickers.ETHUSDT", ...]
     async for ws in _reconnect(WS):
         try:
             # разбиваем на чанки и шлём несколько subscribe
-            for i in range(0, len(symbols), CHUNK):
-                batch = symbols[i:i+CHUNK]
+            for i in range(0, len(subscribe), CHUNK):
+                batch = subscribe[i:i+CHUNK]
                 args = [f"tickers.{s}" for s in batch]
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 await asyncio.sleep(0.05)  # маленькая пауза между сабами

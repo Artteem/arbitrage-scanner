@@ -147,7 +147,13 @@ async def discover_symbols_for_connectors(connectors: Iterable[ConnectorSpec]) -
     for connector in connectors:
         if connector.discover_symbols is None:
             continue
-        symbols = await connector.discover_symbols()
+        try:
+            symbols = await connector.discover_symbols()
+        except Exception:
+            # Обнаружение тикеров не должно приводить к падению всего приложения —
+            # игнорируем временные ошибки конкретной биржи и продолжим с теми
+            # результатами, которые удалось получить.
+            continue
         symbol_set = {Symbol(str(sym)) for sym in symbols if str(sym)}
         if symbol_set:
             discovered[connector.name] = symbol_set
