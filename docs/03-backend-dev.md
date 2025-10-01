@@ -16,3 +16,10 @@ Open http://127.0.0.1:8000/docs
 ```bash
 pytest -q
 ```
+
+## Adding a new exchange connector
+1. Create a module in `arbitrage_scanner/connectors/` with the exchange name (e.g. `kraken.py`).
+2. Inside the module, expose a `connector: ConnectorSpec`.
+   Provide the `run` coroutine and optionally `discover_symbols` and a taker fee.
+3. Add the exchange name to the `ENABLED_EXCHANGES` environment variable (comma separated).
+4. Restart the backend — the exchange will be loaded automatically.

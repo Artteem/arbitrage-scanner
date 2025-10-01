@@ -1,9 +1,11 @@
 from __future__ import annotations
-from typing import Literal, TypedDict
+from typing import TypedDict
 from pydantic import BaseModel, Field
 import time
 
-ExchangeName = Literal["binance", "bybit"]
+# Биржа теперь задаётся строкой, чтобы можно было подключать произвольные коннекторы
+# без изменения доменной модели.
+ExchangeName = str
 Symbol = str  # "BTCUSDT"
 
 class TickerDict(TypedDict):

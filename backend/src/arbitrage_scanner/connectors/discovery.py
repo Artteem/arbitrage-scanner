@@ -1,6 +1,8 @@
 from __future__ import annotations
 import httpx
-from typing import List, Set
+from typing import Iterable, List, Set
+
+from .base import ConnectorSpec
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
@@ -30,8 +32,18 @@ async def discover_bybit_linear_usdt() -> Set[str]:
             if sym: out.add(sym)
     return out
 
-async def discover_common_usdt_perp() -> List[str]:
-    bnc = await discover_binance_usdt_perp()
-    byt = await discover_bybit_linear_usdt()
-    common = sorted(bnc & byt)
-    return common
+async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
+    """Вернуть отсортированное пересечение тикеров для всех коннекторов."""
+
+    discovered: List[Set[str]] = []
+    for connector in connectors:
+        if connector.discover_symbols is None:
+            continue
+        symbols = await connector.discover_symbols()
+        discovered.append({str(sym) for sym in symbols})
+
+    if not discovered:
+        return []
+
+    common = set.intersection(*discovered)
+    return sorted(common)
