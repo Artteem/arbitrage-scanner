@@ -4,9 +4,12 @@ from typing import Sequence, List
 import websockets
 from ..domain import Ticker, Symbol
 from ..store import TickerStore
+from .discovery import discover_binance_usdt_perp
 
 BOOK_WS = "wss://fstream.binance.com/stream"
 MARK_WS = "wss://fstream.binance.com/stream"
+
+MIN_SYMBOL_THRESHOLD = 5
 
 def _stream_name_book(sym: str) -> str:
     return f"{sym.lower()}@bookTicker"
@@ -17,6 +20,18 @@ def _stream_name_mark(sym: str) -> str:
 CHUNK = 100  # безопасный размер пакета подписки
 
 async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
+    subscribe = list(dict.fromkeys(symbols))  # сохраняем порядок без дубликатов
+    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
+        try:
+            discovered = await discover_binance_usdt_perp()
+        except Exception:
+            discovered = set()
+        if discovered:
+            subscribe = sorted(discovered)
+
+    if not subscribe:
+        return
+
     async def _consume(endpoint: str, params: List[str], handler):
         # отдельное соединение на каждый батч
         async for ws in _reconnect(endpoint):
@@ -50,8 +65,8 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
 
     # батчим
     tasks = []
-    for i in range(0, len(symbols), CHUNK):
-        batch = symbols[i:i+CHUNK]
+    for i in range(0, len(subscribe), CHUNK):
+        batch = subscribe[i:i+CHUNK]
         book_params = [_stream_name_book(s) for s in batch]
         mark_params = [_stream_name_mark(s) for s in batch]
         tasks.append(asyncio.create_task(_consume(BOOK_WS, book_params, _handle_book)))

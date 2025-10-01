@@ -8,6 +8,7 @@ from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
+BINGX_TICKERS = "https://bingx.com/api/v3/contract/tickers"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
 async def discover_binance_usdt_perp() -> Set[str]:
@@ -78,6 +79,55 @@ async def discover_mexc_usdt_perp() -> Set[str]:
             out.add(sym)
     return out
 
+
+def _bingx_symbol_to_common(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    return symbol.replace("-", "").replace("_", "").upper()
+
+
+async def discover_bingx_usdt_perp() -> Set[str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://bingx.com/",
+        "Origin": "https://bingx.com",
+    }
+
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        r = await client.get(BINGX_TICKERS, params={"symbol": "ALL"})
+        r.raise_for_status()
+        payload = r.json()
+
+    items: Iterable = []
+    if isinstance(payload, dict):
+        for key in ("data", "result", "tickers", "items"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                items = val
+                break
+            if isinstance(val, dict):
+                items = val.values()
+                break
+        else:
+            items = list(payload.values())
+    elif isinstance(payload, list):
+        items = payload
+
+    out: Set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("symbol") or item.get("market") or item.get("instId")
+        common = _bingx_symbol_to_common(str(raw) if raw else None)
+        if not common:
+            continue
+        if not common.endswith("USDT"):
+            continue
+        out.add(common)
+
+    return out
+
 @dataclass(frozen=True)
 class DiscoveryResult:
     """Результат авто-обнаружения тикеров."""
@@ -97,7 +147,13 @@ async def discover_symbols_for_connectors(connectors: Iterable[ConnectorSpec]) -
     for connector in connectors:
         if connector.discover_symbols is None:
             continue
-        symbols = await connector.discover_symbols()
+        try:
+            symbols = await connector.discover_symbols()
+        except Exception:
+            # Обнаружение тикеров не должно приводить к падению всего приложения —
+            # игнорируем временные ошибки конкретной биржи и продолжим с теми
+            # результатами, которые удалось получить.
+            continue
         symbol_set = {Symbol(str(sym)) for sym in symbols if str(sym)}
         if symbol_set:
             discovered[connector.name] = symbol_set
