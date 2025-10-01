@@ -9,16 +9,25 @@ from .settings import settings
 from .store import TickerStore
 from .domain import Symbol, ExchangeName
 from .engine.spread_calc import compute_rows, DEFAULT_TAKER_FEES
-from .connectors.binance_futures import run_binance
-from .connectors.bybit_perp import run_bybit
-from .connectors.discovery import discover_common_usdt_perp
+from .connectors.base import ConnectorSpec
+from .connectors.loader import load_connectors
+from .connectors.discovery import discover_common_symbols
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.1.0")
 
 store = TickerStore()
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
-EXCHANGES: tuple[ExchangeName, ...] = ("binance", "bybit")
+
+CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
+EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
+
+TAKER_FEES = {**DEFAULT_TAKER_FEES}
+for connector in CONNECTORS:
+    if connector.taker_fee is not None:
+        TAKER_FEES[connector.name] = connector.taker_fee
+
+FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
 @app.on_event("startup")
@@ -26,14 +35,15 @@ async def startup():
     # 1) Автоматически найдём пересечение USDT-перпетуалов
     global SYMBOLS
     try:
-        SYMBOLS = await discover_common_usdt_perp()
+        discovered = await discover_common_symbols(CONNECTORS)
+        SYMBOLS = discovered or FALLBACK_SYMBOLS
     except Exception:
         # Фоллбек: базовый набор
-        SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        SYMBOLS = FALLBACK_SYMBOLS
 
     # 2) Запустим ридеры бирж
-    _tasks.append(asyncio.create_task(run_binance(store, SYMBOLS)))
-    _tasks.append(asyncio.create_task(run_bybit(store, SYMBOLS)))
+    for connector in CONNECTORS:
+        _tasks.append(asyncio.create_task(connector.run(store, SYMBOLS)))
 
 
 @app.on_event("shutdown")
@@ -79,7 +89,7 @@ async def ws_spreads(ws: WebSocket):
                 store,
                 symbols=SYMBOLS,
                 exchanges=EXCHANGES,
-                taker_fees=DEFAULT_TAKER_FEES,
+                taker_fees=TAKER_FEES,
             )
             payload = [r.as_dict() for r in rows]
             await ws.send_text(json.dumps(payload))
