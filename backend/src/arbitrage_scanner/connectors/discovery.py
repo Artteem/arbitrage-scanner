@@ -1,8 +1,10 @@
 from __future__ import annotations
 import httpx
-from typing import Iterable, List, Set
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Set
 
 from .base import ConnectorSpec
+from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
@@ -76,18 +78,48 @@ async def discover_mexc_usdt_perp() -> Set[str]:
             out.add(sym)
     return out
 
-async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
-    """Вернуть отсортированное пересечение тикеров для всех коннекторов."""
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """Результат авто-обнаружения тикеров."""
 
-    discovered: List[Set[str]] = []
+    symbols_union: List[Symbol]
+    per_connector: Dict[ExchangeName, List[Symbol]]
+
+
+async def discover_symbols_for_connectors(connectors: Iterable[ConnectorSpec]) -> DiscoveryResult:
+    """Собрать тикеры USDT-перпетуалов для каждого коннектора.
+
+    Возвращает объединение по всем биржам и словарь вида
+    ``{"binance": [...], "bybit": [...]}``.
+    """
+
+    discovered: Dict[ExchangeName, Set[Symbol]] = {}
     for connector in connectors:
         if connector.discover_symbols is None:
             continue
         symbols = await connector.discover_symbols()
-        discovered.append({str(sym) for sym in symbols})
+        symbol_set = {Symbol(str(sym)) for sym in symbols if str(sym)}
+        if symbol_set:
+            discovered[connector.name] = symbol_set
 
     if not discovered:
+        return DiscoveryResult(symbols_union=[], per_connector={})
+
+    union = sorted(set.union(*discovered.values()))
+    per_connector = {name: sorted(values) for name, values in discovered.items()}
+    return DiscoveryResult(symbols_union=union, per_connector=per_connector)
+
+
+async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
+    """Вернуть отсортированное пересечение тикеров для всех коннекторов."""
+
+    result = await discover_symbols_for_connectors(connectors)
+    if not result.per_connector:
         return []
 
-    common = set.intersection(*discovered)
+    sets = [set(items) for items in result.per_connector.values() if items]
+    if not sets:
+        return []
+
+    common = set.intersection(*sets)
     return sorted(common)
