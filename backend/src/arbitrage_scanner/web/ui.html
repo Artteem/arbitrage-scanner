@@ -12,6 +12,7 @@
     h1 { font-size:18px; margin:0; }
     .controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
     .card { padding:12px 16px; }
+    .filters { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
     .table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
     tr:nth-child(2n){ background:var(--row); }
@@ -31,12 +32,9 @@
   <header>
     <h1>Арбитражный сканер — Реал-тайм</h1>
     <div class="controls">
-      <div>
-        <label><input type="checkbox" id="ex-binance" checked> Binance</label>
-        <label><input type="checkbox" id="ex-bybit" checked> Bybit</label>
-        <label><input type="checkbox" id="ex-mexc" checked> MEXC</label>
-        <label><input type="checkbox" id="ex-bingx" checked> BingX</label>
-      </div>
+
+      <div id="exchange-filters" class="filters"></div>
+
       <div>
         <label>Мин. курсовой спред (%) <input type="number" id="min-entry" step="0.01" value="0"></label>
       </div>
@@ -76,10 +74,15 @@
     let rows = [];
     let page = 1;
 
+
     const exBinance = document.getElementById('ex-binance');
     const exBybit = document.getElementById('ex-bybit');
     const exMexc = document.getElementById('ex-mexc');
     const exBingx = document.getElementById('ex-bingx');
+
+    const exchangeFiltersContainer = document.getElementById('exchange-filters');
+    const exchangeInputs = new Map();
+ 
     const minEntry = document.getElementById('min-entry');
     const minFunding = document.getElementById('min-funding');
     const tbody = document.getElementById('tbody');
@@ -87,14 +90,20 @@
 
     function applyFilters() {
       const enabledEx = new Set();
-      if (exBinance.checked) enabledEx.add('binance');
-      if (exBybit.checked) enabledEx.add('bybit');
-      if (exMexc.checked) enabledEx.add('mexc');
-      if (exBingx.checked) enabledEx.add('bingx');
+      exchangeInputs.forEach((input, ex) => {
+        if (input.checked) enabledEx.add(ex);
+      });
       const minE = parseFloat(minEntry.value || "0");
       const minF = parseFloat(minFunding.value || "0");
 
-      let filtered = rows.filter(r => enabledEx.has(r.long_exchange) && enabledEx.has(r.short_exchange));
+      let filtered = rows;
+      if (exchangeInputs.size > 0) {
+        if (enabledEx.size === 0) {
+          filtered = [];
+        } else {
+          filtered = rows.filter(r => enabledEx.has(r.long_exchange) && enabledEx.has(r.short_exchange));
+        }
+      }
       filtered = filtered.filter(r => r.entry_pct >= minE && Math.abs(r.funding_spread) >= minF);
 
       filtered.sort((a,b)=>{
@@ -136,16 +145,15 @@
       switch (ex) {
         case "binance": return `https://www.binance.com/en/futures/${sym}`;
         case "bybit": return `https://www.bybit.com/trade/usdt/${sym}`;
-        case "mexc": {
-          const mexcSym = sym.replace(/USDT$/, '_USDT');
-          return `https://www.mexc.com/futures/${mexcSym}`;
-        }
-        case "bingx": {
-          const bingxSym = sym.replace(/USDT$/, '-USDT');
-          return `https://bingx.com/futures/${bingxSym}`;
-        }
+        case "mexc": return `https://futures.mexc.com/exchange/${toMexcSymbol(sym)}`;
         default: return "#";
       }
+    }
+
+    function toMexcSymbol(sym) {
+      if (!sym) return sym;
+      if (sym.includes('_')) return sym;
+      return sym.endsWith('USDT') ? `${sym.slice(0, -4)}_USDT` : sym;
     }
 
     document.getElementById('theme-toggle').addEventListener('click', () => {
@@ -165,13 +173,92 @@
     document.getElementById('prev').addEventListener('click', () => { if (page>1){ page--; applyFilters(); }});
     document.getElementById('next').addEventListener('click', () => { page++; applyFilters(); });
 
-    [exBinance, exBybit, exMexc, exBingx, minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
+    [minEntry, minFunding].forEach(el => el.addEventListener('input', () => { page=1; applyFilters(); }));
+
+    function renderExchangeFilters(exchanges) {
+      if (!Array.isArray(exchanges) || exchanges.length === 0) return;
+
+      const prevSelected = new Set();
+      exchangeInputs.forEach((input, ex) => { if (input.checked) prevSelected.add(ex); });
+
+      exchangeFiltersContainer.innerHTML = '';
+      exchangeInputs.clear();
+
+      const normalized = Array.from(new Set(exchanges.map(ex => String(ex)))).sort((a, b) => a.localeCompare(b));
+      const hasPrevSelection = prevSelected.size > 0;
+
+      normalized.forEach(ex => {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.id = `ex-${ex}`;
+        input.checked = hasPrevSelection ? prevSelected.has(ex) : true;
+        input.addEventListener('input', () => { page = 1; applyFilters(); });
+
+        label.appendChild(input);
+        label.append(` ${ex.toUpperCase()}`);
+        exchangeFiltersContainer.appendChild(label);
+        exchangeInputs.set(ex, input);
+      });
+
+      page = 1;
+      applyFilters();
+    }
+
+    async function initExchangeFilters() {
+      try {
+        const res = await fetch('/stats');
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.exchanges) && data.exchanges.length > 0) {
+            renderExchangeFilters(data.exchanges);
+            return;
+          }
+        }
+      } catch (e) {}
+
+      // Фоллбек на случай ошибок запроса
+      if (exchangeInputs.size === 0) {
+        renderExchangeFilters(['binance', 'bybit']);
+      }
+    }
+
+    function updateExchangeFiltersFromRows(rs) {
+      const discovered = new Set();
+      rs.forEach(r => {
+        if (r.long_exchange) discovered.add(r.long_exchange);
+        if (r.short_exchange) discovered.add(r.short_exchange);
+      });
+
+      if (discovered.size === 0) return;
+
+      const current = new Set(exchangeInputs.keys());
+      let shouldUpdate = current.size === 0;
+      discovered.forEach(ex => {
+        if (!current.has(ex)) shouldUpdate = true;
+      });
+
+      if (!shouldUpdate) return;
+
+      const merged = new Set([...current, ...discovered]);
+      renderExchangeFilters(Array.from(merged));
+    }
+
+    initExchangeFilters();
 
     // WS
     const wsProto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${wsProto}://${location.host}/ws/spreads`);
     ws.onmessage = (ev) => {
-      try { rows = JSON.parse(ev.data); applyFilters(); } catch (e) {}
+      try {
+        rows = JSON.parse(ev.data) || [];
+        if (exchangeInputs.size === 0) {
+          updateExchangeFiltersFromRows(rows);
+        } else {
+          updateExchangeFiltersFromRows(rows);
+          applyFilters();
+        }
+      } catch (e) {}
     };
     ws.onclose = ()=>{ setTimeout(()=>location.reload(), 1500); };
   </script>
