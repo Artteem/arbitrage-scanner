@@ -39,6 +39,9 @@ class TickerStore:
     def symbols(self) -> Iterable[Symbol]:
         return {sym for (_, sym) in self._latest.keys()}
 
+    def exchanges(self) -> Iterable[ExchangeName]:
+        return {ex for (ex, _) in self._latest.keys()}
+
     def get_ticker(self, exchange: ExchangeName, symbol: Symbol) -> Ticker | None:
         return self._latest.get((exchange, symbol))
 
