@@ -106,6 +106,12 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
         if candidate not in candidates:
             candidates.append(candidate)
 
+    # Всегда начинаем с «широких» запросов, которые возвращают весь список
+    # тикеров. Они работают на большинстве публичных эндпоинтов BingX и не
+    # страдают от ограничений длины строки запроса.
+    _add({"symbol": "ALL"})
+    _add({"pair": "ALL"})
+
     if wanted_exchange:
         ordered = sorted(wanted_exchange)
         joined_primary = ",".join(ordered)
@@ -120,8 +126,7 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
             _add({"symbol": norm})
             _add({"pairs": norm})
             _add({"pair": norm})
-    _add({"symbol": "ALL"})
-    _add({"pair": "ALL"})
+
     _add(None)
     return candidates
 
@@ -550,6 +555,7 @@ async def _poll_bingx_http(
             except asyncio.CancelledError:
                 raise
             except Exception:
+                params_idx = (params_idx + 1) % len(param_candidates)
                 url_idx = (url_idx + 1) % len(TICKERS_URLS)
                 await asyncio.sleep(2.0)
                 continue
