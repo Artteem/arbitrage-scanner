@@ -24,7 +24,10 @@
     input[type="number"]{ width:120px; padding:6px 8px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; }
     label { font-size:14px; color:var(--muted); }
     .btn { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
-    .sort { cursor:pointer; }
+    th.sort { cursor:pointer; user-select:none; white-space:nowrap; }
+    th.sort::after { content:""; display:inline-block; margin-left:6px; font-size:12px; color:var(--muted); opacity:0; transition:opacity 0.2s ease; }
+    th.sort[data-active="true"][data-direction="asc"]::after { content:"▲"; opacity:1; }
+    th.sort[data-active="true"][data-direction="desc"]::after { content:"▼"; opacity:1; }
     .pager { display:flex; gap:8px; align-items:center; justify-content:flex-end; padding:8px 0; }
   </style>
 </head>
@@ -87,6 +90,22 @@
     const minFunding = document.getElementById('min-funding');
     const tbody = document.getElementById('tbody');
     const pageinfo = document.getElementById('pageinfo');
+    const sortHeaders = document.querySelectorAll('.sort');
+
+    function updateSortIndicators() {
+      sortHeaders.forEach(th => {
+        const isActive = th.dataset.sort === sortBy;
+        if (isActive) {
+          th.dataset.active = 'true';
+          th.dataset.direction = sortDir;
+          th.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
+        } else {
+          delete th.dataset.active;
+          delete th.dataset.direction;
+          th.removeAttribute('aria-sort');
+        }
+      });
+    }
 
     function applyFilters() {
       const enabledEx = new Set();
@@ -95,8 +114,10 @@
         knownEx.add(ex);
         if (input.checked) enabledEx.add(ex);
       });
-      const minE = parseFloat(minEntry.value || "0");
-      const minF = parseFloat(minFunding.value || "0");
+      const minEValue = parseFloat(minEntry.value);
+      const minFValue = parseFloat(minFunding.value);
+      const minE = Number.isFinite(minEValue) ? minEValue : 0;
+      const minF = Number.isFinite(minFValue) ? (minFValue / 100) : 0;
 
       let filtered = rows;
       if (exchangeInputs.size > 0) {
@@ -119,6 +140,8 @@
         const va = a[key], vb = b[key];
         return sortDir === "desc" ? (vb - va) : (va - vb);
       });
+
+      updateSortIndicators();
 
       const total = filtered.length;
       const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -180,7 +203,7 @@
       html.setAttribute('data-theme', html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
     });
 
-    document.querySelectorAll('.sort').forEach(th => {
+    sortHeaders.forEach(th => {
       th.addEventListener('click', () => {
         const key = th.dataset.sort;
         if (sortBy === key) sortDir = (sortDir === "desc") ? "asc" : "desc";
@@ -188,6 +211,8 @@
         applyFilters();
       });
     });
+
+    updateSortIndicators();
 
     document.getElementById('prev').addEventListener('click', () => { if (page>1){ page--; applyFilters(); }});
     document.getElementById('next').addEventListener('click', () => { page++; applyFilters(); });
