@@ -18,12 +18,19 @@ TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
     "https://open-api.bingx.com/openApi/swap/v2/market/getLatest",
     "https://open-api.bingx.com/openApi/swap/v3/market/getLatest",
+    "https://open-api.bingx.com/openApi/swap/v3/market/getAllLatest",
 )
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://bingx.com/",
     "Origin": "https://bingx.com",
+}
+WS_HEADERS = {
+    "User-Agent": REQUEST_HEADERS["User-Agent"],
+    "Origin": REQUEST_HEADERS["Origin"],
+    "Referer": REQUEST_HEADERS["Referer"],
+    "Accept": REQUEST_HEADERS["Accept"],
 }
 POLL_INTERVAL = 1.5
 HTTP_RELAX_INTERVAL = 6.0
@@ -103,7 +110,10 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
         joined = ",".join(sorted(wanted_exchange))
         _add({"symbols": joined})
         _add({"symbol": joined})
+        _add({"pairs": joined})
+        _add({"pair": joined})
     _add({"symbol": "ALL"})
+    _add({"pair": "ALL"})
     _add(None)
     return candidates
 
@@ -243,7 +253,11 @@ async def _reconnect_ws():
         idx += 1
         try:
             async with websockets.connect(
-                endpoint, ping_interval=20, ping_timeout=20, close_timeout=5
+                endpoint,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                extra_headers=WS_HEADERS,
             ) as ws:
                 yield ws
         except asyncio.CancelledError:
@@ -508,7 +522,7 @@ async def _poll_bingx_http(
 
             items: Iterable[dict] = []
             if isinstance(data, dict):
-                for key in ("data", "result", "tickers", "items"):
+                for key in ("data", "result", "tickers", "items", "rows", "list", "dataList"):
                     value = data.get(key)
                     if isinstance(value, list):
                         items = value

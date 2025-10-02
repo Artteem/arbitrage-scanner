@@ -1,7 +1,7 @@
 from __future__ import annotations
 import httpx
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 from .base import ConnectorSpec
 from .bingx_utils import normalize_bingx_symbol
@@ -9,7 +9,18 @@ from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-BINGX_TICKERS = "https://bingx.com/api/v3/contract/tickers"
+BINGX_TICKER_ENDPOINTS: Tuple[str, ...] = (
+    "https://bingx.com/api/v3/contract/tickers",
+    "https://open-api.bingx.com/openApi/swap/v2/market/getLatest",
+    "https://open-api.bingx.com/openApi/swap/v3/market/getLatest",
+    "https://open-api.bingx.com/openApi/swap/v3/market/getAllLatest",
+)
+BINGX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://bingx.com/",
+    "Origin": "https://bingx.com",
+}
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
 async def discover_binance_usdt_perp() -> Set[str]:
@@ -85,33 +96,52 @@ def _bingx_symbol_to_common(symbol: str | None) -> str | None:
     return normalize_bingx_symbol(symbol)
 
 
-async def discover_bingx_usdt_perp() -> Set[str]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://bingx.com/",
-        "Origin": "https://bingx.com",
-    }
+async def _fetch_bingx_payload(client: httpx.AsyncClient) -> Iterable:
+    param_candidates: Sequence[dict[str, str] | None] = (
+        {"symbol": "ALL"},
+        {"pair": "ALL"},
+        None,
+    )
 
-    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        r = await client.get(BINGX_TICKERS, params={"symbol": "ALL"})
-        r.raise_for_status()
-        payload = r.json()
+    for url in BINGX_TICKER_ENDPOINTS:
+        for params in param_candidates:
+            try:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                continue
+            except Exception:
+                break
 
-    items: Iterable = []
+            try:
+                payload = response.json()
+            except Exception:
+                continue
+
+            items = _extract_bingx_items(payload)
+            if items:
+                return items
+
+    return []
+
+
+def _extract_bingx_items(payload) -> Iterable:
     if isinstance(payload, dict):
-        for key in ("data", "result", "tickers", "items"):
-            val = payload.get(key)
-            if isinstance(val, list):
-                items = val
-                break
-            if isinstance(val, dict):
-                items = val.values()
-                break
-        else:
-            items = list(payload.values())
-    elif isinstance(payload, list):
-        items = payload
+        for key in ("data", "result", "tickers", "items", "rows", "list", "dataList"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return value.values()
+        return payload.values()
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+async def discover_bingx_usdt_perp() -> Set[str]:
+    async with httpx.AsyncClient(timeout=20, headers=BINGX_HEADERS) as client:
+        items = await _fetch_bingx_payload(client)
 
     out: Set[str] = set()
     for item in items:
