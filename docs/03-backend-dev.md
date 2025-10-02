@@ -5,6 +5,15 @@
 pip install -r backend/requirements.txt
 ```
 
+## Configure Environment
+Copy `backend/.env.example` to `.env` (or update your existing `.env`) and ensure `ENABLED_EXCHANGES` lists every supported venue:
+
+```bash
+ENABLED_EXCHANGES=binance,bybit,mexc,bingx
+```
+
+> **Note:** BingX support is mandatory for parity with production. If you already have a `.env` file, add `bingx` to the list so the connector loads.
+
 ## Run API
 ```bash
 uvicorn arbitrage_scanner.app:app --reload --port 8000

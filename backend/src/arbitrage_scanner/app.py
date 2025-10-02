@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json
+import asyncio, json, logging
 from typing import Sequence, Iterable
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -12,6 +12,8 @@ from .engine.spread_calc import compute_rows, DEFAULT_TAKER_FEES
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_common_symbols, discover_symbols_for_connectors
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.1.0")
 
@@ -33,6 +35,12 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 @app.on_event("startup")
 async def startup():
+    if "bingx" not in {ex.lower() for ex in settings.enabled_exchanges}:
+        logger.warning(
+            "BingX is not configured in ENABLED_EXCHANGES. "
+            "Add 'bingx' to avoid missing production connectors."
+        )
+
     # 1) Автоматически найдём пересечение USDT-перпетуалов
     global SYMBOLS, CONNECTOR_SYMBOLS
     try:
