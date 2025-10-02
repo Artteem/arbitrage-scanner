@@ -7,7 +7,12 @@ from typing import Iterable, List, Sequence, Tuple
 
 DEFAULT_EXCHANGES = "binance,bybit,mexc,bingx"
 REQUIRED_EXCHANGES: Tuple[str, ...] = ("bingx",)
-EXCHANGE_ALIASES: dict[str, str] = {"bigx": "bingx"}
+EXCHANGE_ALIASES: dict[str, str] = {
+    "bigx": "bingx",
+    "bingx-perp": "bingx",
+    "bingx_perp": "bingx",
+    "bingxperp": "bingx",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,8 @@ class Settings:
         self.enabled_exchanges = normalized
         self.auto_enabled_exchanges = tuple(auto_added)
         self.alias_mappings = tuple(aliases)
+
+        os.environ["ENABLED_EXCHANGES"] = ",".join(self.enabled_exchanges)
 
         for original, canonical in aliases:
             logger.warning(
