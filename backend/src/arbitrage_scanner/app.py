@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio, json, logging
-from typing import Iterable
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
@@ -22,34 +21,7 @@ _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
 
-REQUIRED_EXCHANGES: set[str] = {"bingx"}
-
-
-def _normalize_enabled_exchanges(exchanges: Iterable[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw in exchanges:
-        name = raw.strip()
-        if not name:
-            continue
-        lowered = name.lower()
-        if lowered in seen:
-            continue
-        normalized.append(name)
-        seen.add(lowered)
-
-    missing = sorted(req for req in REQUIRED_EXCHANGES if req not in seen)
-    if missing:
-        logger.warning(
-            "Missing required exchanges in ENABLED_EXCHANGES: %s. Automatically enabling them.",
-            ", ".join(missing),
-        )
-        normalized.extend(missing)
-
-    return normalized
-
-
-ACTIVE_EXCHANGES: list[str] = _normalize_enabled_exchanges(settings.enabled_exchanges)
+ACTIVE_EXCHANGES: list[str] = list(settings.enabled_exchanges)
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(ACTIVE_EXCHANGES))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
 
@@ -63,12 +35,19 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 @app.on_event("startup")
 async def startup():
-    missing = REQUIRED_EXCHANGES - {ex.lower() for ex in settings.enabled_exchanges}
-    if missing:
+    if settings.alias_mappings:
+        for original, canonical in settings.alias_mappings:
+            logger.warning(
+                "Exchange '%s' is an alias. Update ENABLED_EXCHANGES to '%s' to avoid surprises.",
+                original,
+                canonical,
+            )
+
+    if settings.auto_enabled_exchanges:
         logger.warning(
             "Required exchanges %s were missing from ENABLED_EXCHANGES in the environment. "
             "They have been enabled automatically for this session. Update your .env to keep them persistent.",
-            ", ".join(sorted(missing)),
+            ", ".join(settings.auto_enabled_exchanges),
         )
 
     # 1) Автоматически найдём пересечение USDT-перпетуалов

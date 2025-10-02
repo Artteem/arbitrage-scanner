@@ -1,4 +1,4 @@
-import pytest
+import asyncio
 
 from arbitrage_scanner.connectors import discovery
 from arbitrage_scanner.connectors.bingx_utils import normalize_bingx_symbol
@@ -34,11 +34,10 @@ class _DummyClient:
         return _DummyResponse()
 
 
-@pytest.mark.asyncio
-async def test_discover_bingx_usdt_perp(monkeypatch):
+def test_discover_bingx_usdt_perp(monkeypatch):
     monkeypatch.setattr(discovery.httpx, "AsyncClient", _DummyClient)
 
-    symbols = await discovery.discover_bingx_usdt_perp()
+    symbols = asyncio.run(discovery.discover_bingx_usdt_perp())
 
     assert symbols == {"BTCUSDT", "ETHUSDT"}
 
