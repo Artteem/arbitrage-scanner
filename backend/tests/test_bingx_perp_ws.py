@@ -1,5 +1,7 @@
 from arbitrage_scanner.connectors.bingx_perp import (
+    _build_param_candidates,
     _extract_price,
+    _extract_symbol,
     _from_bingx_symbol,
     _iter_ws_payloads,
 )
@@ -127,3 +129,17 @@ def test_extract_price_supports_short_keys():
 def test_from_bingx_symbol_strips_suffixes():
     assert _from_bingx_symbol("BTCUSDT_UMCBL") == "BTCUSDT"
     assert _from_bingx_symbol("eth-usdt-perp") == "ETHUSDT"
+
+
+def test_build_param_candidates_includes_hyphen_variants():
+    candidates = _build_param_candidates({"BTC_USDT", "ETH_USDT"})
+
+    assert {"symbol": "BTC_USDT,ETH_USDT"} in candidates
+    assert {"symbol": "BTC-USDT,ETH-USDT"} in candidates
+    assert {"symbol": "ALL"} in candidates
+
+
+def test_extract_symbol_supports_symbol_name():
+    payload = {"symbolName": "XRP-USDT"}
+
+    assert _extract_symbol(payload, None, None) == "XRP-USDT"

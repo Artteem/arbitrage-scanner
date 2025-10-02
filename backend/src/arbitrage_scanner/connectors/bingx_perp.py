@@ -107,11 +107,19 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
             candidates.append(candidate)
 
     if wanted_exchange:
-        joined = ",".join(sorted(wanted_exchange))
-        _add({"symbols": joined})
-        _add({"symbol": joined})
-        _add({"pairs": joined})
-        _add({"pair": joined})
+        ordered = sorted(wanted_exchange)
+        joined_primary = ",".join(ordered)
+        joined_variants = {
+            joined_primary,
+            joined_primary.replace("_", "-"),
+            ",".join(s.replace("-", "_") for s in ordered),
+        }
+        for variant in joined_variants:
+            norm = variant.upper()
+            _add({"symbols": norm})
+            _add({"symbol": norm})
+            _add({"pairs": norm})
+            _add({"pair": norm})
     _add({"symbol": "ALL"})
     _add({"pair": "ALL"})
     _add(None)
@@ -273,18 +281,44 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
     def _next_id() -> str:
         return str(int(time.time() * 1_000))
 
-    payloads = [
+    payloads = []
+
+    payloads.append(
         {
             "id": _next_id(),
             "action": "subscribe",
             "params": {"channel": "ticker", "instId": list(symbols)},
-        },
+        }
+    )
+    payloads.append(
         {
             "id": _next_id(),
             "action": "subscribe",
             "params": {"channel": "ticker", "symbols": list(symbols)},
-        },
-    ]
+        }
+    )
+    for sym in symbols:
+        payloads.append(
+            {
+                "id": _next_id(),
+                "action": "subscribe",
+                "params": {"channel": "ticker", "instId": sym},
+            }
+        )
+        payloads.append(
+            {
+                "id": _next_id(),
+                "action": "subscribe",
+                "params": {"channel": "ticker", "symbol": sym},
+            }
+        )
+        payloads.append(
+            {
+                "id": _next_id(),
+                "action": "subscribe",
+                "params": {"channel": "ticker", "symbols": sym},
+            }
+        )
 
     market_topics = [f"market.{sym}.ticker" for sym in symbols]
     payloads.append({"id": _next_id(), "reqType": "sub", "dataType": market_topics})
@@ -432,7 +466,7 @@ def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[s
 
 
 def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str | None) -> str | None:
-    for key in ("symbol", "instId", "s", "market", "pair"):
+    for key in ("symbol", "symbolName", "instId", "s", "market", "pair"):
         val = payload.get(key)
         if isinstance(val, str) and val:
             return val
