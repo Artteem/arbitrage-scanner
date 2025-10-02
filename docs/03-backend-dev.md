@@ -13,6 +13,7 @@ ENABLED_EXCHANGES=binance,bybit,mexc,bingx
 ```
 
 > **Note:** BingX support is mandatory for parity with production. If you already have a `.env` file, add `bingx` to the list so the connector loads.
+> The backend will temporarily enable any missing required exchanges (such as BingX) at runtime, but you should update your `.env` to keep the configuration persistent.
 
 ## Run API
 ```bash

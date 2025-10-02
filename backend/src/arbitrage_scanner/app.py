@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio, json, logging
-from typing import Sequence, Iterable
+from typing import Iterable
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
@@ -11,7 +11,7 @@ from .domain import Symbol, ExchangeName
 from .engine.spread_calc import compute_rows, DEFAULT_TAKER_FEES
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
-from .connectors.discovery import discover_common_symbols, discover_symbols_for_connectors
+from .connectors.discovery import discover_symbols_for_connectors
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,35 @@ _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
 
-CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
+REQUIRED_EXCHANGES: set[str] = {"bingx"}
+
+
+def _normalize_enabled_exchanges(exchanges: Iterable[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in exchanges:
+        name = raw.strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        normalized.append(name)
+        seen.add(lowered)
+
+    missing = sorted(req for req in REQUIRED_EXCHANGES if req not in seen)
+    if missing:
+        logger.warning(
+            "Missing required exchanges in ENABLED_EXCHANGES: %s. Automatically enabling them.",
+            ", ".join(missing),
+        )
+        normalized.extend(missing)
+
+    return normalized
+
+
+ACTIVE_EXCHANGES: list[str] = _normalize_enabled_exchanges(settings.enabled_exchanges)
+CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(ACTIVE_EXCHANGES))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
 
 TAKER_FEES = {**DEFAULT_TAKER_FEES}
@@ -35,10 +63,12 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 @app.on_event("startup")
 async def startup():
-    if "bingx" not in {ex.lower() for ex in settings.enabled_exchanges}:
+    missing = REQUIRED_EXCHANGES - {ex.lower() for ex in settings.enabled_exchanges}
+    if missing:
         logger.warning(
-            "BingX is not configured in ENABLED_EXCHANGES. "
-            "Add 'bingx' to avoid missing production connectors."
+            "Required exchanges %s were missing from ENABLED_EXCHANGES in the environment. "
+            "They have been enabled automatically for this session. Update your .env to keep them persistent.",
+            ", ".join(sorted(missing)),
         )
 
     # 1) Автоматически найдём пересечение USDT-перпетуалов
@@ -71,7 +101,8 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "env": settings.model_dump(), "symbols": SYMBOLS}
+    env_snapshot = {**settings.model_dump(), "enabled_exchanges": ACTIVE_EXCHANGES}
+    return {"status": "ok", "env": env_snapshot, "symbols": SYMBOLS}
 
 
 @app.get("/stats")
