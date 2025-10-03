@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Карточка пары {{symbol}}</title>
+  <style>
+    :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa4ad; --row:#161a20; --accent:#4aa3ff; --bad:#ff5a5f; --good:#12d67a; --link:#7ab7ff; --border:#2a2f39; }
+    [data-theme="light"] { --bg:#fff; --fg:#0f172a; --muted:#4b5563; --row:#f8fafc; --accent:#0ea5e9; --bad:#ef4444; --good:#10b981; --link:#2563eb; --border:#e5e7eb; }
+    body { background:var(--bg); color:var(--fg); font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin:0; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); }
+    h1 { font-size:18px; margin:0; }
+    a { color:var(--link); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .layout { padding:16px; display:flex; flex-direction:column; gap:16px; }
+    .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+    .badge { font-size:13px; color:var(--muted); }
+    button, select { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
+    button:hover, select:hover { border-color:var(--accent); }
+    label { font-size:14px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+    input[type="checkbox"] { accent-color:var(--accent); }
+    .chart-card { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:12px; }
+    .chart-card h2 { margin:0 0 8px 0; font-size:16px; font-weight:600; }
+    .chart-container { height:340px; position:relative; }
+    .empty { font-size:14px; color:var(--muted); padding:32px 0; text-align:center; }
+    .exchange-line { display:flex; flex-wrap:wrap; gap:12px; font-size:14px; }
+    .exchange-line span { display:flex; align-items:center; gap:4px; }
+    .hidden { display:none; }
+  </style>
+  <script src="https://unpkg.com/lightweight-charts@4.0.1/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body data-symbol="{{symbol}}">
+  <header>
+    <div>
+      <div class="badge"><a href="/ui">← Назад к таблице</a></div>
+      <h1>{{symbol}}</h1>
+    </div>
+    <div class="controls">
+      <button id="theme-toggle" type="button">Светлая/Тёмная</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="exchange-line" id="exchange-line"></section>
+    <section class="controls">
+      <label>Таймфрейм
+        <select id="timeframe">
+          <option value="1m">1 мин</option>
+          <option value="5m" selected>5 мин</option>
+          <option value="1h">1 час</option>
+        </select>
+      </label>
+      <button id="reverse-btn" type="button">Перевернуть график</button>
+      <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
+    </section>
+
+    <section class="chart-card">
+      <h2>Вход %</h2>
+      <div id="entry-chart" class="chart-container"></div>
+      <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+    </section>
+
+    <section id="exit-card" class="chart-card hidden">
+      <h2>Выход %</h2>
+      <div id="exit-chart" class="chart-container"></div>
+      <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+    </section>
+  </main>
+
+  <script>
+    const symbol = document.body.dataset.symbol;
+    const LOOKBACK_DAYS = 10;
+    const LOOKBACK_SECONDS = LOOKBACK_DAYS * 86400;
+    const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '1h': 3600 };
+    const timeframeSelect = document.getElementById('timeframe');
+    const reverseBtn = document.getElementById('reverse-btn');
+    const exitToggle = document.getElementById('exit-toggle');
+    const exchangeLine = document.getElementById('exchange-line');
+    const entryEmpty = document.getElementById('entry-empty');
+    const exitEmpty = document.getElementById('exit-empty');
+    const exitCard = document.getElementById('exit-card');
+
+    const symbolUpper = symbol.toUpperCase();
+
+    let longExchange = null;
+    let shortExchange = null;
+    let overviewRows = [];
+    const entryState = createChartState({
+      containerId: 'entry-chart',
+      emptyEl: entryEmpty,
+      isActive: () => true,
+    });
+    const exitState = createChartState({
+      containerId: 'exit-chart',
+      emptyEl: exitEmpty,
+      isActive: () => exitToggle.checked,
+    });
+    let realtimeSocket = null;
+    let realtimeReconnect = null;
+    let realtimeKey = null;
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function currentTimeframeSeconds() {
+      const key = timeframeSelect.value;
+      return TIMEFRAME_SECONDS[key] || 300;
+    }
+
+    function formatTimeTick(time) {
+      if (typeof time === 'object' && time !== null && 'year' in time) {
+        const day = String(time.day).padStart(2, '0');
+        const month = String(time.month).padStart(2, '0');
+        return `${day}.${month}`;
+      }
+      if (typeof time !== 'number') return '';
+      const date = new Date(time * 1000);
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      return `${day}.${month} ${hours}:${minutes}`;
+    }
+
+    function timeframeHasSeconds() {
+      return timeframeSelect.value === '1m';
+    }
+
+    function initChart(container) {
+      if (!window.LightweightCharts) {
+        return null;
+      }
+      const chart = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: container.clientHeight,
+        layout: {
+          background: { color: cssVar('--row') },
+          textColor: cssVar('--fg'),
+        },
+        grid: {
+          vertLines: { color: cssVar('--border') },
+          horzLines: { color: cssVar('--border') },
+        },
+        rightPriceScale: { borderColor: cssVar('--border'), scaleMargins: { top: 0.05, bottom: 0.05 } },
+        timeScale: {
+          borderColor: cssVar('--border'),
+          timeVisible: true,
+          secondsVisible: timeframeHasSeconds(),
+          tickMarkFormatter: formatTimeTick,
+        },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      });
+      const series = chart.addCandlestickSeries({
+        upColor: cssVar('--good'),
+        downColor: cssVar('--bad'),
+        borderUpColor: cssVar('--good'),
+        borderDownColor: cssVar('--bad'),
+        wickUpColor: cssVar('--good'),
+        wickDownColor: cssVar('--bad'),
+      });
+      const zeroLine = series.createPriceLine({
+        price: 0,
+        color: cssVar('--fg'),
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: '0'
+      });
+      const resizeObserver = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          const { width, height } = entry.contentRect;
+          chart.applyOptions({ width, height });
+        }
+      });
+      resizeObserver.observe(container);
+      return { chart, series, zeroLine };
+    }
+
+    function applyTimeScaleOptions(chart) {
+      if (!chart) return;
+      chart.applyOptions({
+        timeScale: {
+          borderColor: cssVar('--border'),
+          timeVisible: true,
+          secondsVisible: timeframeHasSeconds(),
+          tickMarkFormatter: formatTimeTick,
+        }
+      });
+    }
+
+    function applyZeroCenteredScale(series, data) {
+      if (!series) return;
+      const priceScale = series.priceScale();
+      if (!priceScale) return;
+      if (!data || data.length === 0) {
+        priceScale.applyOptions({ autoScale: true, scaleMargins: { top: 0.05, bottom: 0.05 } });
+        if (typeof priceScale.setPriceRange === 'function') {
+          priceScale.setPriceRange(null);
+        }
+        return;
+      }
+      const values = [];
+      data.forEach(c => {
+        values.push(Math.abs(c.open));
+        values.push(Math.abs(c.high));
+        values.push(Math.abs(c.low));
+        values.push(Math.abs(c.close));
+      });
+      const maxAbs = values.reduce((acc, val) => Math.max(acc, val), 0);
+      const span = maxAbs > 0 ? maxAbs : 1;
+      priceScale.applyOptions({ autoScale: false, scaleMargins: { top: 0.05, bottom: 0.05 } });
+      priceScale.setPriceRange({ minValue: -span, maxValue: span });
+    }
+
+    function createChartState({ containerId, emptyEl, isActive }) {
+      const state = {
+        container: document.getElementById(containerId),
+        emptyEl,
+        chart: null,
+        series: null,
+        zeroLine: null,
+        data: [],
+        isActive: typeof isActive === 'function' ? isActive : () => true,
+        ensureChart() {
+          if (this.chart) {
+            return true;
+          }
+          const res = initChart(this.container);
+          if (!res) {
+            return false;
+          }
+          this.chart = res.chart;
+          this.series = res.series;
+          this.zeroLine = res.zeroLine;
+          if (this.data.length > 0) {
+            this.applyFullData();
+          } else {
+            this.updateEmpty();
+          }
+          return true;
+        },
+        activate() {
+          if (!this.ensureChart()) {
+            return;
+          }
+          if (this.data.length > 0) {
+            this.applyFullData();
+          } else {
+            this.updateEmpty();
+          }
+        },
+        applyFullData() {
+          if (this.series) {
+            this.series.setData(this.data);
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale) {
+              if (this.data.length > 1 && typeof scale.setVisibleRange === 'function') {
+                scale.setVisibleRange({ from: this.data[0].time, to: this.data[this.data.length - 1].time });
+              } else if (typeof scale.fitContent === 'function') {
+                scale.fitContent();
+              }
+            }
+          }
+          this.updateEmpty();
+        },
+        setData(data) {
+          this.data = sortCandles(data);
+          this.applyFullData();
+        },
+        mergeData(data) {
+          this.data = sortCandles(mergeCandles(data, this.data));
+          this.applyFullData();
+        },
+        appendLive(value, ts) {
+          if (!Number.isFinite(value) || !Number.isFinite(ts)) return;
+          const tfSeconds = currentTimeframeSeconds();
+          const bucket = Math.floor(ts / tfSeconds) * tfSeconds;
+          let last = this.data[this.data.length - 1];
+          if (!last || last.time !== bucket) {
+            last = { time: bucket, open: value, high: value, low: value, close: value };
+            this.data.push(last);
+          } else {
+            last = {
+              time: bucket,
+              open: last.open,
+              high: Math.max(last.high, value),
+              low: Math.min(last.low, value),
+              close: value,
+            };
+            this.data[this.data.length - 1] = last;
+          }
+          const dropped = pruneBuffer(this.data);
+          const active = this.isActive();
+          if (active && !this.chart) {
+            this.ensureChart();
+          }
+          if (active && this.series) {
+            if (dropped > 0) {
+              this.series.setData(this.data);
+            } else {
+              this.series.update(last);
+            }
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (active && this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale) {
+              if (dropped > 0) {
+                if (this.data.length > 1 && typeof scale.setVisibleRange === 'function') {
+                  scale.setVisibleRange({ from: this.data[0].time, to: this.data[this.data.length - 1].time });
+                } else if (typeof scale.fitContent === 'function') {
+                  scale.fitContent();
+                }
+              }
+              if (typeof scale.scrollToRealTime === 'function') {
+                scale.scrollToRealTime();
+              }
+            }
+          }
+          this.updateEmpty();
+        },
+        clear() {
+          this.data = [];
+          if (this.series) {
+            this.series.setData([]);
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale && typeof scale.fitContent === 'function') {
+              scale.fitContent();
+            }
+          }
+          this.updateEmpty();
+        },
+        updateEmpty() {
+          if (!this.emptyEl) return;
+          const isEmpty = !this.data || this.data.length === 0;
+          showEmpty(this.emptyEl, isEmpty);
+        },
+        applyTheme() {
+          if (this.chart) {
+            this.chart.applyOptions({
+              layout: {
+                background: { color: cssVar('--row') },
+                textColor: cssVar('--fg'),
+              },
+              grid: {
+                vertLines: { color: cssVar('--border') },
+                horzLines: { color: cssVar('--border') },
+              },
+              rightPriceScale: { borderColor: cssVar('--border') },
+              timeScale: { borderColor: cssVar('--border') },
+            });
+          }
+          const seriesOptions = {
+            upColor: cssVar('--good'),
+            downColor: cssVar('--bad'),
+            borderUpColor: cssVar('--good'),
+            borderDownColor: cssVar('--bad'),
+            wickUpColor: cssVar('--good'),
+            wickDownColor: cssVar('--bad'),
+          };
+          if (this.series) {
+            this.series.applyOptions(seriesOptions);
+          }
+          if (this.zeroLine) {
+            this.zeroLine.applyOptions({ color: cssVar('--fg') });
+          }
+        }
+      };
+      return state;
+    }
+
+    function updateExchangeInfo() {
+      if (!longExchange || !shortExchange) {
+        exchangeLine.innerHTML = '';
+        return;
+      }
+      exchangeLine.innerHTML = `
+        <span><strong>LONG:</strong> ${longExchange.toUpperCase()}</span>
+        <span><strong>SHORT:</strong> ${shortExchange.toUpperCase()}</span>
+      `;
+    }
+
+    function updateUrl() {
+      const params = new URLSearchParams();
+      if (longExchange) params.set('long', longExchange);
+      if (shortExchange) params.set('short', shortExchange);
+      params.set('tf', timeframeSelect.value);
+      const qs = params.toString();
+      const next = qs ? `${location.pathname}?${qs}` : location.pathname;
+      history.replaceState(null, '', next);
+    }
+
+    function showEmpty(target, isEmpty) {
+      target.classList.toggle('hidden', !isEmpty);
+    }
+
+    async function fetchOverview() {
+      try {
+        const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/overview`);
+        if (!res.ok) return;
+        const data = await res.json();
+        overviewRows = Array.isArray(data.rows) ? data.rows : [];
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function ensureDefaultExchanges() {
+      const params = new URLSearchParams(location.search);
+      const qLong = params.get('long');
+      const qShort = params.get('short');
+      const tf = params.get('tf');
+      if (tf && ['1m','5m','1h'].includes(tf)) {
+        timeframeSelect.value = tf;
+      }
+      if (qLong && qShort) {
+        longExchange = qLong.toLowerCase();
+        shortExchange = qShort.toLowerCase();
+      }
+      if (!longExchange || !shortExchange) {
+        if (overviewRows.length > 0) {
+          const best = overviewRows[0];
+          const longCandidate = best.long_exchange || best.long;
+          const shortCandidate = best.short_exchange || best.short;
+          if (longCandidate) longExchange = String(longCandidate).toLowerCase();
+          if (shortCandidate) shortExchange = String(shortCandidate).toLowerCase();
+        }
+      }
+      updateExchangeInfo();
+      updateUrl();
+    }
+
+    function ensureRealtimeSocket(force = false) {
+      if (!longExchange || !shortExchange) return;
+      const nextKey = `${symbolUpper}:${longExchange}:${shortExchange}`;
+      if (!force && realtimeSocket && realtimeSocket.readyState <= 1 && realtimeKey === nextKey) {
+        return;
+      }
+      realtimeKey = nextKey;
+      if (realtimeSocket) {
+        try { realtimeSocket.close(); } catch (_) {}
+        realtimeSocket = null;
+      }
+      if (realtimeReconnect) {
+        clearTimeout(realtimeReconnect);
+        realtimeReconnect = null;
+      }
+      const params = new URLSearchParams({
+        symbol: symbolUpper,
+        long: longExchange,
+        short: shortExchange,
+      });
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      realtimeSocket = new WebSocket(`${proto}://${location.host}/ws/spreads?${params.toString()}`);
+      realtimeSocket.onmessage = (event) => {
+        handleRealtimeMessage(event.data);
+      };
+      realtimeSocket.onerror = () => {
+        try { realtimeSocket.close(); } catch (_) {}
+      };
+      realtimeSocket.onclose = () => {
+        realtimeSocket = null;
+        if (!realtimeReconnect) {
+          realtimeReconnect = setTimeout(() => ensureRealtimeSocket(true), 1200);
+        }
+      };
+    }
+
+    function pruneBuffer(buffer) {
+      if (!Array.isArray(buffer) || buffer.length === 0) return 0;
+      const cutoff = Math.floor(Date.now() / 1000) - LOOKBACK_SECONDS;
+      let dropIndex = 0;
+      while (dropIndex < buffer.length && buffer[dropIndex].time < cutoff) {
+        dropIndex += 1;
+      }
+      if (dropIndex > 0) {
+        buffer.splice(0, dropIndex);
+      }
+      return dropIndex;
+    }
+
+    function handleRealtimeMessage(raw) {
+      if (!raw || !longExchange || !shortExchange) return;
+      let payload;
+      try {
+        payload = JSON.parse(raw);
+      } catch (e) {
+        return;
+      }
+      if (!Array.isArray(payload)) return;
+      const longTarget = longExchange.toLowerCase();
+      const shortTarget = shortExchange.toLowerCase();
+      payload.forEach(row => {
+        if (!row) return;
+        if ((row.symbol || '').toUpperCase() !== symbolUpper) return;
+        const rowLong = String(row.long_exchange || row.long_ex || '').toLowerCase();
+        const rowShort = String(row.short_exchange || row.short_ex || '').toLowerCase();
+        if (rowLong !== longTarget || rowShort !== shortTarget) return;
+        const ts = Number(row._ts || row.ts || Date.now() / 1000);
+          const entryValue = Number(row.entry_pct);
+          entryState.appendLive(entryValue, ts);
+        if (typeof row.exit_pct !== 'undefined') {
+          const exitValue = Number(row.exit_pct);
+          exitState.appendLive(exitValue, ts);
+        }
+      });
+    }
+
+    function sortCandles(data) {
+      if (!Array.isArray(data)) return [];
+      return data.slice().sort((a, b) => a.time - b.time);
+    }
+
+    function mergeCandles(history, updates) {
+      const result = new Map();
+      const push = (source) => {
+        if (!Array.isArray(source)) return;
+        source.forEach((candle) => {
+          if (!candle) return;
+          const time = Number(candle.time);
+          if (!Number.isFinite(time)) return;
+          result.set(time, {
+            time,
+            open: Number(candle.open),
+            high: Number(candle.high),
+            low: Number(candle.low),
+            close: Number(candle.close),
+          });
+        });
+      };
+      push(history);
+      push(updates);
+      return Array.from(result.values()).sort((a, b) => a.time - b.time);
+    }
+
+    async function loadCandles(metric) {
+      const params = new URLSearchParams({
+        long: longExchange,
+        short: shortExchange,
+        timeframe: timeframeSelect.value,
+        metric,
+        days: LOOKBACK_DAYS,
+      });
+      const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/spreads?${params.toString()}`);
+      if (!res.ok) {
+        return { candles: [] };
+      }
+      const data = await res.json();
+      return data;
+    }
+
+    function toSeriesData(candles) {
+      return candles.map(c => ({
+        time: Math.floor(c.ts),
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close),
+      }));
+    }
+
+    async function renderEntry() {
+      entryState.activate();
+      const { candles } = await loadCandles('entry');
+      if (!candles || candles.length === 0) {
+        if (entryState.data.length === 0) {
+          entryState.setData([]);
+        } else {
+          entryState.applyFullData();
+        }
+        return;
+      }
+      const data = toSeriesData(candles);
+      entryState.mergeData(data);
+    }
+
+    async function renderExit() {
+      if (!exitToggle.checked) {
+        return;
+      }
+      exitState.activate();
+      const { candles } = await loadCandles('exit');
+      if (!candles || candles.length === 0) {
+        exitState.updateEmpty();
+        return;
+      }
+      const historical = toSeriesData(candles);
+      exitState.mergeData(historical);
+    }
+
+    async function refreshCharts() {
+      if (!longExchange || !shortExchange) return;
+      entryState.clear();
+      exitState.clear();
+      ensureRealtimeSocket();
+      updateExchangeInfo();
+      updateUrl();
+      await renderEntry();
+      if (exitToggle.checked) {
+        await renderExit();
+      }
+    }
+
+    timeframeSelect.addEventListener('change', () => {
+      refreshCharts();
+    });
+
+    reverseBtn.addEventListener('click', async () => {
+      if (!longExchange || !shortExchange) return;
+      [longExchange, shortExchange] = [shortExchange, longExchange];
+      await refreshCharts();
+    });
+
+    exitToggle.addEventListener('change', async () => {
+      exitCard.classList.toggle('hidden', !exitToggle.checked);
+      if (exitToggle.checked) {
+        exitState.activate();
+        ensureRealtimeSocket(true);
+        try {
+          await renderExit();
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    });
+
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const html = document.documentElement;
+      const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      [entryState, exitState].forEach((state) => {
+        state.applyTheme();
+        if (state.chart) {
+          applyTimeScaleOptions(state.chart);
+        }
+      });
+    });
+
+    (async function init() {
+      await fetchOverview();
+      ensureDefaultExchanges();
+      await refreshCharts();
+    })();
+  </script>
+</body>
+</html>
