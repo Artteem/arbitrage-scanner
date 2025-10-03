@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Карточка пары {{symbol}}</title>
+  <style>
+    :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa4ad; --row:#161a20; --accent:#4aa3ff; --bad:#ff5a5f; --good:#12d67a; --link:#7ab7ff; --border:#2a2f39; }
+    [data-theme="light"] { --bg:#fff; --fg:#0f172a; --muted:#4b5563; --row:#f8fafc; --accent:#0ea5e9; --bad:#ef4444; --good:#10b981; --link:#2563eb; --border:#e5e7eb; }
+    body { background:var(--bg); color:var(--fg); font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin:0; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--border); }
+    h1 { font-size:18px; margin:0; }
+    a { color:var(--link); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .layout { padding:16px; display:flex; flex-direction:column; gap:16px; }
+    .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+    .badge { font-size:13px; color:var(--muted); }
+    button, select { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
+    button:hover, select:hover { border-color:var(--accent); }
+    label { font-size:14px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+    input[type="checkbox"] { accent-color:var(--accent); }
+    .chart-card { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:12px; }
+    .chart-card h2 { margin:0 0 8px 0; font-size:16px; font-weight:600; }
+    .chart-container { height:340px; position:relative; }
+    .empty { font-size:14px; color:var(--muted); padding:32px 0; text-align:center; }
+    .exchange-line { display:flex; flex-wrap:wrap; gap:12px; font-size:14px; }
+    .exchange-line span { display:flex; align-items:center; gap:4px; }
+    .hidden { display:none; }
+  </style>
+  <script src="https://unpkg.com/lightweight-charts@4.0.1/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body data-symbol="{{symbol}}">
+  <header>
+    <div>
+      <div class="badge"><a href="/ui">← Назад к таблице</a></div>
+      <h1>{{symbol}}</h1>
+    </div>
+    <div class="controls">
+      <button id="theme-toggle" type="button">Светлая/Тёмная</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="exchange-line" id="exchange-line"></section>
+    <section class="controls">
+      <label>Таймфрейм
+        <select id="timeframe">
+          <option value="1m">1 мин</option>
+          <option value="5m">5 мин</option>
+          <option value="1h">1 час</option>
+        </select>
+      </label>
+      <button id="reverse-btn" type="button">Перевернуть график</button>
+      <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
+    </section>
+
+    <section class="chart-card">
+      <h2>Вход %</h2>
+      <div id="entry-chart" class="chart-container"></div>
+      <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+    </section>
+
+    <section id="exit-card" class="chart-card hidden">
+      <h2>Выход %</h2>
+      <div id="exit-chart" class="chart-container"></div>
+      <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+    </section>
+  </main>
+
+  <script>
+    const symbol = document.body.dataset.symbol;
+    const timeframeSelect = document.getElementById('timeframe');
+    const reverseBtn = document.getElementById('reverse-btn');
+    const exitToggle = document.getElementById('exit-toggle');
+    const exchangeLine = document.getElementById('exchange-line');
+    const entryEmpty = document.getElementById('entry-empty');
+    const exitEmpty = document.getElementById('exit-empty');
+    const exitCard = document.getElementById('exit-card');
+
+    let longExchange = null;
+    let shortExchange = null;
+    let overviewRows = [];
+    let entryChart = null;
+    let entrySeries = null;
+    let exitChart = null;
+    let exitSeries = null;
+    let entryZeroLine = null;
+    let exitZeroLine = null;
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function initChart(container) {
+      if (!window.LightweightCharts) {
+        return null;
+      }
+      const chart = LightweightCharts.createChart(container, {
+        width: container.clientWidth,
+        height: container.clientHeight,
+        layout: {
+          background: { color: cssVar('--row') },
+          textColor: cssVar('--fg'),
+        },
+        grid: {
+          vertLines: { color: cssVar('--border') },
+          horzLines: { color: cssVar('--border') },
+        },
+        rightPriceScale: { borderColor: cssVar('--border') },
+        timeScale: { borderColor: cssVar('--border') },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      });
+      const series = chart.addCandlestickSeries({
+        upColor: cssVar('--good'),
+        downColor: cssVar('--bad'),
+        borderUpColor: cssVar('--good'),
+        borderDownColor: cssVar('--bad'),
+        wickUpColor: cssVar('--good'),
+        wickDownColor: cssVar('--bad'),
+      });
+      const zeroLine = series.createPriceLine({
+        price: 0,
+        color: cssVar('--fg'),
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: '0'
+      });
+      const resizeObserver = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          const { width, height } = entry.contentRect;
+          chart.applyOptions({ width, height });
+        }
+      });
+      resizeObserver.observe(container);
+      return { chart, series, zeroLine };
+    }
+
+    function updateExchangeInfo() {
+      if (!longExchange || !shortExchange) {
+        exchangeLine.innerHTML = '';
+        return;
+      }
+      exchangeLine.innerHTML = `
+        <span><strong>LONG:</strong> ${longExchange.toUpperCase()}</span>
+        <span><strong>SHORT:</strong> ${shortExchange.toUpperCase()}</span>
+      `;
+    }
+
+    function updateUrl() {
+      const params = new URLSearchParams();
+      if (longExchange) params.set('long', longExchange);
+      if (shortExchange) params.set('short', shortExchange);
+      params.set('tf', timeframeSelect.value);
+      const qs = params.toString();
+      const next = qs ? `${location.pathname}?${qs}` : location.pathname;
+      history.replaceState(null, '', next);
+    }
+
+    function showEmpty(target, isEmpty) {
+      target.classList.toggle('hidden', !isEmpty);
+    }
+
+    async function fetchOverview() {
+      try {
+        const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/overview`);
+        if (!res.ok) return;
+        const data = await res.json();
+        overviewRows = Array.isArray(data.rows) ? data.rows : [];
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function ensureDefaultExchanges() {
+      const params = new URLSearchParams(location.search);
+      const qLong = params.get('long');
+      const qShort = params.get('short');
+      const tf = params.get('tf');
+      if (tf && ['1m','5m','1h'].includes(tf)) {
+        timeframeSelect.value = tf;
+      }
+      if (qLong && qShort) {
+        longExchange = qLong.toLowerCase();
+        shortExchange = qShort.toLowerCase();
+      }
+      if (!longExchange || !shortExchange) {
+        if (overviewRows.length > 0) {
+          const best = overviewRows[0];
+          const longCandidate = best.long_exchange || best.long;
+          const shortCandidate = best.short_exchange || best.short;
+          if (longCandidate) longExchange = String(longCandidate).toLowerCase();
+          if (shortCandidate) shortExchange = String(shortCandidate).toLowerCase();
+        }
+      }
+      updateExchangeInfo();
+      updateUrl();
+    }
+
+    async function loadCandles(metric) {
+      const params = new URLSearchParams({
+        long: longExchange,
+        short: shortExchange,
+        timeframe: timeframeSelect.value,
+        metric,
+      });
+      const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/spreads?${params.toString()}`);
+      if (!res.ok) {
+        return { candles: [] };
+      }
+      const data = await res.json();
+      return data;
+    }
+
+    function toSeriesData(candles) {
+      return candles.map(c => ({
+        time: Math.floor(c.ts),
+        open: Number(c.open),
+        high: Number(c.high),
+        low: Number(c.low),
+        close: Number(c.close),
+      }));
+    }
+
+    async function renderEntry() {
+      if (!entryChart) {
+        const res = initChart(document.getElementById('entry-chart'));
+        if (!res) return;
+        entryChart = res.chart;
+        entrySeries = res.series;
+        entryZeroLine = res.zeroLine;
+      }
+      const { candles } = await loadCandles('entry');
+      if (!candles || candles.length === 0) {
+        showEmpty(entryEmpty, true);
+        entrySeries.setData([]);
+      } else {
+        showEmpty(entryEmpty, false);
+        entrySeries.setData(toSeriesData(candles));
+      }
+    }
+
+    async function renderExit() {
+      if (!exitToggle.checked) {
+        return;
+      }
+      if (!exitChart) {
+        const res = initChart(document.getElementById('exit-chart'));
+        if (!res) return;
+        exitChart = res.chart;
+        exitSeries = res.series;
+        exitZeroLine = res.zeroLine;
+      }
+      const { candles } = await loadCandles('exit');
+      if (!candles || candles.length === 0) {
+        showEmpty(exitEmpty, true);
+        exitSeries.setData([]);
+      } else {
+        showEmpty(exitEmpty, false);
+        exitSeries.setData(toSeriesData(candles));
+      }
+    }
+
+    async function refreshCharts() {
+      if (!longExchange || !shortExchange) return;
+      updateExchangeInfo();
+      updateUrl();
+      await renderEntry();
+      if (exitToggle.checked) {
+        await renderExit();
+      }
+    }
+
+    timeframeSelect.addEventListener('change', () => {
+      refreshCharts();
+    });
+
+    reverseBtn.addEventListener('click', () => {
+      if (!longExchange || !shortExchange) return;
+      [longExchange, shortExchange] = [shortExchange, longExchange];
+      refreshCharts();
+    });
+
+    exitToggle.addEventListener('change', () => {
+      exitCard.classList.toggle('hidden', !exitToggle.checked);
+      if (exitToggle.checked) {
+        renderExit();
+      }
+    });
+
+      document.getElementById('theme-toggle').addEventListener('click', () => {
+        const html = document.documentElement;
+        const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        html.setAttribute('data-theme', next);
+        [entryChart, exitChart].forEach(chart => {
+          if (!chart) return;
+          chart.applyOptions({
+            layout: {
+              background: { color: cssVar('--row') },
+              textColor: cssVar('--fg')
+            },
+            grid: {
+              vertLines: { color: cssVar('--border') },
+              horzLines: { color: cssVar('--border') },
+            },
+            rightPriceScale: { borderColor: cssVar('--border') },
+            timeScale: { borderColor: cssVar('--border') },
+          });
+        });
+        const seriesOptions = {
+          upColor: cssVar('--good'),
+          downColor: cssVar('--bad'),
+          borderUpColor: cssVar('--good'),
+          borderDownColor: cssVar('--bad'),
+          wickUpColor: cssVar('--good'),
+          wickDownColor: cssVar('--bad'),
+        };
+        if (entrySeries) entrySeries.applyOptions(seriesOptions);
+        if (exitSeries) exitSeries.applyOptions(seriesOptions);
+        if (entryZeroLine) entryZeroLine.applyOptions({ color: cssVar('--fg') });
+        if (exitZeroLine) exitZeroLine.applyOptions({ color: cssVar('--fg') });
+      });
+
+    (async function init() {
+      await fetchOverview();
+      ensureDefaultExchanges();
+      await refreshCharts();
+    })();
+  </script>
+</body>
+</html>

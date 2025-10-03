@@ -154,7 +154,8 @@
 
     function render(rs) {
       tbody.innerHTML = rs.map(r => {
-        const pairLink = `<a href="/pair/${r.symbol}" target="_blank" rel="noopener" title="Карточка пары">${r.symbol}</a>`;
+        const pairUrl = `/pair/${encodeURIComponent(r.symbol)}?long=${encodeURIComponent(r.long_exchange)}&short=${encodeURIComponent(r.short_exchange)}`;
+        const pairLink = `<a href="${pairUrl}" title="Карточка пары">${r.symbol}</a>`;
         const exLong = `<div><a href="${exchangeUrl(r.long_exchange, r.symbol)}" target="_blank" rel="noopener">${r.long_exchange.toUpperCase()}</a><div class="badge">фандинг: ${(r.funding_long*100).toFixed(4)}% / ${r.funding_interval_long||"—"}</div></div>`;
         const exShort = `<div><a href="${exchangeUrl(r.short_exchange, r.symbol)}" target="_blank" rel="noopener">${r.short_exchange.toUpperCase()}</a><div class="badge">фандинг: ${(r.funding_short*100).toFixed(4)}% / ${r.funding_interval_short||"—"}</div></div>`;
         const entryCls = r.entry_pct >= 0 ? "pos" : "neg";
