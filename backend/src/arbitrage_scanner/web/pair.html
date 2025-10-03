@@ -70,6 +70,7 @@
   <script>
     const symbol = document.body.dataset.symbol;
     const LOOKBACK_DAYS = 10;
+    const LOOKBACK_SECONDS = LOOKBACK_DAYS * 86400;
     const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '1h': 3600 };
     const timeframeSelect = document.getElementById('timeframe');
     const reverseBtn = document.getElementById('reverse-btn');
@@ -94,6 +95,7 @@
     let exitData = [];
     let realtimeSocket = null;
     let realtimeReconnect = null;
+    let realtimeKey = null;
 
     function cssVar(name) {
       return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -138,7 +140,7 @@
           vertLines: { color: cssVar('--border') },
           horzLines: { color: cssVar('--border') },
         },
-        rightPriceScale: { borderColor: cssVar('--border'), scaleMargins: { top: 0.1, bottom: 0.1 } },
+        rightPriceScale: { borderColor: cssVar('--border'), scaleMargins: { top: 0.05, bottom: 0.05 } },
         timeScale: {
           borderColor: cssVar('--border'),
           timeVisible: true,
@@ -190,7 +192,7 @@
       const priceScale = series.priceScale();
       if (!priceScale) return;
       if (!data || data.length === 0) {
-        priceScale.applyOptions({ autoScale: true, scaleMargins: { top: 0.1, bottom: 0.1 } });
+        priceScale.applyOptions({ autoScale: true, scaleMargins: { top: 0.05, bottom: 0.05 } });
         if (typeof priceScale.setPriceRange === 'function') {
           priceScale.setPriceRange(null);
         }
@@ -205,7 +207,7 @@
       });
       const maxAbs = values.reduce((acc, val) => Math.max(acc, val), 0);
       const span = maxAbs > 0 ? maxAbs : 1;
-      priceScale.applyOptions({ autoScale: false, scaleMargins: { top: 0.1, bottom: 0.1 } });
+      priceScale.applyOptions({ autoScale: false, scaleMargins: { top: 0.05, bottom: 0.05 } });
       priceScale.setPriceRange({ minValue: -span, maxValue: span });
     }
 
@@ -270,16 +272,28 @@
       updateUrl();
     }
 
-    function ensureRealtimeSocket() {
-      if (realtimeSocket && realtimeSocket.readyState <= 1) {
+    function ensureRealtimeSocket(force = false) {
+      if (!longExchange || !shortExchange) return;
+      const nextKey = `${symbolUpper}:${longExchange}:${shortExchange}`;
+      if (!force && realtimeSocket && realtimeSocket.readyState <= 1 && realtimeKey === nextKey) {
         return;
+      }
+      realtimeKey = nextKey;
+      if (realtimeSocket) {
+        try { realtimeSocket.close(); } catch (_) {}
+        realtimeSocket = null;
       }
       if (realtimeReconnect) {
         clearTimeout(realtimeReconnect);
         realtimeReconnect = null;
       }
+      const params = new URLSearchParams({
+        symbol: symbolUpper,
+        long: longExchange,
+        short: shortExchange,
+      });
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      realtimeSocket = new WebSocket(`${proto}://${location.host}/ws/spreads`);
+      realtimeSocket = new WebSocket(`${proto}://${location.host}/ws/spreads?${params.toString()}`);
       realtimeSocket.onmessage = (event) => {
         handleRealtimeMessage(event.data);
       };
@@ -289,9 +303,22 @@
       realtimeSocket.onclose = () => {
         realtimeSocket = null;
         if (!realtimeReconnect) {
-          realtimeReconnect = setTimeout(ensureRealtimeSocket, 1500);
+          realtimeReconnect = setTimeout(() => ensureRealtimeSocket(true), 1200);
         }
       };
+    }
+
+    function pruneBuffer(buffer) {
+      if (!Array.isArray(buffer) || buffer.length === 0) return 0;
+      const cutoff = Math.floor(Date.now() / 1000) - LOOKBACK_SECONDS;
+      let dropIndex = 0;
+      while (dropIndex < buffer.length && buffer[dropIndex].time < cutoff) {
+        dropIndex += 1;
+      }
+      if (dropIndex > 0) {
+        buffer.splice(0, dropIndex);
+      }
+      return dropIndex;
     }
 
     function updateSeriesBuffer(buffer, series, chart, value, ts) {
@@ -315,6 +342,10 @@
         const candle = { time, open: value, high: value, low: value, close: value };
         buffer.push(candle);
         series.update(candle);
+      }
+      const dropped = pruneBuffer(buffer);
+      if (dropped > 0) {
+        series.setData(buffer);
       }
       applyZeroCenteredScale(series, buffer);
       applyTimeScaleOptions(chart);
@@ -358,26 +389,41 @@
       });
     }
 
+    function sortCandles(data) {
+      if (!Array.isArray(data)) return [];
+      return data.slice().sort((a, b) => a.time - b.time);
+    }
+
     function setEntryData(data) {
-      entryData = Array.isArray(data) ? data.slice() : [];
+      entryData = sortCandles(data);
       if (entrySeries) {
         entrySeries.setData(entryData);
         applyZeroCenteredScale(entrySeries, entryData);
         if (entryChart) {
           applyTimeScaleOptions(entryChart);
-          entryChart.timeScale().fitContent();
+          const scale = entryChart.timeScale();
+          if (entryData.length > 1 && scale && typeof scale.setVisibleRange === 'function') {
+            scale.setVisibleRange({ from: entryData[0].time, to: entryData[entryData.length - 1].time });
+          } else if (scale && typeof scale.fitContent === 'function') {
+            scale.fitContent();
+          }
         }
       }
     }
 
     function setExitData(data) {
-      exitData = Array.isArray(data) ? data.slice() : [];
+      exitData = sortCandles(data);
       if (exitSeries) {
         exitSeries.setData(exitData);
         applyZeroCenteredScale(exitSeries, exitData);
         if (exitChart) {
           applyTimeScaleOptions(exitChart);
-          exitChart.timeScale().fitContent();
+          const scale = exitChart.timeScale();
+          if (exitData.length > 1 && scale && typeof scale.setVisibleRange === 'function') {
+            scale.setVisibleRange({ from: exitData[0].time, to: exitData[exitData.length - 1].time });
+          } else if (scale && typeof scale.fitContent === 'function') {
+            scale.fitContent();
+          }
         }
       }
     }
@@ -425,7 +471,6 @@
         const data = toSeriesData(candles);
         setEntryData(data);
       }
-      ensureRealtimeSocket();
     }
 
     async function renderExit() {
@@ -452,6 +497,7 @@
 
     async function refreshCharts() {
       if (!longExchange || !shortExchange) return;
+      ensureRealtimeSocket();
       updateExchangeInfo();
       updateUrl();
       await renderEntry();
@@ -464,10 +510,10 @@
       refreshCharts();
     });
 
-    reverseBtn.addEventListener('click', () => {
+    reverseBtn.addEventListener('click', async () => {
       if (!longExchange || !shortExchange) return;
       [longExchange, shortExchange] = [shortExchange, longExchange];
-      refreshCharts();
+      await refreshCharts();
     });
 
     exitToggle.addEventListener('change', () => {

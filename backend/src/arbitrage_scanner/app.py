@@ -234,16 +234,28 @@ async def pair_spreads(
 @app.websocket("/ws/spreads")
 async def ws_spreads(ws: WebSocket):
     await ws.accept()
+    target_symbol = (ws.query_params.get("symbol") or "").upper()
+    target_long = (ws.query_params.get("long") or "").lower()
+    target_short = (ws.query_params.get("short") or "").lower()
+    use_filter = bool(target_symbol and target_long and target_short)
     try:
         while True:
             rows = _current_rows()
             ts = LAST_ROWS_TS if LAST_ROWS else time.time()
             payload = []
             for r in rows:
+                if use_filter:
+                    if (
+                        r.symbol.upper() != target_symbol
+                        or r.long_ex.lower() != target_long
+                        or r.short_ex.lower() != target_short
+                    ):
+                        continue
                 item = r.as_dict()
                 item["_ts"] = ts
                 payload.append(item)
-            await ws.send_text(json.dumps(payload))
+            if payload or not use_filter:
+                await ws.send_text(json.dumps(payload))
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         return
