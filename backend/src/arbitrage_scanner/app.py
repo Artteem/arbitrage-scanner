@@ -34,6 +34,7 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 LAST_ROWS: list[Row] = []
+LAST_ROWS_TS: float = 0.0
 
 TIMEFRAME_ALIASES: dict[str, int] = {
     "1m": 60,
@@ -85,7 +86,7 @@ def _rows_for_symbol(symbol: Symbol) -> list[Row]:
 
 
 async def _spread_loop() -> None:
-    global LAST_ROWS
+    global LAST_ROWS, LAST_ROWS_TS
     while True:
         try:
             rows = compute_rows(
@@ -105,9 +106,11 @@ async def _spread_loop() -> None:
                     ts=ts,
                 )
             LAST_ROWS = rows
+            LAST_ROWS_TS = ts
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception("Failed to compute spreads", exc_info=exc)
             LAST_ROWS = []
+            LAST_ROWS_TS = 0.0
         await asyncio.sleep(1.0)
 
 
@@ -233,7 +236,13 @@ async def ws_spreads(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            payload = [r.as_dict() for r in _current_rows()]
+            rows = _current_rows()
+            ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+            payload = []
+            for r in rows:
+                item = r.as_dict()
+                item["_ts"] = ts
+                payload.append(item)
             await ws.send_text(json.dumps(payload))
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
