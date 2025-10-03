@@ -14,6 +14,7 @@ from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
+from .exchanges.limits import fetch_limits as fetch_exchange_limits
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
 
@@ -228,6 +229,19 @@ async def pair_spreads(
         "timeframe": timeframe,
         "timeframe_seconds": tf_value,
         "candles": [c.to_dict() for c in candles],
+    }
+
+
+@app.get("/api/pair/{symbol}/limits")
+async def pair_limits(symbol: str, long_exchange: str = Query(..., alias="long"), short_exchange: str = Query(..., alias="short")):
+    long_limits = await fetch_exchange_limits(long_exchange, symbol)
+    short_limits = await fetch_exchange_limits(short_exchange, symbol)
+    return {
+        "symbol": symbol.upper(),
+        "long_exchange": long_exchange.lower(),
+        "short_exchange": short_exchange.lower(),
+        "long": long_limits,
+        "short": short_limits,
     }
 
 

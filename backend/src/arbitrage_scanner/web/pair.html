@@ -12,13 +12,18 @@
     h1 { font-size:18px; margin:0; }
     a { color:var(--link); text-decoration:none; }
     a:hover { text-decoration:underline; }
-    .layout { padding:16px; display:flex; flex-direction:column; gap:16px; }
+    .layout { padding:16px; display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+    .layout-left, .layout-right { display:flex; flex-direction:column; gap:16px; }
+    .layout-left { flex:1 1 480px; min-width:320px; }
+    .layout-right { flex:1 1 420px; min-width:320px; }
     .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
     .badge { font-size:13px; color:var(--muted); }
     button, select { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
     button:hover, select:hover { border-color:var(--accent); }
     label { font-size:14px; color:var(--muted); display:flex; align-items:center; gap:6px; }
     input[type="checkbox"] { accent-color:var(--accent); }
+    input[type="number"] { padding:6px 8px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; }
+    input[type="number"]:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
     .chart-card { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:12px; }
     .chart-card h2 { margin:0 0 8px 0; font-size:16px; font-weight:600; }
     .chart-container { height:340px; position:relative; }
@@ -26,6 +31,30 @@
     .exchange-line { display:flex; flex-wrap:wrap; gap:12px; font-size:14px; }
     .exchange-line span { display:flex; align-items:center; gap:4px; }
     .hidden { display:none; }
+    .summary { display:flex; flex-direction:column; gap:16px; }
+    .summary-controls { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-end; }
+    .volume-input { display:flex; flex-direction:column; gap:6px; color:var(--muted); font-size:13px; }
+    .volume-input input { width:160px; font-size:15px; color:var(--fg); }
+    .metrics-grid { display:flex; flex-wrap:wrap; gap:12px; }
+    .metric-card { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:12px 14px; min-width:160px; }
+    .metric-label { font-size:13px; color:var(--muted); }
+    .metric-value { font-size:20px; font-weight:600; }
+    .metric-sub { font-size:13px; color:var(--muted); margin-top:4px; }
+    .metric-pos { color:var(--good); }
+    .metric-neg { color:var(--bad); }
+    .exchanges-grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); }
+    .exchange-card { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:10px; }
+    .exchange-card-header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .exchange-card-header h3 { margin:0; font-size:16px; font-weight:600; }
+    .exchange-meta { font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
+    .orderbook { display:grid; grid-template-columns:1fr minmax(80px, auto) 1fr; gap:12px; font-family:var(--mono, "JetBrains Mono", "Fira Mono", monospace); font-size:13px; }
+    .orderbook .asks { display:flex; flex-direction:column-reverse; gap:4px; }
+    .orderbook .bids { display:flex; flex-direction:column; gap:4px; }
+    .orderbook .asks div { color:var(--bad); display:flex; justify-content:space-between; }
+    .orderbook .bids div { color:var(--good); display:flex; justify-content:space-between; }
+    .orderbook .mid { display:flex; flex-direction:column; justify-content:center; align-items:center; font-weight:600; font-size:14px; gap:4px; }
+    .orderbook .mid span { color:var(--muted); font-size:12px; font-weight:400; }
+    .orderbook-empty { font-size:13px; color:var(--muted); text-align:center; padding:12px; border:1px dashed var(--border); border-radius:8px; }
   </style>
   <script src="https://unpkg.com/lightweight-charts@4.0.1/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -41,30 +70,104 @@
   </header>
 
   <main class="layout">
-    <section class="exchange-line" id="exchange-line"></section>
-    <section class="controls">
-      <label>Таймфрейм
-        <select id="timeframe">
-          <option value="1m">1 мин</option>
-          <option value="5m" selected>5 мин</option>
-          <option value="1h">1 час</option>
-        </select>
-      </label>
-      <button id="reverse-btn" type="button">Перевернуть график</button>
-      <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
-    </section>
+    <div class="layout-left">
+      <section class="controls">
+        <label>Таймфрейм
+          <select id="timeframe">
+            <option value="1m">1 мин</option>
+            <option value="5m" selected>5 мин</option>
+            <option value="1h">1 час</option>
+          </select>
+        </label>
+        <button id="reverse-btn" type="button">Перевернуть график</button>
+        <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
+      </section>
 
-    <section class="chart-card">
-      <h2>Вход %</h2>
-      <div id="entry-chart" class="chart-container"></div>
-      <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
-    </section>
+      <section class="chart-card">
+        <h2>Вход %</h2>
+        <div id="entry-chart" class="chart-container"></div>
+        <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+      </section>
 
-    <section id="exit-card" class="chart-card hidden">
-      <h2>Выход %</h2>
-      <div id="exit-chart" class="chart-container"></div>
-      <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
-    </section>
+      <section id="exit-card" class="chart-card hidden">
+        <h2>Выход %</h2>
+        <div id="exit-chart" class="chart-container"></div>
+        <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+      </section>
+    </div>
+
+    <div class="layout-right">
+      <section class="summary">
+        <div class="summary-controls">
+          <label class="volume-input">Объём сделки, USDT
+            <input id="volume-input" type="number" min="0" step="10" value="1000"/>
+          </label>
+          <div class="metrics-grid">
+            <div class="metric-card">
+              <div class="metric-label">Вход</div>
+              <div class="metric-value" id="metric-entry">—</div>
+              <div class="metric-sub" id="metric-entry-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Выход</div>
+              <div class="metric-value" id="metric-exit">—</div>
+              <div class="metric-sub" id="metric-exit-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Спред фандинга</div>
+              <div class="metric-value" id="metric-funding">—</div>
+              <div class="metric-sub" id="metric-funding-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Комиссии</div>
+              <div class="metric-value" id="metric-fees">—</div>
+              <div class="metric-sub" id="metric-fees-usd">—</div>
+            </div>
+          </div>
+        </div>
+        <section class="exchange-line" id="exchange-line"></section>
+        <div class="exchanges-grid">
+          <div class="exchange-card" id="long-card">
+            <div class="exchange-card-header">
+              <h3>LONG</h3>
+              <a id="long-link" href="#" target="_blank" rel="noopener">—</a>
+            </div>
+            <div class="exchange-meta">
+              <div id="long-funding">Фандинг: —</div>
+              <div id="long-limit">Лимит: —</div>
+            </div>
+            <div class="orderbook" id="long-orderbook">
+              <div class="asks" id="long-asks"></div>
+              <div class="mid" id="long-mid">
+                <div id="long-last-price">—</div>
+                <span>посл. сделка</span>
+              </div>
+              <div class="bids" id="long-bids"></div>
+            </div>
+            <div class="orderbook-empty hidden" id="long-orderbook-empty">Стакан недоступен</div>
+          </div>
+          <div class="exchange-card" id="short-card">
+            <div class="exchange-card-header">
+              <h3>SHORT</h3>
+              <a id="short-link" href="#" target="_blank" rel="noopener">—</a>
+            </div>
+            <div class="exchange-meta">
+              <div id="short-funding">Фандинг: —</div>
+              <div id="short-limit">Лимит: —</div>
+            </div>
+            <div class="orderbook" id="short-orderbook">
+              <div class="asks" id="short-asks"></div>
+              <div class="mid" id="short-mid">
+                <div id="short-last-price">—</div>
+                <span>посл. сделка</span>
+              </div>
+              <div class="bids" id="short-bids"></div>
+            </div>
+            <div class="orderbook-empty hidden" id="short-orderbook-empty">Стакан недоступен</div>
+          </div>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script>
@@ -79,12 +182,39 @@
     const entryEmpty = document.getElementById('entry-empty');
     const exitEmpty = document.getElementById('exit-empty');
     const exitCard = document.getElementById('exit-card');
+    const volumeInput = document.getElementById('volume-input');
+    const metricEntry = document.getElementById('metric-entry');
+    const metricEntryUsd = document.getElementById('metric-entry-usd');
+    const metricExit = document.getElementById('metric-exit');
+    const metricExitUsd = document.getElementById('metric-exit-usd');
+    const metricFunding = document.getElementById('metric-funding');
+    const metricFundingUsd = document.getElementById('metric-funding-usd');
+    const metricFees = document.getElementById('metric-fees');
+    const metricFeesUsd = document.getElementById('metric-fees-usd');
+    const longLink = document.getElementById('long-link');
+    const shortLink = document.getElementById('short-link');
+    const longFundingMeta = document.getElementById('long-funding');
+    const shortFundingMeta = document.getElementById('short-funding');
+    const longLimitMeta = document.getElementById('long-limit');
+    const shortLimitMeta = document.getElementById('short-limit');
+    const longAsksEl = document.getElementById('long-asks');
+    const longBidsEl = document.getElementById('long-bids');
+    const shortAsksEl = document.getElementById('short-asks');
+    const shortBidsEl = document.getElementById('short-bids');
+    const longOrderbookEl = document.getElementById('long-orderbook');
+    const shortOrderbookEl = document.getElementById('short-orderbook');
+    const longOrderbookEmpty = document.getElementById('long-orderbook-empty');
+    const shortOrderbookEmpty = document.getElementById('short-orderbook-empty');
+    const longLastPriceEl = document.getElementById('long-last-price');
+    const shortLastPriceEl = document.getElementById('short-last-price');
 
     const symbolUpper = symbol.toUpperCase();
 
     let longExchange = null;
     let shortExchange = null;
     let overviewRows = [];
+    let currentRow = null;
+    let currentLimits = { long: null, short: null };
     const entryState = createChartState({
       containerId: 'entry-chart',
       emptyEl: entryEmpty,
@@ -380,14 +510,20 @@
     }
 
     function updateExchangeInfo() {
-      if (!longExchange || !shortExchange) {
-        exchangeLine.innerHTML = '';
-        return;
+      const parts = [];
+      if (longExchange) {
+        parts.push(`<span><strong>LONG:</strong> ${longExchange.toUpperCase()}</span>`);
       }
-      exchangeLine.innerHTML = `
-        <span><strong>LONG:</strong> ${longExchange.toUpperCase()}</span>
-        <span><strong>SHORT:</strong> ${shortExchange.toUpperCase()}</span>
-      `;
+      if (shortExchange) {
+        parts.push(`<span><strong>SHORT:</strong> ${shortExchange.toUpperCase()}</span>`);
+      }
+      exchangeLine.innerHTML = parts.join(' ');
+      const longText = longExchange ? longExchange.toUpperCase() : '—';
+      const shortText = shortExchange ? shortExchange.toUpperCase() : '—';
+      longLink.textContent = longText;
+      longLink.href = longExchange ? exchangeUrl(longExchange, symbolUpper) : '#';
+      shortLink.textContent = shortText;
+      shortLink.href = shortExchange ? exchangeUrl(shortExchange, symbolUpper) : '#';
     }
 
     function updateUrl() {
@@ -476,6 +612,459 @@
       };
     }
 
+    function exchangeUrl(ex, sym) {
+      switch ((ex || '').toLowerCase()) {
+        case 'binance':
+          return `https://www.binance.com/en/futures/${sym}`;
+        case 'bybit':
+          return `https://www.bybit.com/trade/usdt/${sym}`;
+        case 'mexc':
+          return `https://futures.mexc.com/exchange/${toMexcSymbol(sym)}`;
+        case 'bingx':
+          return `https://bingx.com/en-us/futures/${toBingxSymbol(sym)}`;
+        default:
+          return '#';
+      }
+    }
+
+    function toMexcSymbol(sym) {
+      if (!sym) return sym;
+      if (sym.includes('_')) return sym;
+      return sym.endsWith('USDT') ? `${sym.slice(0, -4)}_USDT` : sym;
+    }
+
+    function toBingxSymbol(sym) {
+      if (!sym) return sym;
+      const upper = sym.toUpperCase();
+      const quotes = ['USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'];
+      const quote = quotes.find(q => upper.endsWith(q));
+      if (!quote) return upper;
+      const base = upper.slice(0, -quote.length);
+      return `${base}-${quote}`;
+    }
+
+    function baseSymbol() {
+      const quotes = ['USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'];
+      for (const quote of quotes) {
+        if (symbolUpper.endsWith(quote)) {
+          return symbolUpper.slice(0, -quote.length);
+        }
+      }
+      return symbolUpper;
+    }
+
+    function formatPercent(value) {
+      if (!Number.isFinite(value)) return '—';
+      const formatted = value.toFixed(4);
+      return `${value > 0 ? '+' : ''}${formatted}%`;
+    }
+
+    function formatUsd(value) {
+      if (!Number.isFinite(value)) return '—';
+      const formatted = value.toFixed(2);
+      return `${value > 0 ? '+' : ''}${formatted} USDT`;
+    }
+
+    function formatNumber(value) {
+      if (!Number.isFinite(value)) return null;
+      return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(value);
+    }
+
+    function formatPrice(value) {
+      if (!Number.isFinite(value)) return '—';
+      const abs = Math.abs(value);
+      let digits = 4;
+      if (abs >= 1000) digits = 2;
+      else if (abs >= 100) digits = 3;
+      else if (abs < 1) digits = 6;
+      return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    }
+
+    function formatSize(value) {
+      if (!Number.isFinite(value)) return '—';
+      const abs = Math.abs(value);
+      const digits = abs >= 1 ? 4 : 6;
+      return value.toLocaleString('en-US', { maximumFractionDigits: digits });
+    }
+
+    function formatLimit(limit) {
+      if (!limit) return '—';
+      const parts = [];
+      const notionalRaw = limit.max_notional;
+      const qtyRaw = limit.max_qty;
+      const notionalNumber = typeof notionalRaw === 'number' ? notionalRaw : (notionalRaw ? Number(notionalRaw) : NaN);
+      const qtyNumber = typeof qtyRaw === 'number' ? qtyRaw : (qtyRaw ? Number(qtyRaw) : NaN);
+      const formattedNotional = Number.isFinite(notionalNumber) && notionalNumber > 0 ? formatNumber(notionalNumber) : null;
+      const formattedQty = Number.isFinite(qtyNumber) && qtyNumber > 0 ? formatNumber(qtyNumber) : null;
+      if (formattedNotional) {
+        parts.push(`до ${formattedNotional} USDT`);
+      }
+      if (formattedQty) {
+        parts.push(`объём ${formattedQty} ${baseSymbol()}`);
+      }
+      if (limit.limit_desc) {
+        parts.push(limit.limit_desc);
+      }
+      if (parts.length === 0) {
+        return '—';
+      }
+      return parts.join(', ');
+    }
+
+    function resetMetric(el) {
+      el.classList.remove('metric-pos', 'metric-neg');
+    }
+
+    function setMetric(el, usdEl, pctValue, usdValue) {
+      const pctText = formatPercent(pctValue);
+      const usdText = formatUsd(usdValue);
+      resetMetric(el);
+      if (Number.isFinite(pctValue)) {
+        if (pctValue > 0) el.classList.add('metric-pos');
+        if (pctValue < 0) el.classList.add('metric-neg');
+      }
+      el.textContent = pctText;
+      usdEl.textContent = Number.isFinite(usdValue) ? `Δ ${usdText}` : '—';
+    }
+
+    function currentVolumeUsdt() {
+      const raw = Number(volumeInput.value);
+      if (!Number.isFinite(raw) || raw <= 0) return 0;
+      return raw;
+    }
+
+    function normalizeOrderBook(raw) {
+      if (!raw) return null;
+      const bids = Array.isArray(raw.bids) ? raw.bids.map(level => {
+        if (!Array.isArray(level) || level.length < 2) return null;
+        const price = Number(level[0]);
+        const size = Number(level[1]);
+        if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
+        return { price, size };
+      }).filter(Boolean) : [];
+      const asks = Array.isArray(raw.asks) ? raw.asks.map(level => {
+        if (!Array.isArray(level) || level.length < 2) return null;
+        const price = Number(level[0]);
+        const size = Number(level[1]);
+        if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
+        return { price, size };
+      }).filter(Boolean) : [];
+      bids.sort((a, b) => b.price - a.price);
+      asks.sort((a, b) => a.price - b.price);
+      const last = Number(raw.last_price);
+      return {
+        bids: bids.slice(0, 5),
+        asks: asks.slice(0, 5),
+        last: Number.isFinite(last) ? last : null,
+      };
+    }
+
+    function ensureBook(book, fallbackBid, fallbackAsk, volume) {
+      const bids = book && book.bids ? book.bids.slice() : [];
+      const asks = book && book.asks ? book.asks.slice() : [];
+      if ((!bids || bids.length === 0) && Number.isFinite(fallbackBid) && fallbackBid > 0) {
+        const size = volume > 0 ? volume / fallbackBid : 0;
+        if (size > 0) bids.push({ price: fallbackBid, size });
+      }
+      if ((!asks || asks.length === 0) && Number.isFinite(fallbackAsk) && fallbackAsk > 0) {
+        const size = volume > 0 ? volume / fallbackAsk : 0;
+        if (size > 0) asks.push({ price: fallbackAsk, size });
+      }
+      return {
+        bids: bids.slice(0, 5),
+        asks: asks.slice(0, 5),
+        last: book && Number.isFinite(book.last) ? book.last : (
+          Number.isFinite(fallbackBid) && Number.isFinite(fallbackAsk)
+            ? (Number(fallbackBid) + Number(fallbackAsk)) / 2
+            : null
+        ),
+      };
+    }
+
+    function fillBuyQuote(levels, quoteTarget) {
+      let remaining = quoteTarget;
+      let base = 0;
+      let spent = 0;
+      for (const level of levels) {
+        if (remaining <= 0) break;
+        const levelQuote = level.price * level.size;
+        if (levelQuote >= remaining) {
+          const take = remaining / level.price;
+          base += take;
+          spent += remaining;
+          remaining = 0;
+          break;
+        }
+        base += level.size;
+        spent += levelQuote;
+        remaining -= levelQuote;
+      }
+      return { base, quote: spent, filled: remaining <= 1e-8 };
+    }
+
+    function fillBuyBase(levels, baseTarget) {
+      let remaining = baseTarget;
+      let spent = 0;
+      let base = 0;
+      for (const level of levels) {
+        if (remaining <= 0) break;
+        const take = Math.min(level.size, remaining);
+        base += take;
+        spent += take * level.price;
+        remaining -= take;
+      }
+      return { base, quote: spent, filled: remaining <= 1e-8 };
+    }
+
+    function fillSellBase(levels, baseTarget) {
+      let remaining = baseTarget;
+      let received = 0;
+      let base = 0;
+      for (const level of levels) {
+        if (remaining <= 0) break;
+        const take = Math.min(level.size, remaining);
+        base += take;
+        received += take * level.price;
+        remaining -= take;
+      }
+      return { base, quote: received, filled: remaining <= 1e-8 };
+    }
+
+    function computeMetrics(row) {
+      if (!row) return null;
+      const volume = currentVolumeUsdt();
+      if (volume <= 0) {
+        return {
+          volume,
+          baseQty: 0,
+          entryPct: null,
+          exitPct: null,
+          entryPnl: null,
+          exitPnl: null,
+          fundingPct: Number(row.funding_spread) * 100,
+          fundingUsd: null,
+          commissionPct: Number(row.commission_total_pct),
+          commissionUsd: null,
+          longBook: ensureBook(normalizeOrderBook(row.orderbook_long), Number(row.price_long_bid), Number(row.price_long_ask), volume),
+          shortBook: ensureBook(normalizeOrderBook(row.orderbook_short), Number(row.price_short_bid), Number(row.price_short_ask), volume),
+        };
+      }
+
+      const longBook = ensureBook(
+        normalizeOrderBook(row.orderbook_long),
+        Number(row.price_long_bid),
+        Number(row.price_long_ask),
+        volume,
+      );
+      const shortBook = ensureBook(
+        normalizeOrderBook(row.orderbook_short),
+        Number(row.price_short_bid),
+        Number(row.price_short_ask),
+        volume,
+      );
+
+      if (!longBook || longBook.asks.length === 0 || !shortBook || shortBook.bids.length === 0) {
+        return null;
+      }
+
+      const longVolumeFill = fillBuyQuote(longBook.asks, volume);
+      if (longVolumeFill.base <= 0) {
+        return null;
+      }
+      const targetBase = longVolumeFill.base;
+      const shortVolumeFill = fillSellBase(shortBook.bids, targetBase);
+      const baseQty = Math.min(targetBase, shortVolumeFill.base);
+      if (baseQty <= 0) {
+        return null;
+      }
+
+      const longFill = fillBuyBase(longBook.asks, baseQty);
+      const shortEntryFill = fillSellBase(shortBook.bids, baseQty);
+      const longExitFill = fillSellBase(longBook.bids, baseQty);
+      const shortCoverFill = fillBuyBase(shortBook.asks, baseQty);
+
+      const avgLongEntry = longFill.base > 0 ? longFill.quote / longFill.base : Number(row.price_long_ask);
+      const avgShortEntry = shortEntryFill.base > 0 ? shortEntryFill.quote / shortEntryFill.base : Number(row.price_short_bid);
+      const avgLongExit = longExitFill.base > 0 ? longExitFill.quote / longExitFill.base : Number(row.price_long_bid);
+      const avgShortExit = shortCoverFill.base > 0 ? shortCoverFill.quote / shortCoverFill.base : Number(row.price_short_ask);
+
+      const entryMid = Number.isFinite(avgLongEntry) && Number.isFinite(avgShortEntry)
+        ? (avgLongEntry + avgShortEntry) / 2
+        : null;
+      const exitMid = Number.isFinite(avgLongExit) && Number.isFinite(avgShortExit)
+        ? (avgLongExit + avgShortExit) / 2
+        : null;
+
+      const entryPct = entryMid ? ((avgShortEntry - avgLongEntry) / entryMid) * 100 : null;
+      const exitPct = exitMid ? ((avgLongExit - avgShortExit) / exitMid) * 100 : null;
+
+      const entryPnl = shortEntryFill.quote - longFill.quote;
+      const exitPnl = longExitFill.quote - shortCoverFill.quote;
+
+      const notionalLong = longFill.quote;
+      const notionalShort = shortEntryFill.quote;
+      const avgNotional = (notionalLong + notionalShort) / 2;
+
+      const fundingSpread = Number(row.funding_spread) || 0;
+      const commissionPct = Number(row.commission_total_pct) || 0;
+
+      const fundingPct = fundingSpread * 100;
+      const fundingUsd = Number.isFinite(avgNotional) ? avgNotional * fundingSpread : null;
+      const commissionUsd = Number.isFinite(avgNotional) ? avgNotional * (commissionPct / 100) : null;
+
+      return {
+        volume,
+        baseQty,
+        entryPct,
+        exitPct,
+        entryPnl,
+        exitPnl,
+        fundingPct,
+        fundingUsd,
+        commissionPct,
+        commissionUsd,
+        longBook,
+        shortBook,
+        avgLongEntry,
+        avgShortEntry,
+        avgLongExit,
+        avgShortExit,
+      };
+    }
+
+    function renderOrderBookElements({
+      asksEl,
+      bidsEl,
+      midPriceEl,
+      emptyEl,
+      book,
+    }) {
+      if (!book || ((!book.asks || book.asks.length === 0) && (!book.bids || book.bids.length === 0))) {
+        asksEl.innerHTML = '';
+        bidsEl.innerHTML = '';
+        midPriceEl.textContent = '—';
+        if (emptyEl) emptyEl.classList.remove('hidden');
+        return;
+      }
+      const asksRows = (book.asks || []).slice(0, 5);
+      const bidsRows = (book.bids || []).slice(0, 5);
+      asksEl.innerHTML = asksRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
+      bidsEl.innerHTML = bidsRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
+      midPriceEl.textContent = Number.isFinite(book.last) ? formatPrice(book.last) : '—';
+      if (emptyEl) emptyEl.classList.add('hidden');
+    }
+
+    function renderOrderBooks(row, metrics) {
+      const volume = currentVolumeUsdt();
+      const longBook = metrics && metrics.longBook
+        ? metrics.longBook
+        : ensureBook(normalizeOrderBook(row ? row.orderbook_long : null), Number(row ? row.price_long_bid : null), Number(row ? row.price_long_ask : null), volume);
+      const shortBook = metrics && metrics.shortBook
+        ? metrics.shortBook
+        : ensureBook(normalizeOrderBook(row ? row.orderbook_short : null), Number(row ? row.price_short_bid : null), Number(row ? row.price_short_ask : null), volume);
+
+      renderOrderBookElements({
+        asksEl: longAsksEl,
+        bidsEl: longBidsEl,
+        midPriceEl: longLastPriceEl,
+        emptyEl: longOrderbookEmpty,
+        book: longBook,
+      });
+      renderOrderBookElements({
+        asksEl: shortAsksEl,
+        bidsEl: shortBidsEl,
+        midPriceEl: shortLastPriceEl,
+        emptyEl: shortOrderbookEmpty,
+        book: shortBook,
+      });
+    }
+
+    function updateFundingMeta() {
+      if (!currentRow) {
+        longFundingMeta.textContent = 'Фандинг: —';
+        shortFundingMeta.textContent = 'Фандинг: —';
+        return;
+      }
+      const longRate = Number(currentRow.funding_long);
+      const shortRate = Number(currentRow.funding_short);
+      const longInterval = currentRow.funding_interval_long || '—';
+      const shortInterval = currentRow.funding_interval_short || '—';
+      const longText = Number.isFinite(longRate)
+        ? `${(longRate * 100).toFixed(4)}% / ${longInterval}`
+        : '—';
+      const shortText = Number.isFinite(shortRate)
+        ? `${(shortRate * 100).toFixed(4)}% / ${shortInterval}`
+        : '—';
+      longFundingMeta.textContent = `Фандинг: ${longText}`;
+      shortFundingMeta.textContent = `Фандинг: ${shortText}`;
+    }
+
+    function updateLimitsMeta() {
+      const longText = currentLimits.long ? formatLimit(currentLimits.long) : '—';
+      const shortText = currentLimits.short ? formatLimit(currentLimits.short) : '—';
+      longLimitMeta.textContent = `Лимит: ${longText}`;
+      shortLimitMeta.textContent = `Лимит: ${shortText}`;
+    }
+
+    function updateDocumentTitle(entry, exit) {
+      if (Number.isFinite(entry) && Number.isFinite(exit)) {
+        const entryText = formatPercent(entry);
+        const exitText = formatPercent(exit);
+        document.title = `Вход ${entryText} · Выход ${exitText} · ${symbolUpper}`;
+      } else {
+        document.title = `Карточка пары ${symbolUpper}`;
+      }
+    }
+
+    function applyMetrics(row, metrics) {
+      if (!metrics) {
+        setMetric(metricEntry, metricEntryUsd, null, null);
+        setMetric(metricExit, metricExitUsd, null, null);
+        setMetric(metricFunding, metricFundingUsd, null, null);
+        setMetric(metricFees, metricFeesUsd, null, null);
+        updateDocumentTitle(null, null);
+        return;
+      }
+      setMetric(metricEntry, metricEntryUsd, metrics.entryPct, metrics.entryPnl);
+      setMetric(metricExit, metricExitUsd, metrics.exitPct, metrics.exitPnl);
+      setMetric(metricFunding, metricFundingUsd, metrics.fundingPct, metrics.fundingUsd);
+      const commissionPct = Number.isFinite(metrics.commissionPct) ? -metrics.commissionPct : metrics.commissionPct;
+      const commissionUsd = Number.isFinite(metrics.commissionUsd) ? -Math.abs(metrics.commissionUsd) : metrics.commissionUsd;
+      setMetric(metricFees, metricFeesUsd, commissionPct, commissionUsd);
+      updateDocumentTitle(metrics.entryPct, metrics.exitPct);
+    }
+
+    async function loadLimits() {
+      if (!longExchange || !shortExchange) {
+        currentLimits = { long: null, short: null };
+        updateLimitsMeta();
+        return;
+      }
+      try {
+        const params = new URLSearchParams({ long: longExchange, short: shortExchange });
+        const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/limits?${params.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          currentLimits = {
+            long: data?.long || null,
+            short: data?.short || null,
+          };
+        } else {
+          currentLimits = { long: null, short: null };
+        }
+      } catch (err) {
+        currentLimits = { long: null, short: null };
+      }
+      updateLimitsMeta();
+    }
+
+    function updateSummary() {
+      const metrics = computeMetrics(currentRow);
+      renderOrderBooks(currentRow, metrics);
+      updateFundingMeta();
+      applyMetrics(currentRow, metrics);
+    }
+
     function pruneBuffer(buffer) {
       if (!Array.isArray(buffer) || buffer.length === 0) return 0;
       const cutoff = Math.floor(Date.now() / 1000) - LOOKBACK_SECONDS;
@@ -500,6 +1089,7 @@
       if (!Array.isArray(payload)) return;
       const longTarget = longExchange.toLowerCase();
       const shortTarget = shortExchange.toLowerCase();
+      let matchedRow = null;
       payload.forEach(row => {
         if (!row) return;
         if ((row.symbol || '').toUpperCase() !== symbolUpper) return;
@@ -513,7 +1103,12 @@
           const exitValue = Number(row.exit_pct);
           exitState.appendLive(exitValue, ts);
         }
+        matchedRow = row;
       });
+      if (matchedRow) {
+        currentRow = matchedRow;
+        updateSummary();
+      }
     }
 
     function sortCandles(data) {
@@ -605,6 +1200,9 @@
       ensureRealtimeSocket();
       updateExchangeInfo();
       updateUrl();
+      currentRow = null;
+      updateSummary();
+      await loadLimits();
       await renderEntry();
       if (exitToggle.checked) {
         await renderExit();
@@ -613,6 +1211,13 @@
 
     timeframeSelect.addEventListener('change', () => {
       refreshCharts();
+    });
+
+    volumeInput.addEventListener('input', () => {
+      updateSummary();
+    });
+    volumeInput.addEventListener('change', () => {
+      updateSummary();
     });
 
     reverseBtn.addEventListener('click', async () => {

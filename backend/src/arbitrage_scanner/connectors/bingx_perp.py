@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 import zlib
-from typing import Iterable, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import httpx
 import websockets
@@ -128,8 +128,11 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     ws_ready = asyncio.Event()
     tasks = [
         asyncio.create_task(_poll_bingx_http(store, subscribe, ws_ready, http_fetch_all)),
-        asyncio.create_task(_run_bingx_ws(store, subscribe, ws_ready)),
+        asyncio.create_task(_run_bingx_ws_tickers(store, subscribe, ws_ready)),
     ]
+
+    if subscribe:
+        tasks.append(asyncio.create_task(_run_bingx_orderbooks(store, subscribe)))
 
     try:
         await asyncio.gather(*tasks)
@@ -145,7 +148,7 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         raise
 
 
-async def _run_bingx_ws(
+async def _run_bingx_ws_tickers(
     store: TickerStore,
     symbols: Sequence[Symbol],
     ready_event: asyncio.Event | None = None,
@@ -236,6 +239,61 @@ async def _run_bingx_ws(
             await asyncio.sleep(2.0)
 
 
+async def _run_bingx_orderbooks(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+) -> None:
+    wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
+    if not wanted_common:
+        return
+
+    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common})
+    if not ws_symbols:
+        return
+
+    async for ws in _reconnect_ws():
+        try:
+            for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
+                batch = ws_symbols[i : i + WS_SUB_CHUNK]
+                await _send_ws_depth_subscriptions(ws, batch)
+                await asyncio.sleep(WS_SUB_DELAY)
+
+            async for raw_msg in ws:
+                msg = _decode_ws_message(raw_msg)
+                if msg is None:
+                    continue
+
+                if _is_ws_ping(msg):
+                    await _reply_ws_ping(ws, msg)
+                    continue
+
+                for raw_symbol, payload in _iter_ws_payloads(msg):
+                    if not isinstance(payload, dict):
+                        continue
+
+                    exchange_symbol = _normalize_ws_symbol(raw_symbol)
+                    common_symbol = _from_bingx_symbol(exchange_symbol)
+                    if not common_symbol or common_symbol not in wanted_common:
+                        continue
+
+                    bids, asks, last_price = _extract_depth_payload(payload)
+                    if not bids and not asks and last_price is None:
+                        continue
+
+                    store.upsert_order_book(
+                        "bingx",
+                        common_symbol,
+                        bids=bids or None,
+                        asks=asks or None,
+                        ts=time.time(),
+                        last_price=last_price,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(2.0)
+
+
 async def _reconnect_ws():
     idx = 0
     while True:
@@ -281,6 +339,44 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
         {"id": _next_id(), "reqType": "sub", "dataType": topic}
         for topic in swap_topics
     )
+
+    for payload in payloads:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            continue
+        await asyncio.sleep(WS_SUB_DELAY)
+
+
+async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
+    if not symbols:
+        return
+
+    def _next_id() -> str:
+        return str(int(time.time() * 1_000))
+
+    depth_topics = [f"market.{sym}.depth5" for sym in symbols]
+    swap_depth_topics = [f"swap/depth:{sym}" for sym in symbols]
+    swap_depth5_topics = [f"swap/depth5:{sym}" for sym in symbols]
+
+    payloads = [
+        {
+            "id": _next_id(),
+            "action": "subscribe",
+            "params": {"channel": "depth5", "instId": list(symbols)},
+        },
+        {
+            "id": _next_id(),
+            "action": "subscribe",
+            "params": {"channel": "depth", "instId": list(symbols)},
+        },
+        {"id": _next_id(), "reqType": "sub", "dataType": depth_topics},
+        {"id": _next_id(), "reqType": "sub", "dataType": swap_depth_topics},
+        {"id": _next_id(), "reqType": "sub", "dataType": swap_depth5_topics},
+    ]
+
+    for topic in depth_topics + swap_depth_topics + swap_depth5_topics:
+        payloads.append({"id": _next_id(), "reqType": "sub", "dataType": topic})
 
     for payload in payloads:
         try:
@@ -381,6 +477,147 @@ def _iter_ws_payloads(message: dict) -> Iterable[tuple[str, dict]]:
         default_symbol = topic_symbol
 
     return list(_iter_payload_items(payload, default_symbol))
+
+
+def _extract_depth_payload(payload: dict) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], float | None]:
+    if not isinstance(payload, dict):
+        return [], [], None
+
+    containers: List[dict] = [payload]
+    for key in ("depth", "depths", "orderbook", "book", "tick", "snapshot", "data"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+
+    bids: List[Tuple[float, float]] = []
+    asks: List[Tuple[float, float]] = []
+    last_price: float | None = None
+
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+
+        bids_candidate = _collect_depth_levels(
+            container,
+            (
+                "bids",
+                "bid",
+                "buy",
+                "buys",
+                "buyDepth",
+                "buyLevels",
+                "buyList",
+                "bp",
+            ),
+        )
+        asks_candidate = _collect_depth_levels(
+            container,
+            (
+                "asks",
+                "ask",
+                "sell",
+                "sells",
+                "sellDepth",
+                "sellLevels",
+                "sellList",
+                "ap",
+            ),
+        )
+
+        if bids_candidate:
+            bids = bids_candidate
+        if asks_candidate:
+            asks = asks_candidate
+        if last_price is None:
+            last_price = _extract_last_price(container)
+
+    return bids[:20], asks[:20], last_price
+
+
+def _collect_depth_levels(container: dict, keys: Sequence[str]) -> List[Tuple[float, float]]:
+    for key in keys:
+        if key not in container:
+            continue
+        levels = container.get(key)
+        parsed = list(_iter_levels(levels))
+        if parsed:
+            return parsed
+    return []
+
+
+def _extract_last_price(container: dict) -> float | None:
+    for key in (
+        "lastPrice",
+        "last_price",
+        "last",
+        "price",
+        "close",
+        "tradePrice",
+        "markPrice",
+    ):
+        val = container.get(key)
+        if val is None:
+            continue
+        try:
+            price = float(val)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def _iter_levels(source) -> Iterable[Tuple[float, float]]:
+    if isinstance(source, dict):
+        source = source.get("levels") or source.get("data") or source.get("list") or []
+    if not isinstance(source, (list, tuple)):
+        return []
+    result: List[Tuple[float, float]] = []
+    for entry in source:
+        price, size = _parse_level(entry)
+        if price is None or size is None:
+            continue
+        result.append((price, size))
+    return result
+
+
+def _parse_level(level) -> Tuple[float | None, float | None]:
+    price = size = None
+    if isinstance(level, dict):
+        for key in ("price", "p", "px", "bp", "ap"):
+            val = level.get(key)
+            if val is None:
+                continue
+            try:
+                price = float(val)
+                break
+            except Exception:
+                continue
+        for key in ("size", "qty", "q", "v", "volume"):
+            val = level.get(key)
+            if val is None:
+                continue
+            try:
+                size = float(val)
+                break
+            except Exception:
+                continue
+    elif isinstance(level, (list, tuple)) and len(level) >= 2:
+        try:
+            price = float(level[0])
+        except Exception:
+            price = None
+        try:
+            size = float(level[1])
+        except Exception:
+            size = None
+    if price is None or price <= 0:
+        return None, None
+    if size is None:
+        return price, 0.0
+    if size < 0:
+        size = 0.0
+    return price, size
 
 
 def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[str, dict]]:
