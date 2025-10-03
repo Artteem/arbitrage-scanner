@@ -85,14 +85,14 @@
     let longExchange = null;
     let shortExchange = null;
     let overviewRows = [];
-    let entryChart = null;
-    let entrySeries = null;
-    let exitChart = null;
-    let exitSeries = null;
-    let entryZeroLine = null;
-    let exitZeroLine = null;
-    let entryData = [];
-    let exitData = [];
+    const entryState = createChartState({
+      containerId: 'entry-chart',
+      emptyEl: entryEmpty,
+    });
+    const exitState = createChartState({
+      containerId: 'exit-chart',
+      emptyEl: exitEmpty,
+    });
     let realtimeSocket = null;
     let realtimeReconnect = null;
     let realtimeKey = null;
@@ -211,6 +211,157 @@
       priceScale.setPriceRange({ minValue: -span, maxValue: span });
     }
 
+    function createChartState({ containerId, emptyEl }) {
+      const state = {
+        container: document.getElementById(containerId),
+        emptyEl,
+        chart: null,
+        series: null,
+        zeroLine: null,
+        data: [],
+        ensureChart() {
+          if (this.chart) {
+            return true;
+          }
+          const res = initChart(this.container);
+          if (!res) {
+            return false;
+          }
+          this.chart = res.chart;
+          this.series = res.series;
+          this.zeroLine = res.zeroLine;
+          if (this.data.length > 0) {
+            this.applyFullData();
+          } else {
+            this.updateEmpty();
+          }
+          return true;
+        },
+        applyFullData() {
+          if (this.series) {
+            this.series.setData(this.data);
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale) {
+              if (this.data.length > 1 && typeof scale.setVisibleRange === 'function') {
+                scale.setVisibleRange({ from: this.data[0].time, to: this.data[this.data.length - 1].time });
+              } else if (typeof scale.fitContent === 'function') {
+                scale.fitContent();
+              }
+            }
+          }
+          this.updateEmpty();
+        },
+        setData(data) {
+          this.data = sortCandles(data);
+          this.applyFullData();
+        },
+        mergeData(data) {
+          this.data = sortCandles(mergeCandles(data, this.data));
+          this.applyFullData();
+        },
+        appendLive(value, ts) {
+          if (!Number.isFinite(value) || !Number.isFinite(ts)) return;
+          const tfSeconds = currentTimeframeSeconds();
+          const bucket = Math.floor(ts / tfSeconds) * tfSeconds;
+          let last = this.data[this.data.length - 1];
+          if (!last || last.time !== bucket) {
+            last = { time: bucket, open: value, high: value, low: value, close: value };
+            this.data.push(last);
+          } else {
+            last = {
+              time: bucket,
+              open: last.open,
+              high: Math.max(last.high, value),
+              low: Math.min(last.low, value),
+              close: value,
+            };
+            this.data[this.data.length - 1] = last;
+          }
+          const dropped = pruneBuffer(this.data);
+          if (this.series) {
+            if (dropped > 0) {
+              this.series.setData(this.data);
+            } else {
+              this.series.update(last);
+            }
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale) {
+              if (dropped > 0) {
+                if (this.data.length > 1 && typeof scale.setVisibleRange === 'function') {
+                  scale.setVisibleRange({ from: this.data[0].time, to: this.data[this.data.length - 1].time });
+                } else if (typeof scale.fitContent === 'function') {
+                  scale.fitContent();
+                }
+              }
+              if (typeof scale.scrollToRealTime === 'function') {
+                scale.scrollToRealTime();
+              }
+            }
+          }
+          this.updateEmpty();
+        },
+        clear() {
+          this.data = [];
+          if (this.series) {
+            this.series.setData([]);
+            applyZeroCenteredScale(this.series, this.data);
+          }
+          if (this.chart) {
+            applyTimeScaleOptions(this.chart);
+            const scale = this.chart.timeScale();
+            if (scale && typeof scale.fitContent === 'function') {
+              scale.fitContent();
+            }
+          }
+          this.updateEmpty();
+        },
+        updateEmpty() {
+          if (!this.emptyEl) return;
+          const isEmpty = !this.data || this.data.length === 0;
+          showEmpty(this.emptyEl, isEmpty);
+        },
+        applyTheme() {
+          if (this.chart) {
+            this.chart.applyOptions({
+              layout: {
+                background: { color: cssVar('--row') },
+                textColor: cssVar('--fg'),
+              },
+              grid: {
+                vertLines: { color: cssVar('--border') },
+                horzLines: { color: cssVar('--border') },
+              },
+              rightPriceScale: { borderColor: cssVar('--border') },
+              timeScale: { borderColor: cssVar('--border') },
+            });
+          }
+          const seriesOptions = {
+            upColor: cssVar('--good'),
+            downColor: cssVar('--bad'),
+            borderUpColor: cssVar('--good'),
+            borderDownColor: cssVar('--bad'),
+            wickUpColor: cssVar('--good'),
+            wickDownColor: cssVar('--bad'),
+          };
+          if (this.series) {
+            this.series.applyOptions(seriesOptions);
+          }
+          if (this.zeroLine) {
+            this.zeroLine.applyOptions({ color: cssVar('--fg') });
+          }
+        }
+      };
+      return state;
+    }
+
     function updateExchangeInfo() {
       if (!longExchange || !shortExchange) {
         exchangeLine.innerHTML = '';
@@ -321,44 +472,6 @@
       return dropIndex;
     }
 
-    function updateSeriesBuffer(buffer, series, chart, value, ts) {
-      if (!Number.isFinite(value) || !Number.isFinite(ts)) return false;
-      const tfSeconds = currentTimeframeSeconds();
-      const bucket = Math.floor(ts / tfSeconds);
-      const time = bucket * tfSeconds;
-      const last = buffer[buffer.length - 1];
-      let candle;
-      if (last && last.time === time) {
-        candle = {
-          time,
-          open: last.open,
-          high: Math.max(last.high, value),
-          low: Math.min(last.low, value),
-          close: value,
-        };
-        buffer[buffer.length - 1] = candle;
-      } else {
-        candle = { time, open: value, high: value, low: value, close: value };
-        buffer.push(candle);
-      }
-      const dropped = pruneBuffer(buffer);
-      if (series) {
-        series.update(candle);
-        if (dropped > 0) {
-          series.setData(buffer);
-        }
-        applyZeroCenteredScale(series, buffer);
-      }
-      if (chart) {
-        applyTimeScaleOptions(chart);
-        const scale = chart.timeScale();
-        if (scale && typeof scale.scrollToRealTime === 'function') {
-          scale.scrollToRealTime();
-        }
-      }
-      return true;
-    }
-
     function handleRealtimeMessage(raw) {
       if (!raw || !longExchange || !shortExchange) return;
       let payload;
@@ -377,18 +490,11 @@
         const rowShort = String(row.short_exchange || row.short_ex || '').toLowerCase();
         if (rowLong !== longTarget || rowShort !== shortTarget) return;
         const ts = Number(row._ts || row.ts || Date.now() / 1000);
-        const entryValue = Number(row.entry_pct);
-        if (entrySeries) {
-          if (updateSeriesBuffer(entryData, entrySeries, entryChart, entryValue, ts)) {
-            showEmpty(entryEmpty, false);
-          }
-        }
+          const entryValue = Number(row.entry_pct);
+          entryState.appendLive(entryValue, ts);
         if (typeof row.exit_pct !== 'undefined') {
           const exitValue = Number(row.exit_pct);
-          const updated = updateSeriesBuffer(exitData, exitSeries, exitChart, exitValue, ts);
-          if (exitSeries && updated) {
-            showEmpty(exitEmpty, false);
-          }
+          exitState.appendLive(exitValue, ts);
         }
       });
     }
@@ -420,40 +526,6 @@
       return Array.from(result.values()).sort((a, b) => a.time - b.time);
     }
 
-    function setEntryData(data) {
-      entryData = sortCandles(data);
-      if (entrySeries) {
-        entrySeries.setData(entryData);
-        applyZeroCenteredScale(entrySeries, entryData);
-        if (entryChart) {
-          applyTimeScaleOptions(entryChart);
-          const scale = entryChart.timeScale();
-          if (entryData.length > 1 && scale && typeof scale.setVisibleRange === 'function') {
-            scale.setVisibleRange({ from: entryData[0].time, to: entryData[entryData.length - 1].time });
-          } else if (scale && typeof scale.fitContent === 'function') {
-            scale.fitContent();
-          }
-        }
-      }
-    }
-
-    function setExitData(data) {
-      exitData = sortCandles(data);
-      if (exitSeries) {
-        exitSeries.setData(exitData);
-        applyZeroCenteredScale(exitSeries, exitData);
-        if (exitChart) {
-          applyTimeScaleOptions(exitChart);
-          const scale = exitChart.timeScale();
-          if (exitData.length > 1 && scale && typeof scale.setVisibleRange === 'function') {
-            scale.setVisibleRange({ from: exitData[0].time, to: exitData[exitData.length - 1].time });
-          } else if (scale && typeof scale.fitContent === 'function') {
-            scale.fitContent();
-          }
-        }
-      }
-    }
-
     async function loadCandles(metric) {
       const params = new URLSearchParams({
         long: longExchange,
@@ -481,55 +553,41 @@
     }
 
     async function renderEntry() {
-      if (!entryChart) {
-        const res = initChart(document.getElementById('entry-chart'));
-        if (!res) return;
-        entryChart = res.chart;
-        entrySeries = res.series;
-        entryZeroLine = res.zeroLine;
-      }
+      entryState.ensureChart();
       const { candles } = await loadCandles('entry');
       if (!candles || candles.length === 0) {
-        showEmpty(entryEmpty, true);
-        setEntryData([]);
-      } else {
-        showEmpty(entryEmpty, false);
-        const data = toSeriesData(candles);
-        setEntryData(data);
+        if (entryState.data.length === 0) {
+          entryState.setData([]);
+        } else {
+          entryState.applyFullData();
+        }
+        return;
       }
+      const data = toSeriesData(candles);
+      entryState.mergeData(data);
     }
 
     async function renderExit() {
       if (!exitToggle.checked) {
         return;
       }
-      if (!exitChart) {
-        const res = initChart(document.getElementById('exit-chart'));
-        if (!res) return;
-        exitChart = res.chart;
-        exitSeries = res.series;
-        exitZeroLine = res.zeroLine;
-      }
-      if (exitSeries && exitData.length > 0) {
-        setExitData(exitData);
-        showEmpty(exitEmpty, false);
+      exitState.ensureChart();
+      if (exitState.data.length > 0) {
+        exitState.applyFullData();
       }
       const { candles } = await loadCandles('exit');
       if (!candles || candles.length === 0) {
-        if (exitData.length === 0) {
-          showEmpty(exitEmpty, true);
-          setExitData([]);
-        }
+        exitState.updateEmpty();
         return;
       }
       const historical = toSeriesData(candles);
-      const merged = mergeCandles(historical, exitData);
-      showEmpty(exitEmpty, merged.length === 0);
-      setExitData(merged);
+      exitState.mergeData(historical);
     }
 
     async function refreshCharts() {
       if (!longExchange || !shortExchange) return;
+      entryState.clear();
+      exitState.clear();
       ensureRealtimeSocket();
       updateExchangeInfo();
       updateUrl();
@@ -561,40 +619,17 @@
       }
     });
 
-      document.getElementById('theme-toggle').addEventListener('click', () => {
-        const html = document.documentElement;
-        const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-        html.setAttribute('data-theme', next);
-        [entryChart, exitChart].forEach(chart => {
-          if (!chart) return;
-          chart.applyOptions({
-            layout: {
-              background: { color: cssVar('--row') },
-              textColor: cssVar('--fg')
-            },
-            grid: {
-              vertLines: { color: cssVar('--border') },
-              horzLines: { color: cssVar('--border') },
-            },
-            rightPriceScale: { borderColor: cssVar('--border') },
-            timeScale: { borderColor: cssVar('--border') },
-          });
-        });
-        const seriesOptions = {
-          upColor: cssVar('--good'),
-          downColor: cssVar('--bad'),
-          borderUpColor: cssVar('--good'),
-          borderDownColor: cssVar('--bad'),
-          wickUpColor: cssVar('--good'),
-          wickDownColor: cssVar('--bad'),
-        };
-        if (entrySeries) entrySeries.applyOptions(seriesOptions);
-        if (exitSeries) exitSeries.applyOptions(seriesOptions);
-        if (entryZeroLine) entryZeroLine.applyOptions({ color: cssVar('--fg') });
-        if (exitZeroLine) exitZeroLine.applyOptions({ color: cssVar('--fg') });
-        applyTimeScaleOptions(entryChart);
-        applyTimeScaleOptions(exitChart);
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const html = document.documentElement;
+      const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      [entryState, exitState].forEach((state) => {
+        state.applyTheme();
+        if (state.chart) {
+          applyTimeScaleOptions(state.chart);
+        }
       });
+    });
 
     (async function init() {
       await fetchOverview();
