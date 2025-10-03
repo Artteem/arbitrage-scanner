@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Iterable, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
-from ..store import TickerStore
+from ..store import OrderBookData, TickerStore
 
 # ТЕЙКЕР-комиссии по биржам (в долях, не в процентах).
 # Берём по умолчанию консервативные значения; при необходимости можно вынести в .env.
@@ -28,6 +28,10 @@ class Row:
     commission_pct_total: float  # сумма комиссий за ВЕСЬ цикл (4 рыночные сделки)
     price_long_ask: float
     price_short_bid: float
+    price_long_bid: float
+    price_short_ask: float
+    orderbook_long: OrderBookData | None = None
+    orderbook_short: OrderBookData | None = None
 
     def as_dict(self) -> dict:
         # ВАЖНО: не ломаем фронт. Отдаём и ключ "commission" (как использовалось в UI),
@@ -53,6 +57,10 @@ class Row:
 
             "price_long_ask": self.price_long_ask,
             "price_short_bid": self.price_short_bid,
+            "price_long_bid": self.price_long_bid,
+            "price_short_ask": self.price_short_ask,
+            "orderbook_long": self.orderbook_long.to_dict() if self.orderbook_long else None,
+            "orderbook_short": self.orderbook_short.to_dict() if self.orderbook_short else None,
         }
 
 def _entry(bid_short: float, ask_long: float) -> float:
@@ -127,6 +135,7 @@ def compute_rows(
             long_t = long_payload.get("ticker")
             if not long_t:
                 continue
+            long_ob = long_payload.get("order_book")
 
             for short_ex in present:
                 if long_ex == short_ex:
@@ -138,6 +147,7 @@ def compute_rows(
                 short_t = short_payload.get("ticker")
                 if not short_t:
                     continue
+                short_ob = short_payload.get("order_book")
 
                 fl = long_payload.get("funding")
                 fs = short_payload.get("funding")
@@ -162,6 +172,10 @@ def compute_rows(
                         commission_pct_total=comm_total,
                         price_long_ask=long_t.ask,
                         price_short_bid=short_t.bid,
+                        price_long_bid=long_t.bid,
+                        price_short_ask=short_t.ask,
+                        orderbook_long=long_ob,
+                        orderbook_short=short_ob,
                     )
                 )
 

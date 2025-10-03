@@ -1,6 +1,35 @@
 from __future__ import annotations
-from typing import Dict, Tuple, Iterable
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Tuple
 from .domain import Ticker, ExchangeName, Symbol
+import time
+
+
+@dataclass
+class OrderBookData:
+    bids: List[Tuple[float, float]] = field(default_factory=list)
+    asks: List[Tuple[float, float]] = field(default_factory=list)
+    ts: float = 0.0
+    last_price: float | None = None
+    last_price_ts: float = 0.0
+
+    def copy(self) -> "OrderBookData":
+        return OrderBookData(
+            bids=list(self.bids),
+            asks=list(self.asks),
+            ts=self.ts,
+            last_price=self.last_price,
+            last_price_ts=self.last_price_ts,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "bids": [[price, size] for price, size in self.bids],
+            "asks": [[price, size] for price, size in self.asks],
+            "ts": self.ts,
+            "last_price": self.last_price,
+            "last_price_ts": self.last_price_ts,
+        }
 
 Key = Tuple[ExchangeName, Symbol]
 
@@ -18,12 +47,42 @@ class TickerStore:
     def __init__(self) -> None:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
+        self._order_books: Dict[Key, OrderBookData] = {}
 
     def upsert_ticker(self, t: Ticker) -> None:
         self._latest[(t.exchange, t.symbol)] = t
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
         self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)
+
+    def upsert_order_book(
+        self,
+        exchange: ExchangeName,
+        symbol: Symbol,
+        *,
+        bids: List[Tuple[float, float]] | None = None,
+        asks: List[Tuple[float, float]] | None = None,
+        ts: float | None = None,
+        last_price: float | None = None,
+        last_price_ts: float | None = None,
+    ) -> None:
+        key = (exchange, symbol)
+        ob = self._order_books.get(key)
+        if ob is None:
+            ob = OrderBookData()
+        if bids is not None:
+            ob.bids = [(float(price), float(size)) for price, size in bids if price and size]
+        if asks is not None:
+            ob.asks = [(float(price), float(size)) for price, size in asks if price and size]
+        if ts is not None:
+            ob.ts = ts
+        if last_price is not None:
+            ob.last_price = float(last_price)
+            if last_price_ts is None:
+                last_price_ts = time.time()
+        if last_price_ts is not None:
+            ob.last_price_ts = last_price_ts
+        self._order_books[key] = ob
 
     def snapshot(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
@@ -53,5 +112,12 @@ class TickerStore:
         for (ex, sym), t in self._latest.items():
             if sym == symbol:
                 f = self._funding.get((ex, sym))
-                d[ex] = {"ticker": t, "funding": f}
+                ob = self._order_books.get((ex, sym))
+                d[ex] = {"ticker": t, "funding": f, "order_book": ob.copy() if ob else None}
         return d
+
+    def get_order_book(self, exchange: ExchangeName, symbol: Symbol) -> OrderBookData | None:
+        ob = self._order_books.get((exchange, symbol))
+        if not ob:
+            return None
+        return ob.copy()
