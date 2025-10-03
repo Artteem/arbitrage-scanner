@@ -12,7 +12,10 @@
     h1 { font-size:18px; margin:0; }
     a { color:var(--link); text-decoration:none; }
     a:hover { text-decoration:underline; }
-    .layout { padding:16px; display:flex; flex-direction:column; gap:16px; }
+    .layout { padding:16px; display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+    .layout-left, .layout-right { display:flex; flex-direction:column; gap:16px; }
+    .layout-left { flex:1 1 480px; min-width:320px; }
+    .layout-right { flex:1 1 420px; min-width:320px; }
     .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
     .badge { font-size:13px; color:var(--muted); }
     button, select { padding:6px 10px; border:1px solid var(--border); background:transparent; color:var(--fg); border-radius:6px; cursor:pointer; }
@@ -67,99 +70,104 @@
   </header>
 
   <main class="layout">
-    <section class="summary">
-      <div class="summary-controls">
-        <label class="volume-input">Объём сделки, USDT
-          <input id="volume-input" type="number" min="0" step="10" value="1000"/>
+    <div class="layout-left">
+      <section class="controls">
+        <label>Таймфрейм
+          <select id="timeframe">
+            <option value="1m">1 мин</option>
+            <option value="5m" selected>5 мин</option>
+            <option value="1h">1 час</option>
+          </select>
         </label>
-        <div class="metrics-grid">
-          <div class="metric-card">
-            <div class="metric-label">Вход</div>
-            <div class="metric-value" id="metric-entry">—</div>
-            <div class="metric-sub" id="metric-entry-usd">—</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Выход</div>
-            <div class="metric-value" id="metric-exit">—</div>
-            <div class="metric-sub" id="metric-exit-usd">—</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Спред фандинга</div>
-            <div class="metric-value" id="metric-funding">—</div>
-            <div class="metric-sub" id="metric-funding-usd">—</div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Комиссии</div>
-            <div class="metric-value" id="metric-fees">—</div>
-            <div class="metric-sub" id="metric-fees-usd">—</div>
-          </div>
-        </div>
-      </div>
-      <div class="exchanges-grid">
-        <div class="exchange-card" id="long-card">
-          <div class="exchange-card-header">
-            <h3>LONG</h3>
-            <a id="long-link" href="#" target="_blank" rel="noopener">—</a>
-          </div>
-          <div class="exchange-meta">
-            <div id="long-funding">Фандинг: —</div>
-            <div id="long-limit">Лимит: —</div>
-          </div>
-          <div class="orderbook" id="long-orderbook">
-            <div class="asks" id="long-asks"></div>
-            <div class="mid" id="long-mid">
-              <div id="long-last-price">—</div>
-              <span>посл. сделка</span>
-            </div>
-            <div class="bids" id="long-bids"></div>
-          </div>
-          <div class="orderbook-empty hidden" id="long-orderbook-empty">Стакан недоступен</div>
-        </div>
-        <div class="exchange-card" id="short-card">
-          <div class="exchange-card-header">
-            <h3>SHORT</h3>
-            <a id="short-link" href="#" target="_blank" rel="noopener">—</a>
-          </div>
-          <div class="exchange-meta">
-            <div id="short-funding">Фандинг: —</div>
-            <div id="short-limit">Лимит: —</div>
-          </div>
-          <div class="orderbook" id="short-orderbook">
-            <div class="asks" id="short-asks"></div>
-            <div class="mid" id="short-mid">
-              <div id="short-last-price">—</div>
-              <span>посл. сделка</span>
-            </div>
-            <div class="bids" id="short-bids"></div>
-          </div>
-          <div class="orderbook-empty hidden" id="short-orderbook-empty">Стакан недоступен</div>
-        </div>
-      </div>
-    </section>
-    <section class="exchange-line" id="exchange-line"></section>
-    <section class="controls">
-      <label>Таймфрейм
-        <select id="timeframe">
-          <option value="1m">1 мин</option>
-          <option value="5m" selected>5 мин</option>
-          <option value="1h">1 час</option>
-        </select>
-      </label>
-      <button id="reverse-btn" type="button">Перевернуть график</button>
-      <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
-    </section>
+        <button id="reverse-btn" type="button">Перевернуть график</button>
+        <label><input type="checkbox" id="exit-toggle"/> Отобразить график выхода</label>
+      </section>
 
-    <section class="chart-card">
-      <h2>Вход %</h2>
-      <div id="entry-chart" class="chart-container"></div>
-      <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
-    </section>
+      <section class="chart-card">
+        <h2>Вход %</h2>
+        <div id="entry-chart" class="chart-container"></div>
+        <div id="entry-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+      </section>
 
-    <section id="exit-card" class="chart-card hidden">
-      <h2>Выход %</h2>
-      <div id="exit-chart" class="chart-container"></div>
-      <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
-    </section>
+      <section id="exit-card" class="chart-card hidden">
+        <h2>Выход %</h2>
+        <div id="exit-chart" class="chart-container"></div>
+        <div id="exit-empty" class="empty hidden">Нет данных для выбранной комбинации</div>
+      </section>
+    </div>
+
+    <div class="layout-right">
+      <section class="summary">
+        <div class="summary-controls">
+          <label class="volume-input">Объём сделки, USDT
+            <input id="volume-input" type="number" min="0" step="10" value="1000"/>
+          </label>
+          <div class="metrics-grid">
+            <div class="metric-card">
+              <div class="metric-label">Вход</div>
+              <div class="metric-value" id="metric-entry">—</div>
+              <div class="metric-sub" id="metric-entry-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Выход</div>
+              <div class="metric-value" id="metric-exit">—</div>
+              <div class="metric-sub" id="metric-exit-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Спред фандинга</div>
+              <div class="metric-value" id="metric-funding">—</div>
+              <div class="metric-sub" id="metric-funding-usd">—</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Комиссии</div>
+              <div class="metric-value" id="metric-fees">—</div>
+              <div class="metric-sub" id="metric-fees-usd">—</div>
+            </div>
+          </div>
+        </div>
+        <section class="exchange-line" id="exchange-line"></section>
+        <div class="exchanges-grid">
+          <div class="exchange-card" id="long-card">
+            <div class="exchange-card-header">
+              <h3>LONG</h3>
+              <a id="long-link" href="#" target="_blank" rel="noopener">—</a>
+            </div>
+            <div class="exchange-meta">
+              <div id="long-funding">Фандинг: —</div>
+              <div id="long-limit">Лимит: —</div>
+            </div>
+            <div class="orderbook" id="long-orderbook">
+              <div class="asks" id="long-asks"></div>
+              <div class="mid" id="long-mid">
+                <div id="long-last-price">—</div>
+                <span>посл. сделка</span>
+              </div>
+              <div class="bids" id="long-bids"></div>
+            </div>
+            <div class="orderbook-empty hidden" id="long-orderbook-empty">Стакан недоступен</div>
+          </div>
+          <div class="exchange-card" id="short-card">
+            <div class="exchange-card-header">
+              <h3>SHORT</h3>
+              <a id="short-link" href="#" target="_blank" rel="noopener">—</a>
+            </div>
+            <div class="exchange-meta">
+              <div id="short-funding">Фандинг: —</div>
+              <div id="short-limit">Лимит: —</div>
+            </div>
+            <div class="orderbook" id="short-orderbook">
+              <div class="asks" id="short-asks"></div>
+              <div class="mid" id="short-mid">
+                <div id="short-last-price">—</div>
+                <span>посл. сделка</span>
+              </div>
+              <div class="bids" id="short-bids"></div>
+            </div>
+            <div class="orderbook-empty hidden" id="short-orderbook-empty">Стакан недоступен</div>
+          </div>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script>
