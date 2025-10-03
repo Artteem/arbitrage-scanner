@@ -32,7 +32,7 @@ for connector in CONNECTORS:
 
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=720)
+SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 LAST_ROWS: list[Row] = []
 
 TIMEFRAME_ALIASES: dict[str, int] = {
@@ -183,6 +183,7 @@ async def pair_spreads(
     short_exchange: str = Query(..., alias="short"),
     timeframe: str = Query("1m"),
     metric: str = Query("entry"),
+    lookback_days: float = Query(10.0, alias="days", ge=0.0),
 ):
     metric_key = metric.lower()
     if metric_key not in {"entry", "exit"}:
@@ -213,6 +214,9 @@ async def pair_spreads(
             short_exchange=short_exchange.lower(),
             timeframe=tf_value,
         )
+    if lookback_days:
+        cutoff_ts = int(time.time() - lookback_days * 86400)
+        candles = [c for c in candles if c.start_ts >= cutoff_ts]
     return {
         "symbol": symbol.upper(),
         "long": long_exchange.lower(),

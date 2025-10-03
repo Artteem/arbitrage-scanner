@@ -69,6 +69,7 @@
 
   <script>
     const symbol = document.body.dataset.symbol;
+    const LOOKBACK_DAYS = 10;
     const timeframeSelect = document.getElementById('timeframe');
     const reverseBtn = document.getElementById('reverse-btn');
     const exitToggle = document.getElementById('exit-toggle');
@@ -91,6 +92,25 @@
       return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     }
 
+    function formatTimeTick(time) {
+      if (typeof time === 'object' && time !== null && 'year' in time) {
+        const day = String(time.day).padStart(2, '0');
+        const month = String(time.month).padStart(2, '0');
+        return `${day}.${month}`;
+      }
+      if (typeof time !== 'number') return '';
+      const date = new Date(time * 1000);
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      return `${day}.${month} ${hours}:${minutes}`;
+    }
+
+    function timeframeHasSeconds() {
+      return timeframeSelect.value === '1m';
+    }
+
     function initChart(container) {
       if (!window.LightweightCharts) {
         return null;
@@ -106,8 +126,13 @@
           vertLines: { color: cssVar('--border') },
           horzLines: { color: cssVar('--border') },
         },
-        rightPriceScale: { borderColor: cssVar('--border') },
-        timeScale: { borderColor: cssVar('--border') },
+        rightPriceScale: { borderColor: cssVar('--border'), scaleMargins: { top: 0.1, bottom: 0.1 } },
+        timeScale: {
+          borderColor: cssVar('--border'),
+          timeVisible: true,
+          secondsVisible: timeframeHasSeconds(),
+          tickMarkFormatter: formatTimeTick,
+        },
         crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
       });
       const series = chart.addCandlestickSeries({
@@ -134,6 +159,42 @@
       });
       resizeObserver.observe(container);
       return { chart, series, zeroLine };
+    }
+
+    function applyTimeScaleOptions(chart) {
+      if (!chart) return;
+      chart.applyOptions({
+        timeScale: {
+          borderColor: cssVar('--border'),
+          timeVisible: true,
+          secondsVisible: timeframeHasSeconds(),
+          tickMarkFormatter: formatTimeTick,
+        }
+      });
+    }
+
+    function applyZeroCenteredScale(series, data) {
+      if (!series) return;
+      const priceScale = series.priceScale();
+      if (!priceScale) return;
+      if (!data || data.length === 0) {
+        priceScale.applyOptions({ autoScale: true, scaleMargins: { top: 0.1, bottom: 0.1 } });
+        if (typeof priceScale.setPriceRange === 'function') {
+          priceScale.setPriceRange(null);
+        }
+        return;
+      }
+      const values = [];
+      data.forEach(c => {
+        values.push(Math.abs(c.open));
+        values.push(Math.abs(c.high));
+        values.push(Math.abs(c.low));
+        values.push(Math.abs(c.close));
+      });
+      const maxAbs = values.reduce((acc, val) => Math.max(acc, val), 0);
+      const span = maxAbs > 0 ? maxAbs : 1;
+      priceScale.applyOptions({ autoScale: false, scaleMargins: { top: 0.1, bottom: 0.1 } });
+      priceScale.setPriceRange({ minValue: -span, maxValue: span });
     }
 
     function updateExchangeInfo() {
@@ -203,6 +264,7 @@
         short: shortExchange,
         timeframe: timeframeSelect.value,
         metric,
+        days: LOOKBACK_DAYS,
       });
       const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/spreads?${params.toString()}`);
       if (!res.ok) {
@@ -234,10 +296,16 @@
       if (!candles || candles.length === 0) {
         showEmpty(entryEmpty, true);
         entrySeries.setData([]);
+        applyZeroCenteredScale(entrySeries, []);
+        applyTimeScaleOptions(entryChart);
       } else {
         showEmpty(entryEmpty, false);
-        entrySeries.setData(toSeriesData(candles));
+        const data = toSeriesData(candles);
+        entrySeries.setData(data);
+        applyZeroCenteredScale(entrySeries, data);
+        applyTimeScaleOptions(entryChart);
       }
+      entryChart.timeScale().fitContent();
     }
 
     async function renderExit() {
@@ -255,10 +323,16 @@
       if (!candles || candles.length === 0) {
         showEmpty(exitEmpty, true);
         exitSeries.setData([]);
+        applyZeroCenteredScale(exitSeries, []);
+        applyTimeScaleOptions(exitChart);
       } else {
         showEmpty(exitEmpty, false);
-        exitSeries.setData(toSeriesData(candles));
+        const data = toSeriesData(candles);
+        exitSeries.setData(data);
+        applyZeroCenteredScale(exitSeries, data);
+        applyTimeScaleOptions(exitChart);
       }
+      exitChart.timeScale().fitContent();
     }
 
     async function refreshCharts() {
@@ -319,6 +393,8 @@
         if (exitSeries) exitSeries.applyOptions(seriesOptions);
         if (entryZeroLine) entryZeroLine.applyOptions({ color: cssVar('--fg') });
         if (exitZeroLine) exitZeroLine.applyOptions({ color: cssVar('--fg') });
+        applyTimeScaleOptions(entryChart);
+        applyTimeScaleOptions(exitChart);
       });
 
     (async function init() {
