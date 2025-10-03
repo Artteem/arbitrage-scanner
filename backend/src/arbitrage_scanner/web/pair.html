@@ -398,6 +398,28 @@
       return data.slice().sort((a, b) => a.time - b.time);
     }
 
+    function mergeCandles(history, updates) {
+      const result = new Map();
+      const push = (source) => {
+        if (!Array.isArray(source)) return;
+        source.forEach((candle) => {
+          if (!candle) return;
+          const time = Number(candle.time);
+          if (!Number.isFinite(time)) return;
+          result.set(time, {
+            time,
+            open: Number(candle.open),
+            high: Number(candle.high),
+            low: Number(candle.low),
+            close: Number(candle.close),
+          });
+        });
+      };
+      push(history);
+      push(updates);
+      return Array.from(result.values()).sort((a, b) => a.time - b.time);
+    }
+
     function setEntryData(data) {
       entryData = sortCandles(data);
       if (entrySeries) {
@@ -488,15 +510,22 @@
         exitSeries = res.series;
         exitZeroLine = res.zeroLine;
       }
+      if (exitSeries && exitData.length > 0) {
+        setExitData(exitData);
+        showEmpty(exitEmpty, false);
+      }
       const { candles } = await loadCandles('exit');
       if (!candles || candles.length === 0) {
-        showEmpty(exitEmpty, true);
-        setExitData([]);
-      } else {
-        showEmpty(exitEmpty, false);
-        const data = toSeriesData(candles);
-        setExitData(data);
+        if (exitData.length === 0) {
+          showEmpty(exitEmpty, true);
+          setExitData([]);
+        }
+        return;
       }
+      const historical = toSeriesData(candles);
+      const merged = mergeCandles(historical, exitData);
+      showEmpty(exitEmpty, merged.length === 0);
+      setExitData(merged);
     }
 
     async function refreshCharts() {
@@ -520,11 +549,15 @@
       await refreshCharts();
     });
 
-    exitToggle.addEventListener('change', () => {
+    exitToggle.addEventListener('change', async () => {
       exitCard.classList.toggle('hidden', !exitToggle.checked);
       if (exitToggle.checked) {
-        ensureRealtimeSocket();
-        renderExit();
+        ensureRealtimeSocket(true);
+        try {
+          await renderExit();
+        } catch (err) {
+          console.error(err);
+        }
       }
     });
 
