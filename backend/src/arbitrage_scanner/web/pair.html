@@ -88,10 +88,12 @@
     const entryState = createChartState({
       containerId: 'entry-chart',
       emptyEl: entryEmpty,
+      isActive: () => true,
     });
     const exitState = createChartState({
       containerId: 'exit-chart',
       emptyEl: exitEmpty,
+      isActive: () => exitToggle.checked,
     });
     let realtimeSocket = null;
     let realtimeReconnect = null;
@@ -211,7 +213,7 @@
       priceScale.setPriceRange({ minValue: -span, maxValue: span });
     }
 
-    function createChartState({ containerId, emptyEl }) {
+    function createChartState({ containerId, emptyEl, isActive }) {
       const state = {
         container: document.getElementById(containerId),
         emptyEl,
@@ -219,6 +221,7 @@
         series: null,
         zeroLine: null,
         data: [],
+        isActive: typeof isActive === 'function' ? isActive : () => true,
         ensureChart() {
           if (this.chart) {
             return true;
@@ -236,6 +239,16 @@
             this.updateEmpty();
           }
           return true;
+        },
+        activate() {
+          if (!this.ensureChart()) {
+            return;
+          }
+          if (this.data.length > 0) {
+            this.applyFullData();
+          } else {
+            this.updateEmpty();
+          }
         },
         applyFullData() {
           if (this.series) {
@@ -282,7 +295,11 @@
             this.data[this.data.length - 1] = last;
           }
           const dropped = pruneBuffer(this.data);
-          if (this.series) {
+          const active = this.isActive();
+          if (active && !this.chart) {
+            this.ensureChart();
+          }
+          if (active && this.series) {
             if (dropped > 0) {
               this.series.setData(this.data);
             } else {
@@ -290,7 +307,7 @@
             }
             applyZeroCenteredScale(this.series, this.data);
           }
-          if (this.chart) {
+          if (active && this.chart) {
             applyTimeScaleOptions(this.chart);
             const scale = this.chart.timeScale();
             if (scale) {
@@ -553,7 +570,7 @@
     }
 
     async function renderEntry() {
-      entryState.ensureChart();
+      entryState.activate();
       const { candles } = await loadCandles('entry');
       if (!candles || candles.length === 0) {
         if (entryState.data.length === 0) {
@@ -571,10 +588,7 @@
       if (!exitToggle.checked) {
         return;
       }
-      exitState.ensureChart();
-      if (exitState.data.length > 0) {
-        exitState.applyFullData();
-      }
+      exitState.activate();
       const { candles } = await loadCandles('exit');
       if (!candles || candles.length === 0) {
         exitState.updateEmpty();
@@ -610,6 +624,7 @@
     exitToggle.addEventListener('change', async () => {
       exitCard.classList.toggle('hidden', !exitToggle.checked);
       if (exitToggle.checked) {
+        exitState.activate();
         ensureRealtimeSocket(true);
         try {
           await renderExit();
