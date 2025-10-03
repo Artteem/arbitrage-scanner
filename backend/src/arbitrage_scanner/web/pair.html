@@ -322,36 +322,39 @@
     }
 
     function updateSeriesBuffer(buffer, series, chart, value, ts) {
-      if (!series || !chart) return false;
       if (!Number.isFinite(value) || !Number.isFinite(ts)) return false;
       const tfSeconds = currentTimeframeSeconds();
       const bucket = Math.floor(ts / tfSeconds);
       const time = bucket * tfSeconds;
       const last = buffer[buffer.length - 1];
+      let candle;
       if (last && last.time === time) {
-        const updated = {
+        candle = {
           time,
           open: last.open,
           high: Math.max(last.high, value),
           low: Math.min(last.low, value),
           close: value,
         };
-        buffer[buffer.length - 1] = updated;
-        series.update(updated);
+        buffer[buffer.length - 1] = candle;
       } else {
-        const candle = { time, open: value, high: value, low: value, close: value };
+        candle = { time, open: value, high: value, low: value, close: value };
         buffer.push(candle);
-        series.update(candle);
       }
       const dropped = pruneBuffer(buffer);
-      if (dropped > 0) {
-        series.setData(buffer);
+      if (series) {
+        series.update(candle);
+        if (dropped > 0) {
+          series.setData(buffer);
+        }
+        applyZeroCenteredScale(series, buffer);
       }
-      applyZeroCenteredScale(series, buffer);
-      applyTimeScaleOptions(chart);
-      const scale = chart.timeScale();
-      if (scale && typeof scale.scrollToRealTime === 'function') {
-        scale.scrollToRealTime();
+      if (chart) {
+        applyTimeScaleOptions(chart);
+        const scale = chart.timeScale();
+        if (scale && typeof scale.scrollToRealTime === 'function') {
+          scale.scrollToRealTime();
+        }
       }
       return true;
     }
@@ -380,9 +383,10 @@
             showEmpty(entryEmpty, false);
           }
         }
-        if (exitSeries && typeof row.exit_pct !== 'undefined') {
+        if (typeof row.exit_pct !== 'undefined') {
           const exitValue = Number(row.exit_pct);
-          if (updateSeriesBuffer(exitData, exitSeries, exitChart, exitValue, ts)) {
+          const updated = updateSeriesBuffer(exitData, exitSeries, exitChart, exitValue, ts);
+          if (exitSeries && updated) {
             showEmpty(exitEmpty, false);
           }
         }
@@ -519,6 +523,7 @@
     exitToggle.addEventListener('change', () => {
       exitCard.classList.toggle('hidden', !exitToggle.checked);
       if (exitToggle.checked) {
+        ensureRealtimeSocket();
         renderExit();
       }
     });
