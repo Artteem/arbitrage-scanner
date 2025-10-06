@@ -215,6 +215,42 @@
     let overviewRows = [];
     let currentRow = null;
     let currentLimits = { long: null, short: null };
+    function normalizeExchangeName(value) {
+      return String(value || '').trim().toLowerCase();
+    }
+
+    function rowLongExchange(row) {
+      if (!row) return '';
+      return normalizeExchangeName(row.long_exchange || row.long_ex || row.long);
+    }
+
+    function rowShortExchange(row) {
+      if (!row) return '';
+      return normalizeExchangeName(row.short_exchange || row.short_ex || row.short);
+    }
+
+    function rowsMatch(a, b) {
+      if (!a || !b) return false;
+      return rowLongExchange(a) === rowLongExchange(b) && rowShortExchange(a) === rowShortExchange(b);
+    }
+
+    function findOverviewRow() {
+      if (!Array.isArray(overviewRows) || overviewRows.length === 0) return null;
+      const long = normalizeExchangeName(longExchange);
+      const short = normalizeExchangeName(shortExchange);
+      return overviewRows.find(row => rowLongExchange(row) === long && rowShortExchange(row) === short) || null;
+    }
+
+    function syncCurrentRow(force = false) {
+      const candidate = findOverviewRow();
+      if (!candidate) {
+        return;
+      }
+      if (force || !currentRow || !rowsMatch(currentRow, candidate)) {
+        currentRow = candidate;
+      }
+    }
+
     const entryState = createChartState({
       containerId: 'entry-chart',
       emptyEl: entryEmpty,
@@ -524,6 +560,8 @@
       longLink.href = longExchange ? exchangeUrl(longExchange, symbolUpper) : '#';
       shortLink.textContent = shortText;
       shortLink.href = shortExchange ? exchangeUrl(shortExchange, symbolUpper) : '#';
+      syncCurrentRow();
+      updateSummary();
     }
 
     function updateUrl() {
@@ -546,6 +584,7 @@
         if (!res.ok) return;
         const data = await res.json();
         overviewRows = Array.isArray(data.rows) ? data.rows : [];
+        syncCurrentRow();
       } catch (e) {
         console.error(e);
       }
@@ -574,6 +613,8 @@
       }
       updateExchangeInfo();
       updateUrl();
+      syncCurrentRow(true);
+      updateSummary();
     }
 
     function ensureRealtimeSocket(force = false) {
@@ -1200,7 +1241,7 @@
       ensureRealtimeSocket();
       updateExchangeInfo();
       updateUrl();
-      currentRow = null;
+      syncCurrentRow(true);
       updateSummary();
       await loadLimits();
       await renderEntry();

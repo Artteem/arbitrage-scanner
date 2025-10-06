@@ -15,6 +15,7 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
+from .exchanges.history import fetch_spread_history
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
 
@@ -193,38 +194,76 @@ async def pair_spreads(
     if metric_key not in {"entry", "exit"}:
         raise HTTPException(status_code=400, detail="Неизвестный тип графика")
     tf_value = _parse_timeframe(timeframe)
+    symbol_upper = symbol.upper()
+    long_key = long_exchange.lower()
+    short_key = short_exchange.lower()
     candles = SPREAD_HISTORY.get_candles(
         metric_key,
-        symbol=symbol.upper(),
-        long_exchange=long_exchange.lower(),
-        short_exchange=short_exchange.lower(),
+        symbol=symbol_upper,
+        long_exchange=long_key,
+        short_exchange=short_key,
         timeframe=tf_value,
     )
-    if not candles:
+    need_backfill = not candles
+    if lookback_days:
+        cutoff_ts = int(time.time() - lookback_days * 86400)
+        if candles and candles[0].start_ts > cutoff_ts:
+            need_backfill = True
+    if need_backfill:
         now = time.time()
-        for row in _rows_for_symbol(symbol):
-            SPREAD_HISTORY.add_point(
-                symbol=row.symbol,
-                long_exchange=row.long_ex,
-                short_exchange=row.short_ex,
-                entry_value=row.entry_pct,
-                exit_value=row.exit_pct,
-                ts=now,
+        rows = _rows_for_symbol(symbol)
+        if rows:
+            for row in rows:
+                SPREAD_HISTORY.add_point(
+                    symbol=row.symbol,
+                    long_exchange=row.long_ex,
+                    short_exchange=row.short_ex,
+                    entry_value=row.entry_pct,
+                    exit_value=row.exit_pct,
+                    ts=now,
+                )
+        try:
+            entry_hist, exit_hist = await fetch_spread_history(
+                symbol=symbol_upper,
+                long_exchange=long_key,
+                short_exchange=short_key,
+                timeframe_seconds=tf_value,
+                lookback_days=max(lookback_days, 1.0),
             )
+            if entry_hist:
+                SPREAD_HISTORY.merge_external(
+                    "entry",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=entry_hist,
+                )
+            if exit_hist:
+                SPREAD_HISTORY.merge_external(
+                    "exit",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=exit_hist,
+                )
+        except Exception:
+            logger.exception("Failed to backfill spread history", exc_info=True)
         candles = SPREAD_HISTORY.get_candles(
             metric_key,
-            symbol=symbol.upper(),
-            long_exchange=long_exchange.lower(),
-            short_exchange=short_exchange.lower(),
+            symbol=symbol_upper,
+            long_exchange=long_key,
+            short_exchange=short_key,
             timeframe=tf_value,
         )
     if lookback_days:
         cutoff_ts = int(time.time() - lookback_days * 86400)
         candles = [c for c in candles if c.start_ts >= cutoff_ts]
     return {
-        "symbol": symbol.upper(),
-        "long": long_exchange.lower(),
-        "short": short_exchange.lower(),
+        "symbol": symbol_upper,
+        "long": long_key,
+        "short": short_key,
         "metric": metric_key,
         "timeframe": timeframe,
         "timeframe_seconds": tf_value,
