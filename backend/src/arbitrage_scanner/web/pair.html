@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Карточка пары {{symbol}}</title>
+  <title>—/— {{symbol}}</title>
   <style>
     :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa4ad; --row:#161a20; --accent:#4aa3ff; --bad:#ff5a5f; --good:#12d67a; --link:#7ab7ff; --border:#2a2f39; }
     [data-theme="light"] { --bg:#fff; --fg:#0f172a; --muted:#4b5563; --row:#f8fafc; --accent:#0ea5e9; --bad:#ef4444; --good:#10b981; --link:#2563eb; --border:#e5e7eb; }
@@ -47,12 +47,15 @@
     .exchange-card-header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
     .exchange-card-header h3 { margin:0; font-size:16px; font-weight:600; }
     .exchange-meta { font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
-    .orderbook { display:grid; grid-template-columns:1fr minmax(80px, auto) 1fr; gap:12px; font-family:var(--mono, "JetBrains Mono", "Fira Mono", monospace); font-size:13px; }
-    .orderbook .asks { display:flex; flex-direction:column-reverse; gap:4px; }
-    .orderbook .bids { display:flex; flex-direction:column; gap:4px; }
-    .orderbook .asks div { color:var(--bad); display:flex; justify-content:space-between; }
-    .orderbook .bids div { color:var(--good); display:flex; justify-content:space-between; }
-    .orderbook .mid { display:flex; flex-direction:column; justify-content:center; align-items:center; font-weight:600; font-size:14px; gap:4px; }
+    .orderbook { display:flex; flex-direction:column; gap:8px; font-family:var(--mono, "JetBrains Mono", "Fira Mono", monospace); font-size:13px; }
+    .orderbook .asks, .orderbook .bids { display:flex; flex-direction:column; gap:4px; }
+    .orderbook .asks { flex-direction:column-reverse; }
+    .orderbook .level { display:flex; justify-content:space-between; gap:12px; }
+    .orderbook .asks .level { color:var(--bad); }
+    .orderbook .bids .level { color:var(--good); }
+    .orderbook .level span { display:inline-flex; align-items:center; }
+    .orderbook .level .volume { color:var(--muted); font-size:12px; margin-left:auto; text-align:right; }
+    .orderbook .mid { display:flex; flex-direction:column; justify-content:center; align-items:center; font-weight:600; font-size:14px; gap:4px; padding:4px 0; border-top:1px dashed var(--border); border-bottom:1px dashed var(--border); }
     .orderbook .mid span { color:var(--muted); font-size:12px; font-weight:400; }
     .orderbook-empty { font-size:13px; color:var(--muted); text-align:center; padding:12px; border:1px dashed var(--border); border-radius:8px; }
   </style>
@@ -100,7 +103,7 @@
       <section class="summary">
         <div class="summary-controls">
           <label class="volume-input">Объём сделки, USDT
-            <input id="volume-input" type="number" min="0" step="10" value="1000"/>
+            <input id="volume-input" type="number" min="0" step="10" value="100"/>
           </label>
           <div class="metrics-grid">
             <div class="metric-card">
@@ -215,6 +218,7 @@
     let overviewRows = [];
     let currentRow = null;
     let currentLimits = { long: null, short: null };
+    let latestMetrics = null;
     function normalizeExchangeName(value) {
       return String(value || '').trim().toLowerCase();
     }
@@ -708,7 +712,9 @@
 
     function formatNumber(value) {
       if (!Number.isFinite(value)) return null;
-      return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(value);
+      const abs = Math.abs(value);
+      const digits = abs < 1 ? 4 : 2;
+      return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: digits }).format(value);
     }
 
     function formatPrice(value) {
@@ -721,27 +727,35 @@
       return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
     }
 
-    function formatSize(value) {
+    function formatUsdtValue(value) {
       if (!Number.isFinite(value)) return '—';
       const abs = Math.abs(value);
-      const digits = abs >= 1 ? 4 : 6;
-      return value.toLocaleString('en-US', { maximumFractionDigits: digits });
+      let digits = 2;
+      if (abs >= 1000000) digits = 0;
+      else if (abs >= 100000) digits = 1;
+      else if (abs < 1) digits = 4;
+      return `${value.toLocaleString('ru-RU', { maximumFractionDigits: digits })} USDT`;
     }
 
-    function formatLimit(limit) {
+    function positiveNumber(value) {
+      const num = Number(value);
+      return Number.isFinite(num) && num > 0 ? num : null;
+    }
+
+    function formatLimit(limit, price) {
       if (!limit) return '—';
       const parts = [];
-      const notionalRaw = limit.max_notional;
-      const qtyRaw = limit.max_qty;
-      const notionalNumber = typeof notionalRaw === 'number' ? notionalRaw : (notionalRaw ? Number(notionalRaw) : NaN);
-      const qtyNumber = typeof qtyRaw === 'number' ? qtyRaw : (qtyRaw ? Number(qtyRaw) : NaN);
-      const formattedNotional = Number.isFinite(notionalNumber) && notionalNumber > 0 ? formatNumber(notionalNumber) : null;
-      const formattedQty = Number.isFinite(qtyNumber) && qtyNumber > 0 ? formatNumber(qtyNumber) : null;
-      if (formattedNotional) {
-        parts.push(`до ${formattedNotional} USDT`);
+      const notionalRaw = positiveNumber(limit.max_notional);
+      const qtyRaw = positiveNumber(limit.max_qty);
+      const px = positiveNumber(price);
+      const notional = notionalRaw || (qtyRaw && px ? qtyRaw * px : null);
+      if (Number.isFinite(notional) && notional > 0) {
+        parts.push(`до ${formatNumber(notional)} USDT`);
       }
-      if (formattedQty) {
-        parts.push(`объём ${formattedQty} ${baseSymbol()}`);
+      if (qtyRaw && px) {
+        parts.push(`≈ ${formatNumber(qtyRaw)} ${baseSymbol()}`);
+      } else if (qtyRaw && !notional) {
+        parts.push(`объём ${formatNumber(qtyRaw)} ${baseSymbol()}`);
       }
       if (limit.limit_desc) {
         parts.push(limit.limit_desc);
@@ -781,14 +795,16 @@
         const price = Number(level[0]);
         const size = Number(level[1]);
         if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
-        return { price, size };
+        const quote = price * size;
+        return { price, size, quote: Number.isFinite(quote) ? quote : null };
       }).filter(Boolean) : [];
       const asks = Array.isArray(raw.asks) ? raw.asks.map(level => {
         if (!Array.isArray(level) || level.length < 2) return null;
         const price = Number(level[0]);
         const size = Number(level[1]);
         if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
-        return { price, size };
+        const quote = price * size;
+        return { price, size, quote: Number.isFinite(quote) ? quote : null };
       }).filter(Boolean) : [];
       bids.sort((a, b) => b.price - a.price);
       asks.sort((a, b) => a.price - b.price);
@@ -811,9 +827,20 @@
         const size = volume > 0 ? volume / fallbackAsk : 0;
         if (size > 0) asks.push({ price: fallbackAsk, size });
       }
+      const mapLevels = (levels) => levels
+        .map(level => {
+          if (!level) return null;
+          const price = Number(level.price);
+          const size = Number(level.size);
+          if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
+          const quote = price * size;
+          return { price, size, quote: Number.isFinite(quote) ? quote : null };
+        })
+        .filter(Boolean)
+        .slice(0, 5);
       return {
-        bids: bids.slice(0, 5),
-        asks: asks.slice(0, 5),
+        bids: mapLevels(bids),
+        asks: mapLevels(asks),
         last: book && Number.isFinite(book.last) ? book.last : (
           Number.isFinite(fallbackBid) && Number.isFinite(fallbackAsk)
             ? (Number(fallbackBid) + Number(fallbackAsk)) / 2
@@ -989,8 +1016,8 @@
       }
       const asksRows = (book.asks || []).slice(0, 5);
       const bidsRows = (book.bids || []).slice(0, 5);
-      asksEl.innerHTML = asksRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
-      bidsEl.innerHTML = bidsRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
+      asksEl.innerHTML = asksRows.map(level => `<div class="level"><span>${formatPrice(level.price)}</span><span class="volume">${formatUsdtValue(level.quote)}</span></div>`).join('');
+      bidsEl.innerHTML = bidsRows.map(level => `<div class="level"><span>${formatPrice(level.price)}</span><span class="volume">${formatUsdtValue(level.quote)}</span></div>`).join('');
       midPriceEl.textContent = Number.isFinite(book.last) ? formatPrice(book.last) : '—';
       if (emptyEl) emptyEl.classList.add('hidden');
     }
@@ -1040,24 +1067,37 @@
       shortFundingMeta.textContent = `Фандинг: ${shortText}`;
     }
 
-    function updateLimitsMeta() {
-      const longText = currentLimits.long ? formatLimit(currentLimits.long) : '—';
-      const shortText = currentLimits.short ? formatLimit(currentLimits.short) : '—';
+    function resolveLimitPrice(side, metrics) {
+      if (metrics) {
+        if (side === 'long' && Number.isFinite(metrics.avgLongEntry)) return metrics.avgLongEntry;
+        if (side === 'short' && Number.isFinite(metrics.avgShortEntry)) return metrics.avgShortEntry;
+      }
+      if (!currentRow) return null;
+      if (side === 'long') {
+        return Number(currentRow.price_long_ask);
+      }
+      if (side === 'short') {
+        return Number(currentRow.price_short_bid);
+      }
+      return null;
+    }
+
+    function updateLimitsMeta(metrics = latestMetrics) {
+      const longPrice = resolveLimitPrice('long', metrics);
+      const shortPrice = resolveLimitPrice('short', metrics);
+      const longText = currentLimits.long ? formatLimit(currentLimits.long, longPrice) : '—';
+      const shortText = currentLimits.short ? formatLimit(currentLimits.short, shortPrice) : '—';
       longLimitMeta.textContent = `Лимит: ${longText}`;
       shortLimitMeta.textContent = `Лимит: ${shortText}`;
     }
 
     function updateDocumentTitle(entry, exit) {
-      if (Number.isFinite(entry) && Number.isFinite(exit)) {
-        const entryText = formatPercent(entry);
-        const exitText = formatPercent(exit);
-        document.title = `Вход ${entryText} · Выход ${exitText} · ${symbolUpper}`;
-      } else {
-        document.title = `Карточка пары ${symbolUpper}`;
-      }
+      const entryText = Number.isFinite(entry) ? entry.toFixed(4) : '—';
+      const exitText = Number.isFinite(exit) ? exit.toFixed(4) : '—';
+      document.title = `${entryText}/${exitText} ${symbolUpper}`;
     }
 
-    function applyMetrics(row, metrics) {
+    function applyMetrics(metrics) {
       if (!metrics) {
         setMetric(metricEntry, metricEntryUsd, null, null);
         setMetric(metricExit, metricExitUsd, null, null);
@@ -1101,9 +1141,11 @@
 
     function updateSummary() {
       const metrics = computeMetrics(currentRow);
+      latestMetrics = metrics;
       renderOrderBooks(currentRow, metrics);
       updateFundingMeta();
-      applyMetrics(currentRow, metrics);
+      applyMetrics(metrics);
+      updateLimitsMeta(metrics);
     }
 
     function pruneBuffer(buffer) {

@@ -35,6 +35,7 @@ for connector in CONNECTORS:
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
+SPREAD_REFRESH_INTERVAL = 0.5
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
@@ -113,7 +114,7 @@ async def _spread_loop() -> None:
             logger.exception("Failed to compute spreads", exc_info=exc)
             LAST_ROWS = []
             LAST_ROWS_TS = 0.0
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
 
 
 @app.on_event("startup")
@@ -309,7 +310,7 @@ async def ws_spreads(ws: WebSocket):
                 payload.append(item)
             if payload or not use_filter:
                 await ws.send_text(json.dumps(payload))
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
     except WebSocketDisconnect:
         return
     except Exception:
