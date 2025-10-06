@@ -15,6 +15,7 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
+from .exchanges.history import fetch_spread_history
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
 
@@ -34,6 +35,8 @@ for connector in CONNECTORS:
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
+SPREAD_REFRESH_INTERVAL = 0.1
+SPREAD_EVENT: asyncio.Event = asyncio.Event()
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
@@ -108,11 +111,13 @@ async def _spread_loop() -> None:
                 )
             LAST_ROWS = rows
             LAST_ROWS_TS = ts
+            SPREAD_EVENT.set()
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception("Failed to compute spreads", exc_info=exc)
             LAST_ROWS = []
             LAST_ROWS_TS = 0.0
-        await asyncio.sleep(1.0)
+            SPREAD_EVENT.set()
+        await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
 
 
 @app.on_event("startup")
@@ -193,38 +198,76 @@ async def pair_spreads(
     if metric_key not in {"entry", "exit"}:
         raise HTTPException(status_code=400, detail="Неизвестный тип графика")
     tf_value = _parse_timeframe(timeframe)
+    symbol_upper = symbol.upper()
+    long_key = long_exchange.lower()
+    short_key = short_exchange.lower()
     candles = SPREAD_HISTORY.get_candles(
         metric_key,
-        symbol=symbol.upper(),
-        long_exchange=long_exchange.lower(),
-        short_exchange=short_exchange.lower(),
+        symbol=symbol_upper,
+        long_exchange=long_key,
+        short_exchange=short_key,
         timeframe=tf_value,
     )
-    if not candles:
+    need_backfill = not candles
+    if lookback_days:
+        cutoff_ts = int(time.time() - lookback_days * 86400)
+        if candles and candles[0].start_ts > cutoff_ts:
+            need_backfill = True
+    if need_backfill:
         now = time.time()
-        for row in _rows_for_symbol(symbol):
-            SPREAD_HISTORY.add_point(
-                symbol=row.symbol,
-                long_exchange=row.long_ex,
-                short_exchange=row.short_ex,
-                entry_value=row.entry_pct,
-                exit_value=row.exit_pct,
-                ts=now,
+        rows = _rows_for_symbol(symbol)
+        if rows:
+            for row in rows:
+                SPREAD_HISTORY.add_point(
+                    symbol=row.symbol,
+                    long_exchange=row.long_ex,
+                    short_exchange=row.short_ex,
+                    entry_value=row.entry_pct,
+                    exit_value=row.exit_pct,
+                    ts=now,
+                )
+        try:
+            entry_hist, exit_hist = await fetch_spread_history(
+                symbol=symbol_upper,
+                long_exchange=long_key,
+                short_exchange=short_key,
+                timeframe_seconds=tf_value,
+                lookback_days=max(lookback_days, 1.0),
             )
+            if entry_hist:
+                SPREAD_HISTORY.merge_external(
+                    "entry",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=entry_hist,
+                )
+            if exit_hist:
+                SPREAD_HISTORY.merge_external(
+                    "exit",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=exit_hist,
+                )
+        except Exception:
+            logger.exception("Failed to backfill spread history", exc_info=True)
         candles = SPREAD_HISTORY.get_candles(
             metric_key,
-            symbol=symbol.upper(),
-            long_exchange=long_exchange.lower(),
-            short_exchange=short_exchange.lower(),
+            symbol=symbol_upper,
+            long_exchange=long_key,
+            short_exchange=short_key,
             timeframe=tf_value,
         )
     if lookback_days:
         cutoff_ts = int(time.time() - lookback_days * 86400)
         candles = [c for c in candles if c.start_ts >= cutoff_ts]
     return {
-        "symbol": symbol.upper(),
-        "long": long_exchange.lower(),
-        "short": short_exchange.lower(),
+        "symbol": symbol_upper,
+        "long": long_key,
+        "short": short_key,
         "metric": metric_key,
         "timeframe": timeframe,
         "timeframe_seconds": tf_value,
@@ -245,6 +288,32 @@ async def pair_limits(symbol: str, long_exchange: str = Query(..., alias="long")
     }
 
 
+@app.get("/api/pair/{symbol}/realtime")
+async def pair_realtime(
+    symbol: str,
+    long_exchange: str = Query(..., alias="long"),
+    short_exchange: str = Query(..., alias="short"),
+):
+    rows = _rows_for_symbol(symbol)
+    long_key = long_exchange.lower()
+    short_key = short_exchange.lower()
+    ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+    payload: dict[str, object] | None = None
+    for row in rows:
+        if row.long_ex.lower() == long_key and row.short_ex.lower() == short_key:
+            payload = row.as_dict()
+            if payload is not None:
+                payload["_ts"] = ts
+            break
+    return {
+        "symbol": symbol.upper(),
+        "long_exchange": long_key,
+        "short_exchange": short_key,
+        "ts": ts,
+        "row": payload,
+    }
+
+
 @app.websocket("/ws/spreads")
 async def ws_spreads(ws: WebSocket):
     await ws.accept()
@@ -252,6 +321,7 @@ async def ws_spreads(ws: WebSocket):
     target_long = (ws.query_params.get("long") or "").lower()
     target_short = (ws.query_params.get("short") or "").lower()
     use_filter = bool(target_symbol and target_long and target_short)
+    last_payload: str | None = None
     try:
         while True:
             rows = _current_rows()
@@ -269,8 +339,16 @@ async def ws_spreads(ws: WebSocket):
                 item["_ts"] = ts
                 payload.append(item)
             if payload or not use_filter:
-                await ws.send_text(json.dumps(payload))
-            await asyncio.sleep(1.0)
+                message = json.dumps(payload)
+                if message != last_payload:
+                    await ws.send_text(message)
+                    last_payload = message
+            if SPREAD_EVENT.is_set():
+                SPREAD_EVENT.clear()
+            try:
+                await asyncio.wait_for(SPREAD_EVENT.wait(), timeout=SPREAD_REFRESH_INTERVAL)
+            except asyncio.TimeoutError:
+                continue
     except WebSocketDisconnect:
         return
     except Exception:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence
 
 from ..domain import ExchangeName, Symbol
+from ..exchanges.history import SpreadCandle
 
 
 @dataclass
@@ -86,6 +87,40 @@ class SpreadHistory:
         if not candles:
             return []
         return list(candles)
+
+    def merge_external(
+        self,
+        metric: str,
+        *,
+        symbol: Symbol,
+        long_exchange: ExchangeName,
+        short_exchange: ExchangeName,
+        timeframe: int,
+        candles: Sequence[SpreadCandle],
+    ) -> None:
+        if not candles:
+            return
+        tf = int(timeframe)
+        if tf not in self._timeframes:
+            return
+        storage = self._entries if metric == "entry" else self._exits
+        key = self._key(symbol, long_exchange, short_exchange)
+        per_key = storage.setdefault(key, {})
+        existing = {c.start_ts: c for c in per_key.get(tf, [])}
+        for candle in candles:
+            try:
+                start_ts = int(candle.start_ts)
+                open_ = float(candle.open)
+                high = float(candle.high)
+                low = float(candle.low)
+                close = float(candle.close)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            existing[start_ts] = Candle(start_ts, open_, high, low, close)
+        merged = [existing[ts] for ts in sorted(existing.keys())]
+        if len(merged) > self._max_candles:
+            merged = merged[-self._max_candles :]
+        per_key[tf] = merged
 
     def _add_value(
         self,

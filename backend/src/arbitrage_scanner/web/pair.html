@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Карточка пары {{symbol}}</title>
+  <title>—/— {{symbol}}</title>
   <style>
     :root { --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa4ad; --row:#161a20; --accent:#4aa3ff; --bad:#ff5a5f; --good:#12d67a; --link:#7ab7ff; --border:#2a2f39; }
     [data-theme="light"] { --bg:#fff; --fg:#0f172a; --muted:#4b5563; --row:#f8fafc; --accent:#0ea5e9; --bad:#ef4444; --good:#10b981; --link:#2563eb; --border:#e5e7eb; }
@@ -47,12 +47,15 @@
     .exchange-card-header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
     .exchange-card-header h3 { margin:0; font-size:16px; font-weight:600; }
     .exchange-meta { font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
-    .orderbook { display:grid; grid-template-columns:1fr minmax(80px, auto) 1fr; gap:12px; font-family:var(--mono, "JetBrains Mono", "Fira Mono", monospace); font-size:13px; }
-    .orderbook .asks { display:flex; flex-direction:column-reverse; gap:4px; }
-    .orderbook .bids { display:flex; flex-direction:column; gap:4px; }
-    .orderbook .asks div { color:var(--bad); display:flex; justify-content:space-between; }
-    .orderbook .bids div { color:var(--good); display:flex; justify-content:space-between; }
-    .orderbook .mid { display:flex; flex-direction:column; justify-content:center; align-items:center; font-weight:600; font-size:14px; gap:4px; }
+    .orderbook { display:flex; flex-direction:column; gap:8px; font-family:var(--mono, "JetBrains Mono", "Fira Mono", monospace); font-size:13px; }
+    .orderbook .asks, .orderbook .bids { display:flex; flex-direction:column; gap:4px; }
+    .orderbook .asks { flex-direction:column-reverse; }
+    .orderbook .level { display:flex; justify-content:space-between; gap:12px; }
+    .orderbook .asks .level { color:var(--bad); }
+    .orderbook .bids .level { color:var(--good); }
+    .orderbook .level span { display:inline-flex; align-items:center; }
+    .orderbook .level .volume { color:var(--muted); font-size:12px; margin-left:auto; text-align:right; }
+    .orderbook .mid { display:flex; flex-direction:column; justify-content:center; align-items:center; font-weight:600; font-size:14px; gap:4px; padding:4px 0; border-top:1px dashed var(--border); border-bottom:1px dashed var(--border); }
     .orderbook .mid span { color:var(--muted); font-size:12px; font-weight:400; }
     .orderbook-empty { font-size:13px; color:var(--muted); text-align:center; padding:12px; border:1px dashed var(--border); border-radius:8px; }
   </style>
@@ -100,7 +103,7 @@
       <section class="summary">
         <div class="summary-controls">
           <label class="volume-input">Объём сделки, USDT
-            <input id="volume-input" type="number" min="0" step="10" value="1000"/>
+            <input id="volume-input" type="number" min="0" step="10" value="100"/>
           </label>
           <div class="metrics-grid">
             <div class="metric-card">
@@ -175,6 +178,8 @@
     const LOOKBACK_DAYS = 10;
     const LOOKBACK_SECONDS = LOOKBACK_DAYS * 86400;
     const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '1h': 3600 };
+    const FALLBACK_INTERVAL_MS = 750;
+    const STALE_THRESHOLD_MS = 900;
     const timeframeSelect = document.getElementById('timeframe');
     const reverseBtn = document.getElementById('reverse-btn');
     const exitToggle = document.getElementById('exit-toggle');
@@ -215,6 +220,188 @@
     let overviewRows = [];
     let currentRow = null;
     let currentLimits = { long: null, short: null };
+    let latestMetrics = null;
+    let fallbackTimer = null;
+    let fallbackFetchPromise = null;
+    let lastRealtimeUpdate = 0;
+    function normalizeExchangeName(value) {
+      return String(value || '').trim().toLowerCase();
+    }
+
+    function normalizeSymbolKey(value) {
+      return String(value || '')
+        .replace(/[^a-z0-9]/gi, '')
+        .toUpperCase();
+    }
+
+    function rowLongExchange(row) {
+      if (!row) return '';
+      return normalizeExchangeName(row.long_exchange || row.long_ex || row.long);
+    }
+
+    function rowShortExchange(row) {
+      if (!row) return '';
+      return normalizeExchangeName(row.short_exchange || row.short_ex || row.short);
+    }
+
+    function rowsMatch(a, b) {
+      if (!a || !b) return false;
+      return rowLongExchange(a) === rowLongExchange(b) && rowShortExchange(a) === rowShortExchange(b);
+    }
+
+    function findOverviewRow() {
+      if (!Array.isArray(overviewRows) || overviewRows.length === 0) return null;
+      const long = normalizeExchangeName(longExchange);
+      const short = normalizeExchangeName(shortExchange);
+      return overviewRows.find(row => rowLongExchange(row) === long && rowShortExchange(row) === short) || null;
+    }
+
+    function normalizeRealtimeRow(row) {
+      if (!row) return null;
+      if (row.__normalized) {
+        return row;
+      }
+      const next = { ...row };
+      next.symbol = symbolUpper;
+      const longKey = rowLongExchange(row);
+      const shortKey = rowShortExchange(row);
+      if (!longKey || !shortKey) {
+        return null;
+      }
+      next.long_exchange = longKey;
+      next.long_ex = longKey;
+      next.long = longKey;
+      next.short_exchange = shortKey;
+      next.short_ex = shortKey;
+      next.short = shortKey;
+      Object.defineProperty(next, '__normalized', {
+        value: true,
+        enumerable: false,
+        configurable: false,
+      });
+      return next;
+    }
+
+    function mergeOverviewRow(row) {
+      if (!row) return null;
+      const normalized = normalizeRealtimeRow(row);
+      if (!normalized) return null;
+      const longKey = rowLongExchange(normalized);
+      const shortKey = rowShortExchange(normalized);
+      const existingIndex = overviewRows.findIndex(
+        (candidate) => rowLongExchange(candidate) === longKey && rowShortExchange(candidate) === shortKey,
+      );
+      const nextRow = normalized;
+      if (existingIndex >= 0) {
+        const merged = { ...overviewRows[existingIndex], ...nextRow };
+        overviewRows[existingIndex] = merged;
+        return merged;
+      } else {
+        overviewRows.push(nextRow);
+        return nextRow;
+      }
+    }
+
+    function markRealtimeUpdate() {
+      lastRealtimeUpdate = Date.now();
+    }
+
+    function syncCurrentRow(force = false) {
+      const candidate = findOverviewRow();
+      if (!candidate) {
+        return;
+      }
+      if (force || !currentRow || !rowsMatch(currentRow, candidate)) {
+        currentRow = candidate;
+      }
+    }
+
+    function applyRealtimeRow(row, tsOverride) {
+      if (!row || !longExchange || !shortExchange) return false;
+      const incomingSymbol = normalizeSymbolKey(row.symbol || symbolUpper || '');
+      const expectedSymbol = normalizeSymbolKey(symbolUpper);
+      if (incomingSymbol && incomingSymbol !== expectedSymbol) return false;
+      const normalized = normalizeRealtimeRow(row);
+      if (!normalized) return false;
+      const expectedLong = normalizeExchangeName(longExchange);
+      const expectedShort = normalizeExchangeName(shortExchange);
+      const rowLong = rowLongExchange(normalized);
+      const rowShort = rowShortExchange(normalized);
+      if (!rowLong || !rowShort) return false;
+      if (rowLong !== expectedLong || rowShort !== expectedShort) return false;
+      const merged = mergeOverviewRow(normalized) || normalized;
+      currentRow = merged;
+      syncCurrentRow(true);
+      const activeRow = currentRow || merged;
+      const ts = Number(tsOverride ?? normalized._ts ?? normalized.ts ?? Date.now() / 1000);
+      const entryValue = Number(normalized.entry_pct ?? activeRow.entry_pct);
+      if (Number.isFinite(entryValue)) {
+        entryState.appendLive(entryValue, ts);
+      }
+      const exitCandidate = typeof normalized.exit_pct !== 'undefined' ? normalized.exit_pct : activeRow.exit_pct;
+      const exitValue = Number(exitCandidate);
+      if (Number.isFinite(exitValue)) {
+        exitState.appendLive(exitValue, ts);
+      }
+      updateSummary();
+      markRealtimeUpdate();
+      return true;
+    }
+
+    function ensureFallbackLoop() {
+      if (fallbackTimer) return;
+      fallbackTimer = setInterval(() => {
+        if (!longExchange || !shortExchange) return;
+        if (fallbackFetchPromise) return;
+        const staleFor = Date.now() - lastRealtimeUpdate;
+        if (staleFor < STALE_THRESHOLD_MS) {
+          return;
+        }
+        fetchRealtimeSnapshot();
+      }, FALLBACK_INTERVAL_MS);
+    }
+
+    async function fetchRealtimeSnapshot(force = false) {
+      if (!longExchange || !shortExchange) return;
+      if (!force && fallbackFetchPromise) {
+        return fallbackFetchPromise;
+      }
+      const params = new URLSearchParams({
+        long: longExchange,
+        short: shortExchange,
+        _t: String(Date.now()),
+      });
+      const request = (async () => {
+        try {
+          const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/realtime?${params.toString()}`, {
+            cache: 'no-store',
+          });
+          if (!res.ok) {
+            lastRealtimeUpdate = 0;
+            return;
+          }
+          const data = await res.json();
+          if (!data || !data.row) {
+            lastRealtimeUpdate = 0;
+            return;
+          }
+          const ts = Number(data.ts ?? data.row?._ts ?? Date.now() / 1000);
+          const payload = { ...data.row, _ts: ts };
+          applyRealtimeRow(payload, ts);
+        } catch (err) {
+          // ignore network errors in fallback fetches
+          lastRealtimeUpdate = 0;
+        }
+      })();
+      if (force) {
+        return request;
+      }
+      fallbackFetchPromise = request.finally(() => {
+        fallbackFetchPromise = null;
+      });
+      return fallbackFetchPromise;
+    }
+
     const entryState = createChartState({
       containerId: 'entry-chart',
       emptyEl: entryEmpty,
@@ -524,6 +711,8 @@
       longLink.href = longExchange ? exchangeUrl(longExchange, symbolUpper) : '#';
       shortLink.textContent = shortText;
       shortLink.href = shortExchange ? exchangeUrl(shortExchange, symbolUpper) : '#';
+      syncCurrentRow();
+      updateSummary();
     }
 
     function updateUrl() {
@@ -545,7 +734,11 @@
         const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/overview`);
         if (!res.ok) return;
         const data = await res.json();
-        overviewRows = Array.isArray(data.rows) ? data.rows : [];
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        overviewRows = rows
+          .map(normalizeRealtimeRow)
+          .filter(Boolean);
+        syncCurrentRow();
       } catch (e) {
         console.error(e);
       }
@@ -574,6 +767,8 @@
       }
       updateExchangeInfo();
       updateUrl();
+      syncCurrentRow(true);
+      updateSummary();
     }
 
     function ensureRealtimeSocket(force = false) {
@@ -598,6 +793,9 @@
       });
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       realtimeSocket = new WebSocket(`${proto}://${location.host}/ws/spreads?${params.toString()}`);
+      realtimeSocket.onopen = () => {
+        markRealtimeUpdate();
+      };
       realtimeSocket.onmessage = (event) => {
         handleRealtimeMessage(event.data);
       };
@@ -606,6 +804,7 @@
       };
       realtimeSocket.onclose = () => {
         realtimeSocket = null;
+        lastRealtimeUpdate = 0;
         if (!realtimeReconnect) {
           realtimeReconnect = setTimeout(() => ensureRealtimeSocket(true), 1200);
         }
@@ -653,21 +852,39 @@
       return symbolUpper;
     }
 
+    function roundToTwo(value) {
+      if (!Number.isFinite(value)) return null;
+      const rounded = Math.round(value * 100) / 100;
+      return Object.is(rounded, -0) ? 0 : rounded;
+    }
+
     function formatPercent(value) {
-      if (!Number.isFinite(value)) return '—';
-      const formatted = value.toFixed(4);
-      return `${value > 0 ? '+' : ''}${formatted}%`;
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      const fixed = Math.abs(rounded).toFixed(2);
+      const sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '';
+      return `${sign}${fixed}%`;
     }
 
     function formatUsd(value) {
-      if (!Number.isFinite(value)) return '—';
-      const formatted = value.toFixed(2);
-      return `${value > 0 ? '+' : ''}${formatted} USDT`;
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      const fixed = Math.abs(rounded).toFixed(2);
+      const sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '';
+      return `${sign}${fixed} USDT`;
+    }
+
+    function formatPlainTwo(value) {
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      return rounded.toFixed(2);
     }
 
     function formatNumber(value) {
       if (!Number.isFinite(value)) return null;
-      return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(value);
+      const abs = Math.abs(value);
+      const digits = abs < 1 ? 4 : 2;
+      return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: digits }).format(value);
     }
 
     function formatPrice(value) {
@@ -680,27 +897,35 @@
       return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
     }
 
-    function formatSize(value) {
+    function formatUsdtValue(value) {
       if (!Number.isFinite(value)) return '—';
       const abs = Math.abs(value);
-      const digits = abs >= 1 ? 4 : 6;
-      return value.toLocaleString('en-US', { maximumFractionDigits: digits });
+      let digits = 2;
+      if (abs >= 1000000) digits = 0;
+      else if (abs >= 100000) digits = 1;
+      else if (abs < 1) digits = 4;
+      return `${value.toLocaleString('ru-RU', { maximumFractionDigits: digits })} USDT`;
     }
 
-    function formatLimit(limit) {
+    function positiveNumber(value) {
+      const num = Number(value);
+      return Number.isFinite(num) && num > 0 ? num : null;
+    }
+
+    function formatLimit(limit, price) {
       if (!limit) return '—';
       const parts = [];
-      const notionalRaw = limit.max_notional;
-      const qtyRaw = limit.max_qty;
-      const notionalNumber = typeof notionalRaw === 'number' ? notionalRaw : (notionalRaw ? Number(notionalRaw) : NaN);
-      const qtyNumber = typeof qtyRaw === 'number' ? qtyRaw : (qtyRaw ? Number(qtyRaw) : NaN);
-      const formattedNotional = Number.isFinite(notionalNumber) && notionalNumber > 0 ? formatNumber(notionalNumber) : null;
-      const formattedQty = Number.isFinite(qtyNumber) && qtyNumber > 0 ? formatNumber(qtyNumber) : null;
-      if (formattedNotional) {
-        parts.push(`до ${formattedNotional} USDT`);
+      const notionalRaw = positiveNumber(limit.max_notional);
+      const qtyRaw = positiveNumber(limit.max_qty);
+      const px = positiveNumber(price);
+      const notional = notionalRaw || (qtyRaw && px ? qtyRaw * px : null);
+      if (Number.isFinite(notional) && notional > 0) {
+        parts.push(`до ${formatNumber(notional)} USDT`);
       }
-      if (formattedQty) {
-        parts.push(`объём ${formattedQty} ${baseSymbol()}`);
+      if (qtyRaw && px) {
+        parts.push(`≈ ${formatNumber(qtyRaw)} ${baseSymbol()}`);
+      } else if (qtyRaw && !notional) {
+        parts.push(`объём ${formatNumber(qtyRaw)} ${baseSymbol()}`);
       }
       if (limit.limit_desc) {
         parts.push(limit.limit_desc);
@@ -716,15 +941,17 @@
     }
 
     function setMetric(el, usdEl, pctValue, usdValue) {
+      const pctRounded = roundToTwo(pctValue);
+      const usdRounded = roundToTwo(usdValue);
       const pctText = formatPercent(pctValue);
       const usdText = formatUsd(usdValue);
       resetMetric(el);
-      if (Number.isFinite(pctValue)) {
-        if (pctValue > 0) el.classList.add('metric-pos');
-        if (pctValue < 0) el.classList.add('metric-neg');
+      if (pctRounded !== null) {
+        if (pctRounded > 0) el.classList.add('metric-pos');
+        if (pctRounded < 0) el.classList.add('metric-neg');
       }
       el.textContent = pctText;
-      usdEl.textContent = Number.isFinite(usdValue) ? `Δ ${usdText}` : '—';
+      usdEl.textContent = usdRounded === null ? '—' : `Δ ${usdText}`;
     }
 
     function currentVolumeUsdt() {
@@ -740,14 +967,16 @@
         const price = Number(level[0]);
         const size = Number(level[1]);
         if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
-        return { price, size };
+        const quote = price * size;
+        return { price, size, quote: Number.isFinite(quote) ? quote : null };
       }).filter(Boolean) : [];
       const asks = Array.isArray(raw.asks) ? raw.asks.map(level => {
         if (!Array.isArray(level) || level.length < 2) return null;
         const price = Number(level[0]);
         const size = Number(level[1]);
         if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
-        return { price, size };
+        const quote = price * size;
+        return { price, size, quote: Number.isFinite(quote) ? quote : null };
       }).filter(Boolean) : [];
       bids.sort((a, b) => b.price - a.price);
       asks.sort((a, b) => a.price - b.price);
@@ -770,9 +999,20 @@
         const size = volume > 0 ? volume / fallbackAsk : 0;
         if (size > 0) asks.push({ price: fallbackAsk, size });
       }
+      const mapLevels = (levels) => levels
+        .map(level => {
+          if (!level) return null;
+          const price = Number(level.price);
+          const size = Number(level.size);
+          if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) return null;
+          const quote = price * size;
+          return { price, size, quote: Number.isFinite(quote) ? quote : null };
+        })
+        .filter(Boolean)
+        .slice(0, 5);
       return {
-        bids: bids.slice(0, 5),
-        asks: asks.slice(0, 5),
+        bids: mapLevels(bids),
+        asks: mapLevels(asks),
         last: book && Number.isFinite(book.last) ? book.last : (
           Number.isFinite(fallbackBid) && Number.isFinite(fallbackAsk)
             ? (Number(fallbackBid) + Number(fallbackAsk)) / 2
@@ -833,49 +1073,104 @@
     function computeMetrics(row) {
       if (!row) return null;
       const volume = currentVolumeUsdt();
-      if (volume <= 0) {
-        return {
-          volume,
-          baseQty: 0,
-          entryPct: null,
-          exitPct: null,
-          entryPnl: null,
-          exitPnl: null,
-          fundingPct: Number(row.funding_spread) * 100,
-          fundingUsd: null,
-          commissionPct: Number(row.commission_total_pct),
-          commissionUsd: null,
-          longBook: ensureBook(normalizeOrderBook(row.orderbook_long), Number(row.price_long_bid), Number(row.price_long_ask), volume),
-          shortBook: ensureBook(normalizeOrderBook(row.orderbook_short), Number(row.price_short_bid), Number(row.price_short_ask), volume),
-        };
-      }
+      const entryPctRaw = Number(row.entry_pct);
+      const exitPctRaw = Number(row.exit_pct);
+      const fundingSpreadRaw = Number(row.funding_spread);
+      const commissionSource = typeof row.commission_total_pct !== 'undefined'
+        ? row.commission_total_pct
+        : row.commission;
+      const commissionPctRaw = Number(commissionSource);
+      const priceLongAsk = Number(row.price_long_ask);
+      const priceShortBid = Number(row.price_short_bid);
+      const priceLongBid = Number(row.price_long_bid);
+      const priceShortAsk = Number(row.price_short_ask);
 
       const longBook = ensureBook(
         normalizeOrderBook(row.orderbook_long),
-        Number(row.price_long_bid),
-        Number(row.price_long_ask),
+        priceLongBid,
+        priceLongAsk,
         volume,
       );
       const shortBook = ensureBook(
         normalizeOrderBook(row.orderbook_short),
-        Number(row.price_short_bid),
-        Number(row.price_short_ask),
+        priceShortBid,
+        priceShortAsk,
         volume,
       );
 
-      if (!longBook || longBook.asks.length === 0 || !shortBook || shortBook.bids.length === 0) {
-        return null;
+      const baseFromTop = volume > 0 && Number.isFinite(priceLongAsk) && priceLongAsk > 0
+        ? volume / priceLongAsk
+        : volume <= 0 ? 0 : null;
+
+      const entryPnlApprox = Number.isFinite(baseFromTop) && Number.isFinite(priceShortBid) && Number.isFinite(priceLongAsk)
+        ? (priceShortBid - priceLongAsk) * baseFromTop
+        : null;
+      const exitPnlApprox = Number.isFinite(baseFromTop) && Number.isFinite(priceLongBid) && Number.isFinite(priceShortAsk)
+        ? (priceLongBid - priceShortAsk) * baseFromTop
+        : null;
+
+      const fundingPct = Number.isFinite(fundingSpreadRaw) ? fundingSpreadRaw * 100 : null;
+      const entryMidApprox = Number.isFinite(priceLongAsk) && Number.isFinite(priceShortBid)
+        ? (priceLongAsk + priceShortBid) / 2
+        : null;
+      const exitMidApprox = Number.isFinite(priceLongBid) && Number.isFinite(priceShortAsk)
+        ? (priceLongBid + priceShortAsk) / 2
+        : null;
+
+      const avgNotionalApprox = Number.isFinite(baseFromTop) && Number.isFinite(entryMidApprox)
+        ? baseFromTop * entryMidApprox
+        : null;
+      const fundingUsdApprox = Number.isFinite(avgNotionalApprox) && Number.isFinite(fundingSpreadRaw)
+        ? avgNotionalApprox * fundingSpreadRaw
+        : null;
+      const commissionPct = Number.isFinite(commissionPctRaw) ? commissionPctRaw : null;
+      const commissionUsdApprox = Number.isFinite(avgNotionalApprox) && Number.isFinite(commissionPctRaw)
+        ? avgNotionalApprox * (commissionPctRaw / 100)
+        : null;
+
+      const result = {
+        volume,
+        baseQty: baseFromTop ?? 0,
+        entryPct: Number.isFinite(entryPctRaw) ? entryPctRaw : null,
+        exitPct: Number.isFinite(exitPctRaw) ? exitPctRaw : null,
+        entryPnl: entryPnlApprox,
+        exitPnl: exitPnlApprox,
+        fundingPct,
+        fundingUsd: fundingUsdApprox,
+        commissionPct,
+        commissionUsd: commissionUsdApprox,
+        longBook,
+        shortBook,
+        avgLongEntry: Number.isFinite(priceLongAsk) ? priceLongAsk : null,
+        avgShortEntry: Number.isFinite(priceShortBid) ? priceShortBid : null,
+        avgLongExit: Number.isFinite(priceLongBid) ? priceLongBid : null,
+        avgShortExit: Number.isFinite(priceShortAsk) ? priceShortAsk : null,
+      };
+
+      if (volume <= 0) {
+        return result;
+      }
+
+      if (
+        !longBook
+        || !Array.isArray(longBook.asks)
+        || longBook.asks.length === 0
+        || !shortBook
+        || !Array.isArray(shortBook.bids)
+        || shortBook.bids.length === 0
+      ) {
+        return result;
       }
 
       const longVolumeFill = fillBuyQuote(longBook.asks, volume);
       if (longVolumeFill.base <= 0) {
-        return null;
+        return result;
       }
       const targetBase = longVolumeFill.base;
       const shortVolumeFill = fillSellBase(shortBook.bids, targetBase);
       const baseQty = Math.min(targetBase, shortVolumeFill.base);
-      if (baseQty <= 0) {
-        return null;
+      if (!(baseQty > 0)) {
+        return result;
       }
 
       const longFill = fillBuyBase(longBook.asks, baseQty);
@@ -883,10 +1178,10 @@
       const longExitFill = fillSellBase(longBook.bids, baseQty);
       const shortCoverFill = fillBuyBase(shortBook.asks, baseQty);
 
-      const avgLongEntry = longFill.base > 0 ? longFill.quote / longFill.base : Number(row.price_long_ask);
-      const avgShortEntry = shortEntryFill.base > 0 ? shortEntryFill.quote / shortEntryFill.base : Number(row.price_short_bid);
-      const avgLongExit = longExitFill.base > 0 ? longExitFill.quote / longExitFill.base : Number(row.price_long_bid);
-      const avgShortExit = shortCoverFill.base > 0 ? shortCoverFill.quote / shortCoverFill.base : Number(row.price_short_ask);
+      const avgLongEntry = longFill.base > 0 ? longFill.quote / longFill.base : result.avgLongEntry;
+      const avgShortEntry = shortEntryFill.base > 0 ? shortEntryFill.quote / shortEntryFill.base : result.avgShortEntry;
+      const avgLongExit = longExitFill.base > 0 ? longExitFill.quote / longExitFill.base : result.avgLongExit;
+      const avgShortExit = shortCoverFill.base > 0 ? shortCoverFill.quote / shortCoverFill.base : result.avgShortExit;
 
       const entryMid = Number.isFinite(avgLongEntry) && Number.isFinite(avgShortEntry)
         ? (avgLongEntry + avgShortEntry) / 2
@@ -895,8 +1190,12 @@
         ? (avgLongExit + avgShortExit) / 2
         : null;
 
-      const entryPct = entryMid ? ((avgShortEntry - avgLongEntry) / entryMid) * 100 : null;
-      const exitPct = exitMid ? ((avgLongExit - avgShortExit) / exitMid) * 100 : null;
+      const entryPct = Number.isFinite(entryMid) && entryMid !== 0
+        ? ((avgShortEntry - avgLongEntry) / entryMid) * 100
+        : result.entryPct;
+      const exitPct = Number.isFinite(exitMid) && exitMid !== 0
+        ? ((avgLongExit - avgShortExit) / exitMid) * 100
+        : result.exitPct;
 
       const entryPnl = shortEntryFill.quote - longFill.quote;
       const exitPnl = longExitFill.quote - shortCoverFill.quote;
@@ -905,31 +1204,26 @@
       const notionalShort = shortEntryFill.quote;
       const avgNotional = (notionalLong + notionalShort) / 2;
 
-      const fundingSpread = Number(row.funding_spread) || 0;
-      const commissionPct = Number(row.commission_total_pct) || 0;
+      const fundingUsd = Number.isFinite(avgNotional) && Number.isFinite(fundingSpreadRaw)
+        ? avgNotional * fundingSpreadRaw
+        : result.fundingUsd;
+      const commissionUsd = Number.isFinite(avgNotional) && Number.isFinite(commissionPct)
+        ? avgNotional * (commissionPct / 100)
+        : result.commissionUsd;
 
-      const fundingPct = fundingSpread * 100;
-      const fundingUsd = Number.isFinite(avgNotional) ? avgNotional * fundingSpread : null;
-      const commissionUsd = Number.isFinite(avgNotional) ? avgNotional * (commissionPct / 100) : null;
+      result.baseQty = baseQty;
+      result.entryPct = Number.isFinite(entryPct) ? entryPct : result.entryPct;
+      result.exitPct = Number.isFinite(exitPct) ? exitPct : result.exitPct;
+      result.entryPnl = Number.isFinite(entryPnl) ? entryPnl : result.entryPnl;
+      result.exitPnl = Number.isFinite(exitPnl) ? exitPnl : result.exitPnl;
+      result.avgLongEntry = Number.isFinite(avgLongEntry) ? avgLongEntry : result.avgLongEntry;
+      result.avgShortEntry = Number.isFinite(avgShortEntry) ? avgShortEntry : result.avgShortEntry;
+      result.avgLongExit = Number.isFinite(avgLongExit) ? avgLongExit : result.avgLongExit;
+      result.avgShortExit = Number.isFinite(avgShortExit) ? avgShortExit : result.avgShortExit;
+      result.fundingUsd = Number.isFinite(fundingUsd) ? fundingUsd : result.fundingUsd;
+      result.commissionUsd = Number.isFinite(commissionUsd) ? commissionUsd : result.commissionUsd;
 
-      return {
-        volume,
-        baseQty,
-        entryPct,
-        exitPct,
-        entryPnl,
-        exitPnl,
-        fundingPct,
-        fundingUsd,
-        commissionPct,
-        commissionUsd,
-        longBook,
-        shortBook,
-        avgLongEntry,
-        avgShortEntry,
-        avgLongExit,
-        avgShortExit,
-      };
+      return result;
     }
 
     function renderOrderBookElements({
@@ -948,8 +1242,8 @@
       }
       const asksRows = (book.asks || []).slice(0, 5);
       const bidsRows = (book.bids || []).slice(0, 5);
-      asksEl.innerHTML = asksRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
-      bidsEl.innerHTML = bidsRows.map(level => `<div><span>${formatPrice(level.price)}</span><span>${formatSize(level.size)}</span></div>`).join('');
+      asksEl.innerHTML = asksRows.map(level => `<div class="level"><span>${formatPrice(level.price)}</span><span class="volume">${formatUsdtValue(level.quote)}</span></div>`).join('');
+      bidsEl.innerHTML = bidsRows.map(level => `<div class="level"><span>${formatPrice(level.price)}</span><span class="volume">${formatUsdtValue(level.quote)}</span></div>`).join('');
       midPriceEl.textContent = Number.isFinite(book.last) ? formatPrice(book.last) : '—';
       if (emptyEl) emptyEl.classList.add('hidden');
     }
@@ -999,24 +1293,37 @@
       shortFundingMeta.textContent = `Фандинг: ${shortText}`;
     }
 
-    function updateLimitsMeta() {
-      const longText = currentLimits.long ? formatLimit(currentLimits.long) : '—';
-      const shortText = currentLimits.short ? formatLimit(currentLimits.short) : '—';
+    function resolveLimitPrice(side, metrics) {
+      if (metrics) {
+        if (side === 'long' && Number.isFinite(metrics.avgLongEntry)) return metrics.avgLongEntry;
+        if (side === 'short' && Number.isFinite(metrics.avgShortEntry)) return metrics.avgShortEntry;
+      }
+      if (!currentRow) return null;
+      if (side === 'long') {
+        return Number(currentRow.price_long_ask);
+      }
+      if (side === 'short') {
+        return Number(currentRow.price_short_bid);
+      }
+      return null;
+    }
+
+    function updateLimitsMeta(metrics = latestMetrics) {
+      const longPrice = resolveLimitPrice('long', metrics);
+      const shortPrice = resolveLimitPrice('short', metrics);
+      const longText = currentLimits.long ? formatLimit(currentLimits.long, longPrice) : '—';
+      const shortText = currentLimits.short ? formatLimit(currentLimits.short, shortPrice) : '—';
       longLimitMeta.textContent = `Лимит: ${longText}`;
       shortLimitMeta.textContent = `Лимит: ${shortText}`;
     }
 
     function updateDocumentTitle(entry, exit) {
-      if (Number.isFinite(entry) && Number.isFinite(exit)) {
-        const entryText = formatPercent(entry);
-        const exitText = formatPercent(exit);
-        document.title = `Вход ${entryText} · Выход ${exitText} · ${symbolUpper}`;
-      } else {
-        document.title = `Карточка пары ${symbolUpper}`;
-      }
+      const entryText = formatPlainTwo(entry);
+      const exitText = formatPlainTwo(exit);
+      document.title = `${entryText}/${exitText} ${symbolUpper}`;
     }
 
-    function applyMetrics(row, metrics) {
+    function applyMetrics(metrics) {
       if (!metrics) {
         setMetric(metricEntry, metricEntryUsd, null, null);
         setMetric(metricExit, metricExitUsd, null, null);
@@ -1060,9 +1367,11 @@
 
     function updateSummary() {
       const metrics = computeMetrics(currentRow);
+      latestMetrics = metrics;
       renderOrderBooks(currentRow, metrics);
       updateFundingMeta();
-      applyMetrics(currentRow, metrics);
+      applyMetrics(metrics);
+      updateLimitsMeta(metrics);
     }
 
     function pruneBuffer(buffer) {
@@ -1079,7 +1388,7 @@
     }
 
     function handleRealtimeMessage(raw) {
-      if (!raw || !longExchange || !shortExchange) return;
+      if (!raw) return;
       let payload;
       try {
         payload = JSON.parse(raw);
@@ -1087,27 +1396,16 @@
         return;
       }
       if (!Array.isArray(payload)) return;
-      const longTarget = longExchange.toLowerCase();
-      const shortTarget = shortExchange.toLowerCase();
-      let matchedRow = null;
+      let updated = false;
       payload.forEach(row => {
         if (!row) return;
-        if ((row.symbol || '').toUpperCase() !== symbolUpper) return;
-        const rowLong = String(row.long_exchange || row.long_ex || '').toLowerCase();
-        const rowShort = String(row.short_exchange || row.short_ex || '').toLowerCase();
-        if (rowLong !== longTarget || rowShort !== shortTarget) return;
-        const ts = Number(row._ts || row.ts || Date.now() / 1000);
-          const entryValue = Number(row.entry_pct);
-          entryState.appendLive(entryValue, ts);
-        if (typeof row.exit_pct !== 'undefined') {
-          const exitValue = Number(row.exit_pct);
-          exitState.appendLive(exitValue, ts);
+        const ts = Number(row._ts ?? row.ts ?? Date.now() / 1000);
+        if (applyRealtimeRow(row, ts)) {
+          updated = true;
         }
-        matchedRow = row;
       });
-      if (matchedRow) {
-        currentRow = matchedRow;
-        updateSummary();
+      if (updated) {
+        ensureFallbackLoop();
       }
     }
 
@@ -1197,15 +1495,27 @@
       if (!longExchange || !shortExchange) return;
       entryState.clear();
       exitState.clear();
+      fallbackFetchPromise = null;
       ensureRealtimeSocket();
+      ensureFallbackLoop();
       updateExchangeInfo();
       updateUrl();
-      currentRow = null;
+      syncCurrentRow(true);
       updateSummary();
+      if (currentRow) {
+        markRealtimeUpdate();
+      } else {
+        lastRealtimeUpdate = 0;
+      }
       await loadLimits();
       await renderEntry();
       if (exitToggle.checked) {
         await renderExit();
+      }
+      try {
+        await fetchRealtimeSnapshot(true);
+      } catch (err) {
+        // ignore network errors during forced refresh
       }
     }
 
@@ -1249,6 +1559,17 @@
           applyTimeScaleOptions(state.chart);
         }
       });
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (realtimeSocket) {
+        try { realtimeSocket.close(); } catch (_) {}
+        realtimeSocket = null;
+      }
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
     });
 
     (async function init() {
