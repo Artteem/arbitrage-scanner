@@ -245,6 +245,28 @@
       return overviewRows.find(row => rowLongExchange(row) === long && rowShortExchange(row) === short) || null;
     }
 
+    function mergeOverviewRow(row) {
+      if (!row) return;
+      const symbolKey = String(row.symbol || symbolUpper || '').toUpperCase();
+      if (symbolKey && symbolKey !== symbolUpper) {
+        return;
+      }
+      const longKey = rowLongExchange(row);
+      const shortKey = rowShortExchange(row);
+      if (!longKey || !shortKey) {
+        return;
+      }
+      const existingIndex = overviewRows.findIndex(
+        (candidate) => rowLongExchange(candidate) === longKey && rowShortExchange(candidate) === shortKey,
+      );
+      const nextRow = { ...row, symbol: symbolUpper };
+      if (existingIndex >= 0) {
+        overviewRows[existingIndex] = { ...overviewRows[existingIndex], ...nextRow };
+      } else {
+        overviewRows.push(nextRow);
+      }
+    }
+
     function syncCurrentRow(force = false) {
       const candidate = findOverviewRow();
       if (!candidate) {
@@ -919,49 +941,104 @@
     function computeMetrics(row) {
       if (!row) return null;
       const volume = currentVolumeUsdt();
-      if (volume <= 0) {
-        return {
-          volume,
-          baseQty: 0,
-          entryPct: null,
-          exitPct: null,
-          entryPnl: null,
-          exitPnl: null,
-          fundingPct: Number(row.funding_spread) * 100,
-          fundingUsd: null,
-          commissionPct: Number(row.commission_total_pct),
-          commissionUsd: null,
-          longBook: ensureBook(normalizeOrderBook(row.orderbook_long), Number(row.price_long_bid), Number(row.price_long_ask), volume),
-          shortBook: ensureBook(normalizeOrderBook(row.orderbook_short), Number(row.price_short_bid), Number(row.price_short_ask), volume),
-        };
-      }
+      const entryPctRaw = Number(row.entry_pct);
+      const exitPctRaw = Number(row.exit_pct);
+      const fundingSpreadRaw = Number(row.funding_spread);
+      const commissionSource = typeof row.commission_total_pct !== 'undefined'
+        ? row.commission_total_pct
+        : row.commission;
+      const commissionPctRaw = Number(commissionSource);
+      const priceLongAsk = Number(row.price_long_ask);
+      const priceShortBid = Number(row.price_short_bid);
+      const priceLongBid = Number(row.price_long_bid);
+      const priceShortAsk = Number(row.price_short_ask);
 
       const longBook = ensureBook(
         normalizeOrderBook(row.orderbook_long),
-        Number(row.price_long_bid),
-        Number(row.price_long_ask),
+        priceLongBid,
+        priceLongAsk,
         volume,
       );
       const shortBook = ensureBook(
         normalizeOrderBook(row.orderbook_short),
-        Number(row.price_short_bid),
-        Number(row.price_short_ask),
+        priceShortBid,
+        priceShortAsk,
         volume,
       );
 
-      if (!longBook || longBook.asks.length === 0 || !shortBook || shortBook.bids.length === 0) {
-        return null;
+      const baseFromTop = volume > 0 && Number.isFinite(priceLongAsk) && priceLongAsk > 0
+        ? volume / priceLongAsk
+        : volume <= 0 ? 0 : null;
+
+      const entryPnlApprox = Number.isFinite(baseFromTop) && Number.isFinite(priceShortBid) && Number.isFinite(priceLongAsk)
+        ? (priceShortBid - priceLongAsk) * baseFromTop
+        : null;
+      const exitPnlApprox = Number.isFinite(baseFromTop) && Number.isFinite(priceLongBid) && Number.isFinite(priceShortAsk)
+        ? (priceLongBid - priceShortAsk) * baseFromTop
+        : null;
+
+      const fundingPct = Number.isFinite(fundingSpreadRaw) ? fundingSpreadRaw * 100 : null;
+      const entryMidApprox = Number.isFinite(priceLongAsk) && Number.isFinite(priceShortBid)
+        ? (priceLongAsk + priceShortBid) / 2
+        : null;
+      const exitMidApprox = Number.isFinite(priceLongBid) && Number.isFinite(priceShortAsk)
+        ? (priceLongBid + priceShortAsk) / 2
+        : null;
+
+      const avgNotionalApprox = Number.isFinite(baseFromTop) && Number.isFinite(entryMidApprox)
+        ? baseFromTop * entryMidApprox
+        : null;
+      const fundingUsdApprox = Number.isFinite(avgNotionalApprox) && Number.isFinite(fundingSpreadRaw)
+        ? avgNotionalApprox * fundingSpreadRaw
+        : null;
+      const commissionPct = Number.isFinite(commissionPctRaw) ? commissionPctRaw : null;
+      const commissionUsdApprox = Number.isFinite(avgNotionalApprox) && Number.isFinite(commissionPctRaw)
+        ? avgNotionalApprox * (commissionPctRaw / 100)
+        : null;
+
+      const result = {
+        volume,
+        baseQty: baseFromTop ?? 0,
+        entryPct: Number.isFinite(entryPctRaw) ? entryPctRaw : null,
+        exitPct: Number.isFinite(exitPctRaw) ? exitPctRaw : null,
+        entryPnl: entryPnlApprox,
+        exitPnl: exitPnlApprox,
+        fundingPct,
+        fundingUsd: fundingUsdApprox,
+        commissionPct,
+        commissionUsd: commissionUsdApprox,
+        longBook,
+        shortBook,
+        avgLongEntry: Number.isFinite(priceLongAsk) ? priceLongAsk : null,
+        avgShortEntry: Number.isFinite(priceShortBid) ? priceShortBid : null,
+        avgLongExit: Number.isFinite(priceLongBid) ? priceLongBid : null,
+        avgShortExit: Number.isFinite(priceShortAsk) ? priceShortAsk : null,
+      };
+
+      if (volume <= 0) {
+        return result;
+      }
+
+      if (
+        !longBook
+        || !Array.isArray(longBook.asks)
+        || longBook.asks.length === 0
+        || !shortBook
+        || !Array.isArray(shortBook.bids)
+        || shortBook.bids.length === 0
+      ) {
+        return result;
       }
 
       const longVolumeFill = fillBuyQuote(longBook.asks, volume);
       if (longVolumeFill.base <= 0) {
-        return null;
+        return result;
       }
       const targetBase = longVolumeFill.base;
       const shortVolumeFill = fillSellBase(shortBook.bids, targetBase);
       const baseQty = Math.min(targetBase, shortVolumeFill.base);
-      if (baseQty <= 0) {
-        return null;
+      if (!(baseQty > 0)) {
+        return result;
       }
 
       const longFill = fillBuyBase(longBook.asks, baseQty);
@@ -969,10 +1046,10 @@
       const longExitFill = fillSellBase(longBook.bids, baseQty);
       const shortCoverFill = fillBuyBase(shortBook.asks, baseQty);
 
-      const avgLongEntry = longFill.base > 0 ? longFill.quote / longFill.base : Number(row.price_long_ask);
-      const avgShortEntry = shortEntryFill.base > 0 ? shortEntryFill.quote / shortEntryFill.base : Number(row.price_short_bid);
-      const avgLongExit = longExitFill.base > 0 ? longExitFill.quote / longExitFill.base : Number(row.price_long_bid);
-      const avgShortExit = shortCoverFill.base > 0 ? shortCoverFill.quote / shortCoverFill.base : Number(row.price_short_ask);
+      const avgLongEntry = longFill.base > 0 ? longFill.quote / longFill.base : result.avgLongEntry;
+      const avgShortEntry = shortEntryFill.base > 0 ? shortEntryFill.quote / shortEntryFill.base : result.avgShortEntry;
+      const avgLongExit = longExitFill.base > 0 ? longExitFill.quote / longExitFill.base : result.avgLongExit;
+      const avgShortExit = shortCoverFill.base > 0 ? shortCoverFill.quote / shortCoverFill.base : result.avgShortExit;
 
       const entryMid = Number.isFinite(avgLongEntry) && Number.isFinite(avgShortEntry)
         ? (avgLongEntry + avgShortEntry) / 2
@@ -981,8 +1058,12 @@
         ? (avgLongExit + avgShortExit) / 2
         : null;
 
-      const entryPct = entryMid ? ((avgShortEntry - avgLongEntry) / entryMid) * 100 : null;
-      const exitPct = exitMid ? ((avgLongExit - avgShortExit) / exitMid) * 100 : null;
+      const entryPct = Number.isFinite(entryMid) && entryMid !== 0
+        ? ((avgShortEntry - avgLongEntry) / entryMid) * 100
+        : result.entryPct;
+      const exitPct = Number.isFinite(exitMid) && exitMid !== 0
+        ? ((avgLongExit - avgShortExit) / exitMid) * 100
+        : result.exitPct;
 
       const entryPnl = shortEntryFill.quote - longFill.quote;
       const exitPnl = longExitFill.quote - shortCoverFill.quote;
@@ -991,31 +1072,26 @@
       const notionalShort = shortEntryFill.quote;
       const avgNotional = (notionalLong + notionalShort) / 2;
 
-      const fundingSpread = Number(row.funding_spread) || 0;
-      const commissionPct = Number(row.commission_total_pct) || 0;
+      const fundingUsd = Number.isFinite(avgNotional) && Number.isFinite(fundingSpreadRaw)
+        ? avgNotional * fundingSpreadRaw
+        : result.fundingUsd;
+      const commissionUsd = Number.isFinite(avgNotional) && Number.isFinite(commissionPct)
+        ? avgNotional * (commissionPct / 100)
+        : result.commissionUsd;
 
-      const fundingPct = fundingSpread * 100;
-      const fundingUsd = Number.isFinite(avgNotional) ? avgNotional * fundingSpread : null;
-      const commissionUsd = Number.isFinite(avgNotional) ? avgNotional * (commissionPct / 100) : null;
+      result.baseQty = baseQty;
+      result.entryPct = Number.isFinite(entryPct) ? entryPct : result.entryPct;
+      result.exitPct = Number.isFinite(exitPct) ? exitPct : result.exitPct;
+      result.entryPnl = Number.isFinite(entryPnl) ? entryPnl : result.entryPnl;
+      result.exitPnl = Number.isFinite(exitPnl) ? exitPnl : result.exitPnl;
+      result.avgLongEntry = Number.isFinite(avgLongEntry) ? avgLongEntry : result.avgLongEntry;
+      result.avgShortEntry = Number.isFinite(avgShortEntry) ? avgShortEntry : result.avgShortEntry;
+      result.avgLongExit = Number.isFinite(avgLongExit) ? avgLongExit : result.avgLongExit;
+      result.avgShortExit = Number.isFinite(avgShortExit) ? avgShortExit : result.avgShortExit;
+      result.fundingUsd = Number.isFinite(fundingUsd) ? fundingUsd : result.fundingUsd;
+      result.commissionUsd = Number.isFinite(commissionUsd) ? commissionUsd : result.commissionUsd;
 
-      return {
-        volume,
-        baseQty,
-        entryPct,
-        exitPct,
-        entryPnl,
-        exitPnl,
-        fundingPct,
-        fundingUsd,
-        commissionPct,
-        commissionUsd,
-        longBook,
-        shortBook,
-        avgLongEntry,
-        avgShortEntry,
-        avgLongExit,
-        avgShortExit,
-      };
+      return result;
     }
 
     function renderOrderBookElements({
@@ -1197,9 +1273,10 @@
         const rowLong = String(row.long_exchange || row.long_ex || '').toLowerCase();
         const rowShort = String(row.short_exchange || row.short_ex || '').toLowerCase();
         if (rowLong !== longTarget || rowShort !== shortTarget) return;
+        mergeOverviewRow(row);
         const ts = Number(row._ts || row.ts || Date.now() / 1000);
-          const entryValue = Number(row.entry_pct);
-          entryState.appendLive(entryValue, ts);
+        const entryValue = Number(row.entry_pct);
+        entryState.appendLive(entryValue, ts);
         if (typeof row.exit_pct !== 'undefined') {
           const exitValue = Number(row.exit_pct);
           exitState.appendLive(exitValue, ts);
@@ -1207,7 +1284,8 @@
         matchedRow = row;
       });
       if (matchedRow) {
-        currentRow = matchedRow;
+        currentRow = { ...currentRow, ...matchedRow };
+        syncCurrentRow(true);
         updateSummary();
       }
     }

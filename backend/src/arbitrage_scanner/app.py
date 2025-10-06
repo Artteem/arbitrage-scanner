@@ -35,7 +35,8 @@ for connector in CONNECTORS:
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
-SPREAD_REFRESH_INTERVAL = 0.25
+SPREAD_REFRESH_INTERVAL = 0.1
+SPREAD_EVENT: asyncio.Event = asyncio.Event()
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
@@ -110,10 +111,12 @@ async def _spread_loop() -> None:
                 )
             LAST_ROWS = rows
             LAST_ROWS_TS = ts
+            SPREAD_EVENT.set()
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.exception("Failed to compute spreads", exc_info=exc)
             LAST_ROWS = []
             LAST_ROWS_TS = 0.0
+            SPREAD_EVENT.set()
         await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
 
 
@@ -292,6 +295,7 @@ async def ws_spreads(ws: WebSocket):
     target_long = (ws.query_params.get("long") or "").lower()
     target_short = (ws.query_params.get("short") or "").lower()
     use_filter = bool(target_symbol and target_long and target_short)
+    last_payload: str | None = None
     try:
         while True:
             rows = _current_rows()
@@ -309,8 +313,16 @@ async def ws_spreads(ws: WebSocket):
                 item["_ts"] = ts
                 payload.append(item)
             if payload or not use_filter:
-                await ws.send_text(json.dumps(payload))
-            await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
+                message = json.dumps(payload)
+                if message != last_payload:
+                    await ws.send_text(message)
+                    last_payload = message
+            if SPREAD_EVENT.is_set():
+                SPREAD_EVENT.clear()
+            try:
+                await asyncio.wait_for(SPREAD_EVENT.wait(), timeout=SPREAD_REFRESH_INTERVAL)
+            except asyncio.TimeoutError:
+                continue
     except WebSocketDisconnect:
         return
     except Exception:
