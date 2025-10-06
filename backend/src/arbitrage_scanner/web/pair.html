@@ -178,6 +178,8 @@
     const LOOKBACK_DAYS = 10;
     const LOOKBACK_SECONDS = LOOKBACK_DAYS * 86400;
     const TIMEFRAME_SECONDS = { '1m': 60, '5m': 300, '1h': 3600 };
+    const FALLBACK_INTERVAL_MS = 750;
+    const STALE_THRESHOLD_MS = 900;
     const timeframeSelect = document.getElementById('timeframe');
     const reverseBtn = document.getElementById('reverse-btn');
     const exitToggle = document.getElementById('exit-toggle');
@@ -219,6 +221,9 @@
     let currentRow = null;
     let currentLimits = { long: null, short: null };
     let latestMetrics = null;
+    let fallbackTimer = null;
+    let fallbackFetchPromise = null;
+    let lastRealtimeUpdate = 0;
     function normalizeExchangeName(value) {
       return String(value || '').trim().toLowerCase();
     }
@@ -246,25 +251,32 @@
     }
 
     function mergeOverviewRow(row) {
-      if (!row) return;
+      if (!row) return null;
       const symbolKey = String(row.symbol || symbolUpper || '').toUpperCase();
       if (symbolKey && symbolKey !== symbolUpper) {
-        return;
+        return null;
       }
       const longKey = rowLongExchange(row);
       const shortKey = rowShortExchange(row);
       if (!longKey || !shortKey) {
-        return;
+        return null;
       }
       const existingIndex = overviewRows.findIndex(
         (candidate) => rowLongExchange(candidate) === longKey && rowShortExchange(candidate) === shortKey,
       );
       const nextRow = { ...row, symbol: symbolUpper };
       if (existingIndex >= 0) {
-        overviewRows[existingIndex] = { ...overviewRows[existingIndex], ...nextRow };
+        const merged = { ...overviewRows[existingIndex], ...nextRow };
+        overviewRows[existingIndex] = merged;
+        return merged;
       } else {
         overviewRows.push(nextRow);
+        return nextRow;
       }
+    }
+
+    function markRealtimeUpdate() {
+      lastRealtimeUpdate = Date.now();
     }
 
     function syncCurrentRow(force = false) {
@@ -275,6 +287,88 @@
       if (force || !currentRow || !rowsMatch(currentRow, candidate)) {
         currentRow = candidate;
       }
+    }
+
+    function applyRealtimeRow(row, tsOverride) {
+      if (!row || !longExchange || !shortExchange) return false;
+      if ((row.symbol || '').toUpperCase() !== symbolUpper) return false;
+      const expectedLong = normalizeExchangeName(longExchange);
+      const expectedShort = normalizeExchangeName(shortExchange);
+      const rowLong = rowLongExchange(row);
+      const rowShort = rowShortExchange(row);
+      if (!rowLong || !rowShort) return false;
+      if (rowLong !== expectedLong || rowShort !== expectedShort) return false;
+      const merged = mergeOverviewRow(row) || row;
+      currentRow = merged;
+      syncCurrentRow(true);
+      const activeRow = currentRow || merged;
+      const ts = Number(tsOverride ?? row._ts ?? row.ts ?? Date.now() / 1000);
+      const entryValue = Number(row.entry_pct ?? activeRow.entry_pct);
+      if (Number.isFinite(entryValue)) {
+        entryState.appendLive(entryValue, ts);
+      }
+      const exitCandidate = typeof row.exit_pct !== 'undefined' ? row.exit_pct : activeRow.exit_pct;
+      const exitValue = Number(exitCandidate);
+      if (Number.isFinite(exitValue)) {
+        exitState.appendLive(exitValue, ts);
+      }
+      updateSummary();
+      markRealtimeUpdate();
+      return true;
+    }
+
+    function ensureFallbackLoop() {
+      if (fallbackTimer) return;
+      fallbackTimer = setInterval(() => {
+        if (!longExchange || !shortExchange) return;
+        if (fallbackFetchPromise) return;
+        const staleFor = Date.now() - lastRealtimeUpdate;
+        if (staleFor < STALE_THRESHOLD_MS) {
+          return;
+        }
+        fetchRealtimeSnapshot();
+      }, FALLBACK_INTERVAL_MS);
+    }
+
+    async function fetchRealtimeSnapshot(force = false) {
+      if (!longExchange || !shortExchange) return;
+      if (!force && fallbackFetchPromise) {
+        return fallbackFetchPromise;
+      }
+      const params = new URLSearchParams({
+        long: longExchange,
+        short: shortExchange,
+        _t: String(Date.now()),
+      });
+      const request = (async () => {
+        try {
+          const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/realtime?${params.toString()}`, {
+            cache: 'no-store',
+          });
+          if (!res.ok) {
+            lastRealtimeUpdate = 0;
+            return;
+          }
+          const data = await res.json();
+          if (!data || !data.row) {
+            lastRealtimeUpdate = 0;
+            return;
+          }
+          const ts = Number(data.ts ?? data.row?._ts ?? Date.now() / 1000);
+          const payload = { ...data.row, _ts: ts };
+          applyRealtimeRow(payload, ts);
+        } catch (err) {
+          // ignore network errors in fallback fetches
+          lastRealtimeUpdate = 0;
+        }
+      })();
+      if (force) {
+        return request;
+      }
+      fallbackFetchPromise = request.finally(() => {
+        fallbackFetchPromise = null;
+      });
+      return fallbackFetchPromise;
     }
 
     const entryState = createChartState({
@@ -665,6 +759,9 @@
       });
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       realtimeSocket = new WebSocket(`${proto}://${location.host}/ws/spreads?${params.toString()}`);
+      realtimeSocket.onopen = () => {
+        markRealtimeUpdate();
+      };
       realtimeSocket.onmessage = (event) => {
         handleRealtimeMessage(event.data);
       };
@@ -673,6 +770,7 @@
       };
       realtimeSocket.onclose = () => {
         realtimeSocket = null;
+        lastRealtimeUpdate = 0;
         if (!realtimeReconnect) {
           realtimeReconnect = setTimeout(() => ensureRealtimeSocket(true), 1200);
         }
@@ -1256,7 +1354,7 @@
     }
 
     function handleRealtimeMessage(raw) {
-      if (!raw || !longExchange || !shortExchange) return;
+      if (!raw) return;
       let payload;
       try {
         payload = JSON.parse(raw);
@@ -1264,29 +1362,16 @@
         return;
       }
       if (!Array.isArray(payload)) return;
-      const longTarget = longExchange.toLowerCase();
-      const shortTarget = shortExchange.toLowerCase();
-      let matchedRow = null;
+      let updated = false;
       payload.forEach(row => {
         if (!row) return;
-        if ((row.symbol || '').toUpperCase() !== symbolUpper) return;
-        const rowLong = String(row.long_exchange || row.long_ex || '').toLowerCase();
-        const rowShort = String(row.short_exchange || row.short_ex || '').toLowerCase();
-        if (rowLong !== longTarget || rowShort !== shortTarget) return;
-        mergeOverviewRow(row);
-        const ts = Number(row._ts || row.ts || Date.now() / 1000);
-        const entryValue = Number(row.entry_pct);
-        entryState.appendLive(entryValue, ts);
-        if (typeof row.exit_pct !== 'undefined') {
-          const exitValue = Number(row.exit_pct);
-          exitState.appendLive(exitValue, ts);
+        const ts = Number(row._ts ?? row.ts ?? Date.now() / 1000);
+        if (applyRealtimeRow(row, ts)) {
+          updated = true;
         }
-        matchedRow = row;
       });
-      if (matchedRow) {
-        currentRow = { ...currentRow, ...matchedRow };
-        syncCurrentRow(true);
-        updateSummary();
+      if (updated) {
+        ensureFallbackLoop();
       }
     }
 
@@ -1376,15 +1461,27 @@
       if (!longExchange || !shortExchange) return;
       entryState.clear();
       exitState.clear();
+      fallbackFetchPromise = null;
       ensureRealtimeSocket();
+      ensureFallbackLoop();
       updateExchangeInfo();
       updateUrl();
       syncCurrentRow(true);
       updateSummary();
+      if (currentRow) {
+        markRealtimeUpdate();
+      } else {
+        lastRealtimeUpdate = 0;
+      }
       await loadLimits();
       await renderEntry();
       if (exitToggle.checked) {
         await renderExit();
+      }
+      try {
+        await fetchRealtimeSnapshot(true);
+      } catch (err) {
+        // ignore network errors during forced refresh
       }
     }
 
@@ -1428,6 +1525,17 @@
           applyTimeScaleOptions(state.chart);
         }
       });
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (realtimeSocket) {
+        try { realtimeSocket.close(); } catch (_) {}
+        realtimeSocket = null;
+      }
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
     });
 
     (async function init() {

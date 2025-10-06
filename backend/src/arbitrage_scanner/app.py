@@ -288,6 +288,32 @@ async def pair_limits(symbol: str, long_exchange: str = Query(..., alias="long")
     }
 
 
+@app.get("/api/pair/{symbol}/realtime")
+async def pair_realtime(
+    symbol: str,
+    long_exchange: str = Query(..., alias="long"),
+    short_exchange: str = Query(..., alias="short"),
+):
+    rows = _rows_for_symbol(symbol)
+    long_key = long_exchange.lower()
+    short_key = short_exchange.lower()
+    ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+    payload: dict[str, object] | None = None
+    for row in rows:
+        if row.long_ex.lower() == long_key and row.short_ex.lower() == short_key:
+            payload = row.as_dict()
+            if payload is not None:
+                payload["_ts"] = ts
+            break
+    return {
+        "symbol": symbol.upper(),
+        "long_exchange": long_key,
+        "short_exchange": short_key,
+        "ts": ts,
+        "row": payload,
+    }
+
+
 @app.websocket("/ws/spreads")
 async def ws_spreads(ws: WebSocket):
     await ws.accept()
