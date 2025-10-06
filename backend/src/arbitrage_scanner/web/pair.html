@@ -228,6 +228,12 @@
       return String(value || '').trim().toLowerCase();
     }
 
+    function normalizeSymbolKey(value) {
+      return String(value || '')
+        .replace(/[^a-z0-9]/gi, '')
+        .toUpperCase();
+    }
+
     function rowLongExchange(row) {
       if (!row) return '';
       return normalizeExchangeName(row.long_exchange || row.long_ex || row.long);
@@ -250,21 +256,42 @@
       return overviewRows.find(row => rowLongExchange(row) === long && rowShortExchange(row) === short) || null;
     }
 
-    function mergeOverviewRow(row) {
+    function normalizeRealtimeRow(row) {
       if (!row) return null;
-      const symbolKey = String(row.symbol || symbolUpper || '').toUpperCase();
-      if (symbolKey && symbolKey !== symbolUpper) {
-        return null;
+      if (row.__normalized) {
+        return row;
       }
+      const next = { ...row };
+      next.symbol = symbolUpper;
       const longKey = rowLongExchange(row);
       const shortKey = rowShortExchange(row);
       if (!longKey || !shortKey) {
         return null;
       }
+      next.long_exchange = longKey;
+      next.long_ex = longKey;
+      next.long = longKey;
+      next.short_exchange = shortKey;
+      next.short_ex = shortKey;
+      next.short = shortKey;
+      Object.defineProperty(next, '__normalized', {
+        value: true,
+        enumerable: false,
+        configurable: false,
+      });
+      return next;
+    }
+
+    function mergeOverviewRow(row) {
+      if (!row) return null;
+      const normalized = normalizeRealtimeRow(row);
+      if (!normalized) return null;
+      const longKey = rowLongExchange(normalized);
+      const shortKey = rowShortExchange(normalized);
       const existingIndex = overviewRows.findIndex(
         (candidate) => rowLongExchange(candidate) === longKey && rowShortExchange(candidate) === shortKey,
       );
-      const nextRow = { ...row, symbol: symbolUpper };
+      const nextRow = normalized;
       if (existingIndex >= 0) {
         const merged = { ...overviewRows[existingIndex], ...nextRow };
         overviewRows[existingIndex] = merged;
@@ -291,23 +318,27 @@
 
     function applyRealtimeRow(row, tsOverride) {
       if (!row || !longExchange || !shortExchange) return false;
-      if ((row.symbol || '').toUpperCase() !== symbolUpper) return false;
+      const incomingSymbol = normalizeSymbolKey(row.symbol || symbolUpper || '');
+      const expectedSymbol = normalizeSymbolKey(symbolUpper);
+      if (incomingSymbol && incomingSymbol !== expectedSymbol) return false;
+      const normalized = normalizeRealtimeRow(row);
+      if (!normalized) return false;
       const expectedLong = normalizeExchangeName(longExchange);
       const expectedShort = normalizeExchangeName(shortExchange);
-      const rowLong = rowLongExchange(row);
-      const rowShort = rowShortExchange(row);
+      const rowLong = rowLongExchange(normalized);
+      const rowShort = rowShortExchange(normalized);
       if (!rowLong || !rowShort) return false;
       if (rowLong !== expectedLong || rowShort !== expectedShort) return false;
-      const merged = mergeOverviewRow(row) || row;
+      const merged = mergeOverviewRow(normalized) || normalized;
       currentRow = merged;
       syncCurrentRow(true);
       const activeRow = currentRow || merged;
-      const ts = Number(tsOverride ?? row._ts ?? row.ts ?? Date.now() / 1000);
-      const entryValue = Number(row.entry_pct ?? activeRow.entry_pct);
+      const ts = Number(tsOverride ?? normalized._ts ?? normalized.ts ?? Date.now() / 1000);
+      const entryValue = Number(normalized.entry_pct ?? activeRow.entry_pct);
       if (Number.isFinite(entryValue)) {
         entryState.appendLive(entryValue, ts);
       }
-      const exitCandidate = typeof row.exit_pct !== 'undefined' ? row.exit_pct : activeRow.exit_pct;
+      const exitCandidate = typeof normalized.exit_pct !== 'undefined' ? normalized.exit_pct : activeRow.exit_pct;
       const exitValue = Number(exitCandidate);
       if (Number.isFinite(exitValue)) {
         exitState.appendLive(exitValue, ts);
@@ -703,7 +734,10 @@
         const res = await fetch(`/api/pair/${encodeURIComponent(symbol)}/overview`);
         if (!res.ok) return;
         const data = await res.json();
-        overviewRows = Array.isArray(data.rows) ? data.rows : [];
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        overviewRows = rows
+          .map(normalizeRealtimeRow)
+          .filter(Boolean);
         syncCurrentRow();
       } catch (e) {
         console.error(e);
