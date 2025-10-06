@@ -698,16 +698,32 @@
       return symbolUpper;
     }
 
+    function roundToTwo(value) {
+      if (!Number.isFinite(value)) return null;
+      const rounded = Math.round(value * 100) / 100;
+      return Object.is(rounded, -0) ? 0 : rounded;
+    }
+
     function formatPercent(value) {
-      if (!Number.isFinite(value)) return '—';
-      const formatted = value.toFixed(4);
-      return `${value > 0 ? '+' : ''}${formatted}%`;
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      const fixed = Math.abs(rounded).toFixed(2);
+      const sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '';
+      return `${sign}${fixed}%`;
     }
 
     function formatUsd(value) {
-      if (!Number.isFinite(value)) return '—';
-      const formatted = value.toFixed(2);
-      return `${value > 0 ? '+' : ''}${formatted} USDT`;
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      const fixed = Math.abs(rounded).toFixed(2);
+      const sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '';
+      return `${sign}${fixed} USDT`;
+    }
+
+    function formatPlainTwo(value) {
+      const rounded = roundToTwo(value);
+      if (rounded === null) return '—';
+      return rounded.toFixed(2);
     }
 
     function formatNumber(value) {
@@ -771,15 +787,17 @@
     }
 
     function setMetric(el, usdEl, pctValue, usdValue) {
+      const pctRounded = roundToTwo(pctValue);
+      const usdRounded = roundToTwo(usdValue);
       const pctText = formatPercent(pctValue);
       const usdText = formatUsd(usdValue);
       resetMetric(el);
-      if (Number.isFinite(pctValue)) {
-        if (pctValue > 0) el.classList.add('metric-pos');
-        if (pctValue < 0) el.classList.add('metric-neg');
+      if (pctRounded !== null) {
+        if (pctRounded > 0) el.classList.add('metric-pos');
+        if (pctRounded < 0) el.classList.add('metric-neg');
       }
       el.textContent = pctText;
-      usdEl.textContent = Number.isFinite(usdValue) ? `Δ ${usdText}` : '—';
+      usdEl.textContent = usdRounded === null ? '—' : `Δ ${usdText}`;
     }
 
     function currentVolumeUsdt() {
@@ -1092,8 +1110,8 @@
     }
 
     function updateDocumentTitle(entry, exit) {
-      const entryText = Number.isFinite(entry) ? entry.toFixed(4) : '—';
-      const exitText = Number.isFinite(exit) ? exit.toFixed(4) : '—';
+      const entryText = formatPlainTwo(entry);
+      const exitText = formatPlainTwo(exit);
       document.title = `${entryText}/${exitText} ${symbolUpper}`;
     }
 

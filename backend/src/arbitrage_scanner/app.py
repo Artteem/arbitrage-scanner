@@ -35,7 +35,7 @@ for connector in CONNECTORS:
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
-SPREAD_REFRESH_INTERVAL = 0.5
+SPREAD_REFRESH_INTERVAL = 0.25
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
