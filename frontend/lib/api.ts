@@ -19,11 +19,9 @@ const fetcher = async <T>(url: string): Promise<T> => {
   return (await response.json()) as T;
 };
 
-export function usePairOverview(selection: PairSelection | null) {
+export function usePairOverview(symbol: string | null) {
   const baseUrl = getApiBaseUrl();
-  const key = selection
-    ? `${baseUrl}/api/pair/${selection.symbol}/overview`
-    : null;
+  const key = symbol ? `${baseUrl}/api/pair/${symbol}/overview` : null;
   return useSWR<PairOverviewResponse>(key, fetcher, {
     refreshInterval: 15_000,
   });

@@ -1,4 +1,4 @@
-import Dashboard from './components/dashboard';
+import SpreadsTable from './components/spreads-table';
 import { getApiBaseUrl } from '../lib/config';
 import type { ApiStats } from '../lib/types';
 
@@ -26,8 +26,6 @@ export default async function Page() {
   const stats = await fetchStats();
 
   return (
-    <Dashboard
-      initialStats={stats}
-    />
+    <SpreadsTable initialStats={stats} />
   );
 }
