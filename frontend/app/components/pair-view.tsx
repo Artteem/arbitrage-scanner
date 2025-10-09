@@ -146,6 +146,39 @@ const getTimezoneOptions = () => {
   return fallback;
 };
 
+const formatTimezoneOffsetLabel = (timezone: string) => {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'shortOffset',
+    });
+    const parts = formatter.formatToParts(new Date());
+    const tzPart = parts.find((part) => part.type === 'timeZoneName');
+    if (tzPart) {
+      const match = tzPart.value.match(/GMT([+-]\d{1,2})(?::(\d{2}))?/);
+      if (match) {
+        const sign = match[1].startsWith('-') ? '-' : '+';
+        const hours = Math.abs(Number(match[1])).toString();
+        const minutePart = match[2] && match[2] !== '00' ? `:${match[2]}` : '';
+        return `${sign}${hours}${minutePart} UTC`;
+      }
+      if (tzPart.value === 'GMT') {
+        return '+0 UTC';
+      }
+    }
+  } catch (error) {
+    console.warn('Unable to format timezone offset', error);
+  }
+  return timezone;
+};
+
+type TimezoneOption = {
+  value: string;
+  label: string;
+};
+
 const formatTimeWithTimezone = (time: Time, timeframe: string, timezone: string, locale = 'ru-RU') => {
   let date: Date;
   if (typeof time === 'number') {
@@ -189,7 +222,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const [volume, setVolume] = useState('100');
   const [timezone, setTimezone] = useState<string>(resolveDefaultTimezone);
 
-  const timezoneOptions = useMemo(() => getTimezoneOptions(), []);
+  const timezoneOptions = useMemo<TimezoneOption[]>(() => {
+    return getTimezoneOptions().map((zone) => ({
+      value: zone,
+      label: formatTimezoneOffsetLabel(zone),
+    }));
+  }, []);
 
   const themeRef = useRef(theme);
   const timeframeRef = useRef(timeframe);
@@ -781,8 +819,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                     onChange={(event) => setTimezone(event.target.value)}
                   >
                     {timezoneOptions.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
+                      <option key={option.value} value={option.value}>
+                        {option.label}
                       </option>
                     ))}
                   </select>
@@ -813,8 +851,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                       onChange={(event) => setTimezone(event.target.value)}
                     >
                       {timezoneOptions.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
+                        <option key={option.value} value={option.value}>
+                          {option.label}
                         </option>
                       ))}
                     </select>
