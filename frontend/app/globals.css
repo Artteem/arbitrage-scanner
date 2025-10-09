@@ -580,6 +580,8 @@ select:focus {
   padding: 12px 16px;
   color: var(--muted);
   font-size: 13px;
+  align-items: center;
+  text-align: center;
 }
 
 .pager-nav {
@@ -587,12 +589,14 @@ select:focus {
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
+  justify-content: center;
 }
 
 .pager-pages {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  align-items: center;
 }
 
 .pager-page {
@@ -609,6 +613,23 @@ select:focus {
   background: var(--accent);
   color: var(--bg);
   border-color: var(--accent);
+}
+
+.pager-ellipsis {
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .pager-info {
@@ -992,11 +1013,11 @@ select:focus {
   }
   .pager {
     flex-direction: column;
-    align-items: flex-start;
+    align-items: center;
   }
   .pager-nav {
     flex-direction: column;
-    align-items: stretch;
+    align-items: center;
     gap: 8px;
   }
 }

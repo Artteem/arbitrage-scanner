@@ -237,7 +237,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
         if (!query) {
           return true;
         }
-        return symbol.includes(query);
+        return symbol.startsWith(query);
       })
       .slice(0, 20);
   }, [availablePairs, blacklistQuery, blacklistSet]);
@@ -381,10 +381,39 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
   const currentPage = Math.min(page, totalPages);
   const start = (currentPage - 1) * PAGE_SIZE;
   const currentRows = processedRows.slice(start, start + PAGE_SIZE);
-  const pageNumbers = useMemo(
-    () => Array.from({ length: totalPages }, (_, index) => index + 1),
-    [totalPages],
-  );
+  const pageItems = useMemo<(number | 'ellipsis')[]>(() => {
+    if (totalPages <= 5) {
+      return Array.from({ length: totalPages }, (_, index) => index + 1);
+    }
+
+    const items: (number | 'ellipsis')[] = [1];
+    const start = Math.max(2, currentPage - 1);
+    const end = Math.min(totalPages - 1, currentPage + 1);
+
+    if (start > 2) {
+      items.push('ellipsis');
+    } else {
+      for (let pageNumber = 2; pageNumber < start; pageNumber += 1) {
+        items.push(pageNumber);
+      }
+    }
+
+    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+      items.push(pageNumber);
+    }
+
+    if (end < totalPages - 1) {
+      items.push('ellipsis');
+    } else {
+      for (let pageNumber = end + 1; pageNumber < totalPages; pageNumber += 1) {
+        items.push(pageNumber);
+      }
+    }
+
+    items.push(totalPages);
+
+    return items;
+  }, [currentPage, totalPages]);
 
   const handleSort = (key: SortKey) => {
     setSortKey((prevKey) => {
@@ -676,32 +705,40 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
           <div className="pager-nav">
             <button
               type="button"
-              className="btn"
+              className="btn icon-button"
               onClick={() => setPage((prev) => Math.max(1, prev - 1))}
               disabled={currentPage <= 1}
+              aria-label="Предыдущая страница"
             >
-              Назад
+              <span aria-hidden="true">‹</span>
             </button>
             <div className="pager-pages">
-              {pageNumbers.map((pageNumber) => (
-                <button
-                  key={pageNumber}
-                  type="button"
-                  className={`pager-page${pageNumber === currentPage ? ' active' : ''}`}
-                  onClick={() => setPage(pageNumber)}
-                  aria-current={pageNumber === currentPage ? 'page' : undefined}
-                >
-                  {pageNumber}
-                </button>
-              ))}
+              {pageItems.map((item, index) =>
+                item === 'ellipsis' ? (
+                  <span key={`ellipsis-${index}`} className="pager-ellipsis" aria-hidden="true">
+                    …
+                  </span>
+                ) : (
+                  <button
+                    key={item}
+                    type="button"
+                    className={`pager-page${item === currentPage ? ' active' : ''}`}
+                    onClick={() => setPage(item)}
+                    aria-current={item === currentPage ? 'page' : undefined}
+                  >
+                    {item}
+                  </button>
+                ),
+              )}
             </div>
             <button
               type="button"
-              className="btn"
+              className="btn icon-button"
               onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
               disabled={currentPage >= totalPages}
+              aria-label="Следующая страница"
             >
-              Вперёд
+              <span aria-hidden="true">›</span>
             </button>
           </div>
           <span className="pager-info">

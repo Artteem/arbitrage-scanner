@@ -367,7 +367,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       return availableSymbols;
     }
     return availableSymbols.filter((item) =>
-      item.toLowerCase().includes(normalizedQuery)
+      item.toLowerCase().startsWith(normalizedQuery)
     );
   }, [availableSymbols, symbolQuery]);
 
