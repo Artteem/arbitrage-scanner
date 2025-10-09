@@ -77,7 +77,7 @@ interface SpreadsTableProps {
 }
 
 export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
-  const { toggleTheme } = useTheme();
+  const { theme, toggleTheme } = useTheme();
   const { data: stats } = useStats(initialStats ?? undefined);
   const [rows, setRows] = useState<SpreadRow[]>([]);
   const [wsStatus, setWsStatus] = useState<WsStatus>('connecting');
@@ -268,27 +268,25 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
   return (
     <div className="page-container">
       <header className="table-header">
-        <div>
-          <h1>Арбитражный сканер</h1>
-          <p className="header-meta">
-            {stats
-              ? `Биржи: ${stats.exchanges.join(', ')} • Подписок: ${stats.symbols_subscribed.length}`
-              : 'Не удалось получить статистику API'}
-          </p>
+        <div className="status-indicator">
+          <span className={`status-dot ${wsStatus}`}></span>
+          <span>{wsStatusLabel}</span>
+          {lastUpdated ? (
+            <span className="muted small">Обновлено: {formatDateTime(lastUpdated)}</span>
+          ) : null}
         </div>
         <div className="header-actions">
-          <div className="status-indicator">
-            <span className={`status-dot ${wsStatus}`}></span>
-            <span>{wsStatusLabel}</span>
-            {lastUpdated ? (
-              <span className="muted small">
-                Обновлено: {formatDateTime(lastUpdated)}
-              </span>
-            ) : null}
-          </div>
-          <button type="button" className="btn" onClick={toggleTheme}>
-            Светлая/Тёмная
-          </button>
+          <label className="theme-toggle">
+            <input
+              type="checkbox"
+              checked={theme === 'light'}
+              onChange={toggleTheme}
+              aria-label="Переключить тему"
+            />
+            <span className="theme-toggle-track">
+              <span className="theme-toggle-thumb" />
+            </span>
+          </label>
         </div>
       </header>
 
