@@ -57,19 +57,19 @@ body {
 }
 
 .site-logo {
-  display: inline-flex;
-  align-items: center;
+  display: inline-block;
   position: relative;
+  width: min(100%, 360px);
 }
 
 .site-logo-image {
   display: block;
-  width: min(100%, 360px);
-  aspect-ratio: 512 / 102;
-  background-repeat: no-repeat;
-  background-size: contain;
-  background-position: left center;
-  background-image: url('/branding/aytrade-header-light.png');
+  width: 100%;
+  height: auto;
+}
+
+.site-logo-image-dark {
+  display: none;
 }
 
 .sr-only {
@@ -84,8 +84,12 @@ body {
   border: 0;
 }
 
-html[data-theme='dark'] .site-logo-image {
-  background-image: url('/branding/aytrade-header-dark.png');
+html[data-theme='dark'] .site-logo-image-light {
+  display: none;
+}
+
+html[data-theme='dark'] .site-logo-image-dark {
+  display: block;
 }
 
 a {
