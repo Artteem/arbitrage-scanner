@@ -16,8 +16,68 @@ import {
   type ISeriesApi,
   type Time,
   type UTCTimestamp,
+  type BusinessDay
 } from 'lightweight-charts';
 import { useTheme } from './useTheme';
+
+function formatTimeWithTimezone(
+  time: unknown,
+  timeframe: '1m' | '5m' | '1h',
+  tz: string
+): string {
+  const date = toDateFromAnyTime(time);
+  if (!date) return '';
+
+  const opts: Intl.DateTimeFormatOptions =
+    timeframe === '1m'
+      ? { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: tz }
+      : timeframe === '5m'
+      ? { hour: '2-digit', minute: '2-digit', timeZone: tz }
+      : { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: tz };
+
+  return new Intl.DateTimeFormat('ru-RU', opts).format(date);
+}
+
+// --- Time helpers ------------------------------------------------------------
+
+function isUtcTimestamp(t: unknown): t is number {
+  return typeof t === 'number' && Number.isFinite(t);
+}
+
+function isDateString(t: unknown): t is string {
+  return typeof t === 'string';
+}
+
+function isBusinessDay(t: unknown): t is BusinessDay {
+  return typeof t === 'object' && t !== null
+    && 'year' in (t as any)
+    && 'month' in (t as any)
+    && 'day' in (t as any);
+}
+
+// Иногда из formatters прилетает объект-обёртка { timestamp } или { businessDay }
+function toDateFromAnyTime(t: unknown): Date | null {
+  if (isUtcTimestamp(t)) return new Date(t * 1000);
+  if (isDateString(t)) {
+    const d = new Date(t);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (isBusinessDay(t)) {
+    const { year, month, day } = t;
+    return new Date(year, month - 1, day);
+  }
+  if (typeof t === 'object' && t !== null) {
+    const anyT = t as any;
+    if (typeof anyT.timestamp === 'number') {
+      return new Date(anyT.timestamp * 1000);
+    }
+    if (anyT.businessDay && isBusinessDay(anyT.businessDay)) {
+      const { year, month, day } = anyT.businessDay as BusinessDay;
+      return new Date(year, month - 1, day);
+    }
+  }
+  return null;
+}
 
 const LOOKBACK_DAYS = 10;
 const TIMEFRAMES = ['1m', '5m', '1h'] as const;
@@ -75,25 +135,17 @@ const exchangeUrl = (exchange: string, symbol: string) => {
 };
 
 const toMexcSymbol = (symbol: string) => {
-  if (!symbol) {
-    return symbol;
-  }
-  if (symbol.includes('_')) {
-    return symbol;
-  }
+  if (!symbol) return symbol;
+  if (symbol.includes('_')) return symbol;
   return symbol.endsWith('USDT') ? `${symbol.slice(0, -4)}_USDT` : symbol;
 };
 
 const toBingxSymbol = (symbol: string) => {
-  if (!symbol) {
-    return symbol;
-  }
+  if (!symbol) return symbol;
   const upper = symbol.toUpperCase();
   const quotes = ['USDT', 'USDC', 'USD', 'BUSD', 'FDUSD'];
   const quote = quotes.find((q) => upper.endsWith(q));
-  if (!quote) {
-    return upper;
-  }
+  if (!quote) return upper;
   const base = upper.slice(0, -quote.length);
   return `${base}-${quote}`;
 };
@@ -179,35 +231,6 @@ type TimezoneOption = {
   label: string;
 };
 
-const formatTimeWithTimezone = (time: Time, timeframe: string, timezone: string, locale = 'ru-RU') => {
-  let date: Date;
-  if (typeof time === 'number') {
-    date = new Date(time * 1000);
-  } else if ('timestamp' in time) {
-    date = new Date(time.timestamp * 1000);
-  } else if ('businessDay' in time) {
-    const { year, month, day } = time.businessDay;
-    date = new Date(Date.UTC(year, month - 1, day));
-  } else if ('time' in time) {
-    date = new Date(time.time * 1000);
-  } else {
-    date = new Date(0);
-  }
-
-  const baseOptions: Intl.DateTimeFormatOptions = {
-    timeZone: timezone,
-    hour: '2-digit',
-    minute: '2-digit',
-  };
-
-  if (timeframe === '1h') {
-    baseOptions.day = '2-digit';
-    baseOptions.month = '2-digit';
-  }
-
-  return new Intl.DateTimeFormat(locale, baseOptions).format(date);
-};
-
 interface PairViewProps {
   symbol: string;
   initialLong?: string;
@@ -279,9 +302,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   }, [initialSelection, overviewRows, selection, symbolUpper]);
 
   useEffect(() => {
-    if (!selection || !overviewRows.length) {
-      return;
-    }
+    if (!selection || !overviewRows.length) return;
     const exists = overviewRows.some((row) => rowMatchesSelection(row, selection));
     if (!exists) {
       const fallback = overviewRows[0];
@@ -301,9 +322,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     days: LOOKBACK_DAYS,
   });
   const reverseSelection = useMemo(() => {
-    if (!selection) {
-      return null;
-    }
+    if (!selection) return null;
     return {
       symbol: selection.symbol,
       long_exchange: selection.short_exchange,
@@ -319,26 +338,18 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const { data: limitsData } = usePairLimits(selection);
 
   const overviewRow = useMemo(() => {
-    if (!selection) {
-      return null;
-    }
+    if (!selection) return null;
     return overviewRows.find((row) => rowMatchesSelection(row, selection)) ?? null;
   }, [overviewRows, selection]);
 
   const realtimeRow = useMemo(() => {
-    if (!selection || !realtimeData?.row) {
-      return null;
-    }
-    if (rowMatchesSelection(realtimeData.row, selection)) {
-      return realtimeData.row;
-    }
+    if (!selection || !realtimeData?.row) return null;
+    if (rowMatchesSelection(realtimeData.row, selection)) return realtimeData.row;
     return null;
   }, [realtimeData, selection]);
 
   const activeRow = useMemo(() => {
-    if (overviewRow && realtimeRow) {
-      return { ...overviewRow, ...realtimeRow };
-    }
+    if (overviewRow && realtimeRow) return { ...overviewRow, ...realtimeRow };
     return realtimeRow ?? overviewRow ?? null;
   }, [overviewRow, realtimeRow]);
 
@@ -354,9 +365,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   useEffect(() => {
     const container = chartContainerRef.current;
-    if (!container || chartRef.current) {
-      return;
-    }
+    if (!container || chartRef.current) return;
 
     const colors = getChartColors(themeRef.current);
 
@@ -375,14 +384,14 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         borderColor: 'transparent',
         timeVisible: true,
         secondsVisible: timeframeRef.current === '1m',
-        tickMarkFormatter: (time) =>
+        tickMarkFormatter: (time: Time) =>
           formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
       },
       rightPriceScale: {
         borderColor: 'transparent',
       },
       localization: {
-        timeFormatter: (time) =>
+        timeFormatter: (time: Time) =>
           formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
       },
     });
@@ -423,9 +432,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   useEffect(() => {
     if (!showExitChart) {
-      if (exitChartRef.current) {
-        exitChartRef.current.remove();
-      }
+      if (exitChartRef.current) exitChartRef.current.remove();
       exitChartRef.current = null;
       exitSeriesRef.current = null;
       exitZeroLineRef.current = null;
@@ -433,13 +440,9 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   }, [showExitChart]);
 
   useEffect(() => {
-    if (!showExitChart) {
-      return;
-    }
+    if (!showExitChart) return;
     const container = exitChartContainerRef.current;
-    if (!container || exitChartRef.current) {
-      return;
-    }
+    if (!container || exitChartRef.current) return;
 
     const colors = getChartColors(themeRef.current);
 
@@ -458,14 +461,14 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         borderColor: 'transparent',
         timeVisible: true,
         secondsVisible: timeframeRef.current === '1m',
-        tickMarkFormatter: (time) =>
+        tickMarkFormatter: (time: Time) =>
           formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
       },
       rightPriceScale: {
         borderColor: 'transparent',
       },
       localization: {
-        timeFormatter: (time) =>
+        timeFormatter: (time: Time) =>
           formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
       },
     });
@@ -507,9 +510,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const chart = chartRef.current;
     const series = seriesRef.current;
-    if (!chart || !series) {
-      return;
-    }
+    if (!chart || !series) return;
+
     const colors = getChartColors(theme);
     chart.applyOptions({
       layout: {
@@ -523,11 +525,11 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       timeScale: {
         timeVisible: true,
         secondsVisible: timeframe === '1m',
-        tickMarkFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        tickMarkFormatter: (time: Time) => formatTimeWithTimezone(time, timeframe, timezone),
         borderColor: 'transparent',
       },
       localization: {
-        timeFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        timeFormatter: (time: Time) => formatTimeWithTimezone(time, timeframe, timezone),
       },
     });
     series.applyOptions({
@@ -554,9 +556,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const chart = exitChartRef.current;
     const series = exitSeriesRef.current;
-    if (!chart || !series) {
-      return;
-    }
+    if (!chart || !series) return;
+
     const colors = getChartColors(theme);
     chart.applyOptions({
       layout: {
@@ -570,11 +571,11 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       timeScale: {
         timeVisible: true,
         secondsVisible: timeframe === '1m',
-        tickMarkFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        tickMarkFormatter: (time: Time) => formatTimeWithTimezone(time, timeframe, timezone),
         borderColor: 'transparent',
       },
       localization: {
-        timeFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        timeFormatter: (time: Time) => formatTimeWithTimezone(time, timeframe, timezone),
       },
     });
     series.applyOptions({
@@ -611,9 +612,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const series = seriesRef.current;
     const chart = chartRef.current;
-    if (!series || !chart) {
-      return;
-    }
+    if (!series || !chart) return;
+
     if (!entryCandles.length) {
       series.setData([]);
       return;
@@ -632,9 +632,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const series = exitSeriesRef.current;
     const chart = exitChartRef.current;
-    if (!series || !chart) {
-      return;
-    }
+    if (!series || !chart) return;
+
     if (!exitCandles.length) {
       series.setData([]);
       return;
@@ -652,9 +651,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   const volumeValue = useMemo(() => {
     const parsed = Number.parseFloat(volume.replace(',', '.'));
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      return 0;
-    }
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
     return parsed;
   }, [volume]);
 
@@ -692,9 +689,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   }, [overviewRows]);
 
   const handleReverse = () => {
-    if (!selection) {
-      return;
-    }
+    if (!selection) return;
     setSelection({
       symbol: selection.symbol,
       long_exchange: selection.short_exchange,
@@ -711,9 +706,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const shortLimit = limitsData?.short as Record<string, unknown> | null | undefined;
 
   const renderLimit = (limit: Record<string, unknown> | null | undefined) => {
-    if (!limit) {
-      return 'Нет данных';
-    }
+    if (!limit) return 'Нет данных';
     const entries: string[] = [];
     const qty = limit['max_qty'];
     if (qty !== undefined) {
@@ -730,12 +723,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       }
     }
     const desc = limit['limit_desc'];
-    if (desc) {
-      entries.push(String(desc));
-    }
-    if (!entries.length) {
-      entries.push('Нет данных');
-    }
+    if (desc) entries.push(String(desc));
+    if (!entries.length) entries.push('Нет данных');
     return entries.join(' • ');
   };
 
@@ -743,9 +732,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const documentTitleExit = exitPct !== null ? exitPct.toFixed(2) : '—';
 
   useEffect(() => {
-    if (typeof document === 'undefined') {
-      return;
-    }
+    if (typeof document === 'undefined') return;
     document.title = `${documentTitleEntry} | ${documentTitleExit} | ${symbolUpper}`;
   }, [documentTitleEntry, documentTitleExit, symbolUpper]);
 
@@ -932,7 +919,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
             {activeRow ? (
               <div className="exchange-line">
                 <span>
-                  LONG:{' '}
+                  LONG{' '}
                   <a
                     href={exchangeUrl(activeRow.long_exchange, symbolUpper)}
                     target="_blank"
@@ -940,10 +927,10 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                   >
                     {activeRow.long_exchange.toUpperCase()}
                   </a>
-                  , фандинг {formatFundingPercent(activeRow.funding_long)} / {longFundingInterval}
+                  : фандинг {formatFundingPercent(activeRow.funding_long)} / {longFundingInterval}
                 </span>
                 <span>
-                  SHORT:{' '}
+                  SHORT{' '}
                   <a
                     href={exchangeUrl(activeRow.short_exchange, symbolUpper)}
                     target="_blank"
@@ -951,7 +938,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                   >
                     {activeRow.short_exchange.toUpperCase()}
                   </a>
-                  , фандинг {formatFundingPercent(activeRow.funding_short)} / {shortFundingInterval}
+                  : фандинг {formatFundingPercent(activeRow.funding_short)} / {shortFundingInterval}
                 </span>
               </div>
             ) : (
