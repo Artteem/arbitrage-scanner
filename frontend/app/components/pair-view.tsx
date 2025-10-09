@@ -8,20 +8,28 @@ import {
   usePairSpreads,
 } from '../../lib/api';
 import type { PairSelection, SpreadRow } from '../../lib/types';
-import { createChart, type IChartApi, type ISeriesApi, type UTCTimestamp } from 'lightweight-charts';
+import {
+  LineStyle,
+  createChart,
+  type IChartApi,
+  type IPriceLine,
+  type ISeriesApi,
+  type Time,
+  type UTCTimestamp,
+} from 'lightweight-charts';
 import { useTheme } from './useTheme';
 
 const LOOKBACK_DAYS = 10;
 const TIMEFRAMES = ['1m', '5m', '1h'] as const;
 
-const formatPercent = (value: number | null | undefined, digits = 4) => {
+const formatPercent = (value: number | null | undefined, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';
   }
   return `${value.toFixed(digits)}%`;
 };
 
-const formatFundingPercent = (value: number | null | undefined, digits = 4) => {
+const formatFundingPercent = (value: number | null | undefined, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';
   }
@@ -95,18 +103,76 @@ const getChartColors = (theme: 'dark' | 'light') => {
     return {
       text: '#0f172a',
       grid: 'rgba(15, 23, 42, 0.12)',
-      line: '#2563eb',
-      areaTop: 'rgba(37, 99, 235, 0.35)',
-      areaBottom: 'rgba(37, 99, 235, 0.05)',
+      candleUp: '#16a34a',
+      candleUpBorder: '#15803d',
+      candleDown: '#dc2626',
+      candleDownBorder: '#b91c1c',
+      zeroLine: '#0f172a',
     } as const;
   }
   return {
     text: '#e6e6e6',
     grid: 'rgba(148, 163, 184, 0.18)',
-    line: '#4aa3ff',
-    areaTop: 'rgba(74, 163, 255, 0.35)',
-    areaBottom: 'rgba(74, 163, 255, 0.05)',
+    candleUp: '#22d3ee',
+    candleUpBorder: '#0891b2',
+    candleDown: '#fb7185',
+    candleDownBorder: '#f43f5e',
+    zeroLine: '#f8fafc',
   } as const;
+};
+
+const resolveDefaultTimezone = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  } catch (error) {
+    console.warn('Unable to resolve timezone, falling back to UTC', error);
+    return 'UTC';
+  }
+};
+
+const getTimezoneOptions = () => {
+  const fallback = ['UTC', 'Europe/Moscow', 'America/New_York', 'Asia/Singapore'];
+  const intlWithSupport = Intl as typeof Intl & {
+    supportedValuesOf?: (input: string) => string[];
+  };
+  if (typeof intlWithSupport.supportedValuesOf === 'function') {
+    try {
+      return intlWithSupport.supportedValuesOf('timeZone');
+    } catch (error) {
+      console.warn('Failed to load timezone list, using fallback', error);
+      return fallback;
+    }
+  }
+  return fallback;
+};
+
+const formatTimeWithTimezone = (time: Time, timeframe: string, timezone: string, locale = 'ru-RU') => {
+  let date: Date;
+  if (typeof time === 'number') {
+    date = new Date(time * 1000);
+  } else if ('timestamp' in time) {
+    date = new Date(time.timestamp * 1000);
+  } else if ('businessDay' in time) {
+    const { year, month, day } = time.businessDay;
+    date = new Date(Date.UTC(year, month - 1, day));
+  } else if ('time' in time) {
+    date = new Date(time.time * 1000);
+  } else {
+    date = new Date(0);
+  }
+
+  const baseOptions: Intl.DateTimeFormatOptions = {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+  };
+
+  if (timeframe === '1h') {
+    baseOptions.day = '2-digit';
+    baseOptions.month = '2-digit';
+  }
+
+  return new Intl.DateTimeFormat(locale, baseOptions).format(date);
 };
 
 interface PairViewProps {
@@ -119,8 +185,19 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const symbolUpper = symbol.toUpperCase();
   const { theme, toggleTheme } = useTheme();
   const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]>('5m');
-  const [metric, setMetric] = useState<'entry' | 'exit'>('entry');
+  const [showExitChart, setShowExitChart] = useState(false);
   const [volume, setVolume] = useState('100');
+  const [timezone, setTimezone] = useState<string>(resolveDefaultTimezone);
+
+  const timezoneOptions = useMemo(() => getTimezoneOptions(), []);
+
+  const themeRef = useRef(theme);
+  const timeframeRef = useRef(timeframe);
+  const timezoneRef = useRef(timezone);
+
+  themeRef.current = theme;
+  timeframeRef.current = timeframe;
+  timezoneRef.current = timezone;
 
   const initialSelection = useMemo<PairSelection | null>(() => {
     if (!initialLong || !initialShort) {
@@ -180,9 +257,24 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     }
   }, [overviewRows, selection, symbolUpper]);
 
-  const { data: spreadsData } = usePairSpreads(selection, {
+  const { data: entrySpreadsData } = usePairSpreads(selection, {
     timeframe,
-    metric,
+    metric: 'entry',
+    days: LOOKBACK_DAYS,
+  });
+  const reverseSelection = useMemo(() => {
+    if (!selection) {
+      return null;
+    }
+    return {
+      symbol: selection.symbol,
+      long_exchange: selection.short_exchange,
+      short_exchange: selection.long_exchange,
+    } satisfies PairSelection;
+  }, [selection]);
+  const { data: exitSpreadsData } = usePairSpreads(showExitChart ? reverseSelection : null, {
+    timeframe,
+    metric: 'entry',
     days: LOOKBACK_DAYS,
   });
   const { data: realtimeData } = usePairRealtime(selection);
@@ -214,7 +306,13 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
+  const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const zeroLineRef = useRef<IPriceLine | null>(null);
+
+  const exitChartContainerRef = useRef<HTMLDivElement | null>(null);
+  const exitChartRef = useRef<IChartApi | null>(null);
+  const exitSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const exitZeroLineRef = useRef<IPriceLine | null>(null);
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -222,33 +320,53 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       return;
     }
 
+    const colors = getChartColors(themeRef.current);
+
     const chart = createChart(container, {
       width: container.clientWidth,
       height: 340,
       layout: {
         background: { color: 'transparent' },
-        textColor: getChartColors('dark').text,
+        textColor: colors.text,
       },
       grid: {
-        vertLines: { color: getChartColors('dark').grid },
-        horzLines: { color: getChartColors('dark').grid },
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
       },
       timeScale: {
         borderColor: 'transparent',
+        timeVisible: true,
+        secondsVisible: timeframeRef.current === '1m',
+        tickMarkFormatter: (time) =>
+          formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
       },
       rightPriceScale: {
         borderColor: 'transparent',
       },
+      localization: {
+        timeFormatter: (time) =>
+          formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
+      },
     });
 
-    const series = chart.addAreaSeries({
-      lineColor: getChartColors('dark').line,
-      topColor: getChartColors('dark').areaTop,
-      bottomColor: getChartColors('dark').areaBottom,
+    const series = chart.addCandlestickSeries({
+      upColor: colors.candleUp,
+      downColor: colors.candleDown,
+      borderUpColor: colors.candleUpBorder,
+      borderDownColor: colors.candleDownBorder,
+      wickUpColor: colors.candleUp,
+      wickDownColor: colors.candleDown,
     });
 
     chartRef.current = chart;
     seriesRef.current = series;
+    zeroLineRef.current = series.createPriceLine({
+      price: 0,
+      color: colors.zeroLine,
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+    });
 
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -261,8 +379,92 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      zeroLineRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!showExitChart) {
+      if (exitChartRef.current) {
+        exitChartRef.current.remove();
+      }
+      exitChartRef.current = null;
+      exitSeriesRef.current = null;
+      exitZeroLineRef.current = null;
+    }
+  }, [showExitChart]);
+
+  useEffect(() => {
+    if (!showExitChart) {
+      return;
+    }
+    const container = exitChartContainerRef.current;
+    if (!container || exitChartRef.current) {
+      return;
+    }
+
+    const colors = getChartColors(themeRef.current);
+
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: 340,
+      layout: {
+        background: { color: 'transparent' },
+        textColor: colors.text,
+      },
+      grid: {
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
+      },
+      timeScale: {
+        borderColor: 'transparent',
+        timeVisible: true,
+        secondsVisible: timeframeRef.current === '1m',
+        tickMarkFormatter: (time) =>
+          formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
+      },
+      rightPriceScale: {
+        borderColor: 'transparent',
+      },
+      localization: {
+        timeFormatter: (time) =>
+          formatTimeWithTimezone(time, timeframeRef.current, timezoneRef.current),
+      },
+    });
+
+    const series = chart.addCandlestickSeries({
+      upColor: colors.candleUp,
+      downColor: colors.candleDown,
+      borderUpColor: colors.candleUpBorder,
+      borderDownColor: colors.candleDownBorder,
+      wickUpColor: colors.candleUp,
+      wickDownColor: colors.candleDown,
+    });
+
+    exitChartRef.current = chart;
+    exitSeriesRef.current = series;
+    exitZeroLineRef.current = series.createPriceLine({
+      price: 0,
+      color: colors.zeroLine,
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+    });
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        chart.applyOptions({ width: entry.contentRect.width });
+      }
+    });
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+      chart.remove();
+      exitChartRef.current = null;
+      exitSeriesRef.current = null;
+      exitZeroLineRef.current = null;
+    };
+  }, [showExitChart]);
 
   useEffect(() => {
     const chart = chartRef.current;
@@ -280,17 +482,92 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         vertLines: { color: colors.grid },
         horzLines: { color: colors.grid },
       },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: timeframe === '1m',
+        tickMarkFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        borderColor: 'transparent',
+      },
+      localization: {
+        timeFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+      },
     });
     series.applyOptions({
-      lineColor: colors.line,
-      topColor: colors.areaTop,
-      bottomColor: colors.areaBottom,
+      upColor: colors.candleUp,
+      downColor: colors.candleDown,
+      borderUpColor: colors.candleUpBorder,
+      borderDownColor: colors.candleDownBorder,
+      wickUpColor: colors.candleUp,
+      wickDownColor: colors.candleDown,
     });
-  }, [theme]);
+    if (zeroLineRef.current) {
+      series.removePriceLine(zeroLineRef.current);
+    }
+    zeroLineRef.current = series.createPriceLine({
+      price: 0,
+      color: colors.zeroLine,
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+    });
+    chart.timeScale().fitContent();
+  }, [theme, timeframe, timezone]);
 
-  const candles = useMemo(
-    () => spreadsData?.candles ?? [],
-    [spreadsData?.candles],
+  useEffect(() => {
+    const chart = exitChartRef.current;
+    const series = exitSeriesRef.current;
+    if (!chart || !series) {
+      return;
+    }
+    const colors = getChartColors(theme);
+    chart.applyOptions({
+      layout: {
+        background: { color: 'transparent' },
+        textColor: colors.text,
+      },
+      grid: {
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
+      },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: timeframe === '1m',
+        tickMarkFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+        borderColor: 'transparent',
+      },
+      localization: {
+        timeFormatter: (time) => formatTimeWithTimezone(time, timeframe, timezone),
+      },
+    });
+    series.applyOptions({
+      upColor: colors.candleUp,
+      downColor: colors.candleDown,
+      borderUpColor: colors.candleUpBorder,
+      borderDownColor: colors.candleDownBorder,
+      wickUpColor: colors.candleUp,
+      wickDownColor: colors.candleDown,
+    });
+    if (exitZeroLineRef.current) {
+      series.removePriceLine(exitZeroLineRef.current);
+    }
+    exitZeroLineRef.current = series.createPriceLine({
+      price: 0,
+      color: colors.zeroLine,
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
+      axisLabelVisible: true,
+    });
+    chart.timeScale().fitContent();
+  }, [theme, timeframe, timezone]);
+
+  const entryCandles = useMemo(
+    () => entrySpreadsData?.candles ?? [],
+    [entrySpreadsData?.candles],
+  );
+
+  const exitCandles = useMemo(
+    () => exitSpreadsData?.candles ?? [],
+    [exitSpreadsData?.candles],
   );
 
   useEffect(() => {
@@ -299,17 +576,41 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     if (!series || !chart) {
       return;
     }
-    if (!candles.length) {
+    if (!entryCandles.length) {
       series.setData([]);
       return;
     }
-    const data = candles.map((candle) => ({
+    const data = entryCandles.map((candle) => ({
       time: Math.round(candle.ts) as UTCTimestamp,
-      value: Number(candle.close.toFixed(6)),
+      open: Number(candle.open.toFixed(6)),
+      high: Number(candle.high.toFixed(6)),
+      low: Number(candle.low.toFixed(6)),
+      close: Number(candle.close.toFixed(6)),
     }));
     series.setData(data);
     chart.timeScale().fitContent();
-  }, [candles]);
+  }, [entryCandles]);
+
+  useEffect(() => {
+    const series = exitSeriesRef.current;
+    const chart = exitChartRef.current;
+    if (!series || !chart) {
+      return;
+    }
+    if (!exitCandles.length) {
+      series.setData([]);
+      return;
+    }
+    const data = exitCandles.map((candle) => ({
+      time: Math.round(candle.ts) as UTCTimestamp,
+      open: Number(candle.open.toFixed(6)),
+      high: Number(candle.high.toFixed(6)),
+      low: Number(candle.low.toFixed(6)),
+      close: Number(candle.close.toFixed(6)),
+    }));
+    series.setData(data);
+    chart.timeScale().fitContent();
+  }, [exitCandles]);
 
   const volumeValue = useMemo(() => {
     const parsed = Number.parseFloat(volume.replace(',', '.'));
@@ -331,7 +632,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   const lastUpdatedTs = realtimeData?.ts ?? realtimeRow?._ts ?? null;
   const lastUpdatedLabel = lastUpdatedTs
-    ? new Date(lastUpdatedTs * 1000).toLocaleTimeString('ru-RU')
+    ? new Intl.DateTimeFormat('ru-RU', {
+        timeZone: timezone,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }).format(new Date(lastUpdatedTs * 1000))
     : null;
 
   const selectionKey = selection
@@ -395,79 +701,132 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     return entries.join(' • ');
   };
 
+  const documentTitleEntry = entryPct !== null ? entryPct.toFixed(2) : '—';
+  const documentTitleExit = exitPct !== null ? exitPct.toFixed(2) : '—';
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    document.title = `${documentTitleEntry} | ${documentTitleExit} | ${symbolUpper}`;
+  }, [documentTitleEntry, documentTitleExit, symbolUpper]);
+
   return (
     <div className="page-container pair-container">
       <header className="pair-header">
-        <div>
-          <div className="breadcrumb">
-            <a href="/">← Назад к таблице</a>
-          </div>
-          <h1>{symbolUpper}</h1>
-        </div>
+        <h1>{symbolUpper}</h1>
         <div className="header-actions">
-          <button type="button" className="btn" onClick={toggleTheme}>
-            Светлая/Тёмная
-          </button>
+          <label className="theme-toggle">
+            <input
+              type="checkbox"
+              checked={theme === 'light'}
+              onChange={toggleTheme}
+              aria-label="Переключить тему"
+            />
+            <span className="theme-toggle-track">
+              <span className="theme-toggle-thumb" />
+            </span>
+          </label>
         </div>
       </header>
 
       <section className="pair-layout">
-        <div className="pair-left">
-          <div className="pair-controls">
-            <label className="control-group">
-              Таймфрейм
-              <select
-                value={timeframe}
-                onChange={(event) => setTimeframe(event.target.value as (typeof TIMEFRAMES)[number])}
-              >
-                {TIMEFRAMES.map((tf) => (
-                  <option key={tf} value={tf}>
-                    {tf === '1m' ? '1 мин' : tf === '5m' ? '5 мин' : '1 час'}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="control-group metric-toggle">
-              <button
-                type="button"
-                className={metric === 'entry' ? 'btn active' : 'btn'}
-                onClick={() => setMetric('entry')}
-              >
-                Вход
-              </button>
-              <button
-                type="button"
-                className={metric === 'exit' ? 'btn active' : 'btn'}
-                onClick={() => setMetric('exit')}
-              >
-                Выход
-              </button>
-            </div>
-            <button
-              type="button"
-              className="btn"
-              onClick={handleReverse}
-              disabled={!selection}
+        <div className="pair-controls">
+          <label className="control-group">
+            Таймфрейм
+            <select
+              value={timeframe}
+              onChange={(event) => setTimeframe(event.target.value as (typeof TIMEFRAMES)[number])}
             >
-              Перевернуть связку
-            </button>
-          </div>
-
-          <div className="chart-card">
-            <div className="chart-card-header">
-              <h2>{metric === 'entry' ? 'Вход %' : 'Выход %'}</h2>
-              {lastUpdatedLabel ? (
-                <span className="muted small">Обновлено: {lastUpdatedLabel}</span>
-              ) : null}
-            </div>
-            <div ref={chartContainerRef} className="chart-container"></div>
-            {!candles.length ? (
-              <div className="chart-empty">Нет данных для выбранной комбинации</div>
-            ) : null}
-          </div>
+              {TIMEFRAMES.map((tf) => (
+                <option key={tf} value={tf}>
+                  {tf === '1m' ? '1 мин' : tf === '5m' ? '5 мин' : '1 час'}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="control-group toggle-inline">
+            <span>Отобразить график выхода</span>
+            <span className="switch">
+              <input
+                type="checkbox"
+                checked={showExitChart}
+                onChange={(event) => setShowExitChart(event.target.checked)}
+              />
+              <span className="switch-track">
+                <span className="switch-thumb" />
+              </span>
+            </span>
+          </label>
+          <button type="button" className="btn" onClick={handleReverse} disabled={!selection}>
+            Перевернуть связку
+          </button>
         </div>
 
-        <div className="pair-right">
+        <div className="pair-main">
+          <div className="chart-column">
+            <div className="chart-card">
+              <div className="chart-card-header">
+                <h2>Вход %</h2>
+                {lastUpdatedLabel ? (
+                  <span className="muted small">Обновлено: {lastUpdatedLabel}</span>
+                ) : null}
+              </div>
+              <div className="chart-container">
+                <div ref={chartContainerRef} className="chart-surface"></div>
+                <div className="chart-timezone-select">
+                  <select
+                    aria-label="Выбрать часовой пояс"
+                    value={timezone}
+                    onChange={(event) => setTimezone(event.target.value)}
+                  >
+                    {timezoneOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              {!entryCandles.length ? (
+                <div className="chart-empty">Нет данных для выбранной комбинации</div>
+              ) : null}
+            </div>
+
+            {showExitChart ? (
+              <div className="chart-card">
+                <div className="chart-card-header">
+                  <h2>Выход %</h2>
+                  {reverseSelection ? (
+                    <span className="muted small">
+                      {reverseSelection.long_exchange.toUpperCase()} →{' '}
+                      {reverseSelection.short_exchange.toUpperCase()}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="chart-container">
+                  <div ref={exitChartContainerRef} className="chart-surface"></div>
+                  <div className="chart-timezone-select">
+                    <select
+                      aria-label="Выбрать часовой пояс"
+                      value={timezone}
+                      onChange={(event) => setTimezone(event.target.value)}
+                    >
+                      {timezoneOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                {!exitCandles.length ? (
+                  <div className="chart-empty">Нет данных для выбранной комбинации</div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+
           <div className="summary-card">
             <div className="summary-top">
               <label className="volume-input">
