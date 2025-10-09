@@ -267,6 +267,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const [showExitChart, setShowExitChart] = useState(false);
   const [volume, setVolume] = useState('100');
   const [timezone, setTimezone] = useState<string>(resolveDefaultTimezone);
+  const [symbolDropdownOpen, setSymbolDropdownOpen] = useState(false);
+  const [symbolQuery, setSymbolQuery] = useState('');
 
   const timezoneOptions = useMemo<TimezoneOption[]>(() => {
     return getTimezoneOptions().map((zone) => ({
@@ -278,6 +280,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const themeRef = useRef(theme);
   const timeframeRef = useRef(timeframe);
   const timezoneRef = useRef(timezone);
+  const symbolDropdownRef = useRef<HTMLDivElement | null>(null);
+  const symbolSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   themeRef.current = theme;
   timeframeRef.current = timeframe;
@@ -357,6 +361,16 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     return Array.from(collected).sort((a, b) => a.localeCompare(b));
   }, [overviewData?.symbol, statsData?.symbols_subscribed, symbolUpper]);
 
+  const filteredSymbols = useMemo(() => {
+    const normalizedQuery = symbolQuery.trim().toLowerCase();
+    if (!normalizedQuery) {
+      return availableSymbols;
+    }
+    return availableSymbols.filter((item) =>
+      item.toLowerCase().includes(normalizedQuery)
+    );
+  }, [availableSymbols, symbolQuery]);
+
   const longOptions = useMemo(() => {
     const set = new Set<string>();
     overviewRows.forEach((row) => {
@@ -426,6 +440,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       return;
     }
     router.push(`/pair/${encodeURIComponent(normalized)}`);
+  };
+
+  const handleSymbolSelect = (nextSymbol: string) => {
+    setSymbolDropdownOpen(false);
+    setSymbolQuery('');
+    handleSymbolChange(nextSymbol);
   };
 
   useEffect(() => {
@@ -906,20 +926,97 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     document.title = `${documentTitleEntry} | ${documentTitleExit} | ${symbolUpper}`;
   }, [documentTitleEntry, documentTitleExit, symbolUpper]);
 
+  useEffect(() => {
+    if (!symbolDropdownOpen) return;
+    const handleOutsideClick = (event: MouseEvent | TouchEvent) => {
+      const target = event.target as Node;
+      if (symbolDropdownRef.current && !symbolDropdownRef.current.contains(target)) {
+        setSymbolDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    document.addEventListener('touchstart', handleOutsideClick);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('touchstart', handleOutsideClick);
+    };
+  }, [symbolDropdownOpen]);
+
+  useEffect(() => {
+    if (symbolDropdownOpen) {
+      symbolSearchInputRef.current?.focus();
+    } else {
+      setSymbolQuery('');
+    }
+  }, [symbolDropdownOpen]);
+
+  useEffect(() => {
+    setSymbolDropdownOpen(false);
+    setSymbolQuery('');
+  }, [symbolUpper]);
+
   return (
     <div className="page-container pair-container">
       <header className="pair-header">
         <h1 className="pair-title">
-          <select
-            value={symbolUpper}
-            onChange={(event) => handleSymbolChange(event.target.value)}
+          <div
+            className={`symbol-select ${symbolDropdownOpen ? 'open' : ''}`}
+            ref={symbolDropdownRef}
           >
-            {availableSymbols.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
+            <button
+              type="button"
+              className="symbol-select-trigger"
+              onClick={() => setSymbolDropdownOpen((prev) => !prev)}
+              aria-haspopup="listbox"
+              aria-expanded={symbolDropdownOpen}
+            >
+              {symbolUpper}
+              <span className="symbol-select-chevron" aria-hidden="true" />
+            </button>
+            {symbolDropdownOpen ? (
+              <div className="symbol-select-menu">
+                <input
+                  ref={symbolSearchInputRef}
+                  type="text"
+                  value={symbolQuery}
+                  onChange={(event) => setSymbolQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      const first = filteredSymbols[0];
+                      if (first) {
+                        handleSymbolSelect(first);
+                      }
+                    } else if (event.key === 'Escape') {
+                      setSymbolDropdownOpen(false);
+                    }
+                  }}
+                  placeholder="Поиск пары"
+                  className="symbol-select-search"
+                  spellCheck={false}
+                />
+                <ul role="listbox" className="symbol-select-options">
+                  {filteredSymbols.length ? (
+                    filteredSymbols.map((item) => (
+                      <li key={item}>
+                        <button
+                          type="button"
+                          className={`symbol-select-option ${
+                            item === symbolUpper ? 'active' : ''
+                          }`}
+                          onClick={() => handleSymbolSelect(item)}
+                        >
+                          {item}
+                        </button>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="symbol-select-empty">Нет совпадений</li>
+                  )}
+                </ul>
+              </div>
+            ) : null}
+          </div>
         </h1>
         <div className="header-actions">
           <label className="theme-toggle">
@@ -1012,19 +1109,6 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                 </div>
                 <div className="chart-container">
                   <div ref={exitChartContainerRef} className="chart-surface"></div>
-                  <div className="chart-timezone-select">
-                    <select
-                      aria-label="Выбрать часовой пояс"
-                      value={timezone}
-                      onChange={(event) => setTimezone(event.target.value)}
-                    >
-                      {timezoneOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
                 </div>
                 {!exitCandles.length ? (
                   <div className="chart-empty">Нет данных для выбранной комбинации</div>

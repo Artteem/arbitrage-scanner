@@ -647,7 +647,11 @@ select:focus {
   align-items: center;
 }
 
-.pair-title select {
+.symbol-select {
+  position: relative;
+}
+
+.symbol-select-trigger {
   font-size: 22px;
   font-weight: 600;
   border: none;
@@ -655,10 +659,103 @@ select:focus {
   color: var(--fg);
   padding: 2px 0;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.pair-title select:focus {
+.symbol-select-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.symbol-select-chevron {
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 6px solid var(--fg-muted);
+  transition: transform 0.15s ease;
+}
+
+.symbol-select.open .symbol-select-chevron {
+  transform: rotate(180deg);
+}
+
+.symbol-select-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 220px;
+  background: var(--row);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.22);
+  z-index: 10;
+}
+
+.symbol-select-search {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+
+.symbol-select-search:focus {
   outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.symbol-select-options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.symbol-select-option {
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.symbol-select-option:hover,
+.symbol-select-option:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.symbol-select-option.active {
+  background: rgba(59, 130, 246, 0.16);
+  border-color: var(--accent);
+}
+
+.symbol-select-empty {
+  padding: 6px 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.pair-title button {
+  font-family: inherit;
 }
 
 .breadcrumb {
@@ -681,23 +778,22 @@ select:focus {
 
 
 .pair-main {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(320px, 1.4fr) minmax(320px, 1fr);
   gap: 20px;
   align-items: stretch;
 }
 
 .chart-column {
-  flex: 1 1 540px;
-  min-width: 320px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  height: 100%;
 }
 
 .pair-main .summary-card {
-  flex: 1 1 360px;
-  min-width: 320px;
+  min-width: 0;
   height: 100%;
 }
 
@@ -743,8 +839,10 @@ select:focus {
 
 .chart-timezone-select {
   position: absolute;
-  top: 8px;
+  bottom: 8px;
   right: 8px;
+  z-index: 2;
+  pointer-events: auto;
 }
 
 .chart-timezone-select select {
@@ -758,6 +856,7 @@ select:focus {
   border-radius: 6px;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18);
 }
 
 .chart-timezone-select select:focus {
@@ -899,5 +998,16 @@ select:focus {
     flex-direction: column;
     align-items: stretch;
     gap: 8px;
+  }
+}
+
+@media (max-width: 1040px) {
+  .pair-main {
+    grid-template-columns: 1fr;
+  }
+
+  .chart-column,
+  .pair-main .summary-card {
+    height: auto;
   }
 }
