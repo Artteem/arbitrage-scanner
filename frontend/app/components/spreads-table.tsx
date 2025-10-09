@@ -1,21 +1,22 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStats } from '../../lib/api';
 import { getWsBaseUrl } from '../../lib/config';
 import type { ApiStats, SpreadRow } from '../../lib/types';
 import { useTheme } from './useTheme';
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = 10;
+const STORAGE_KEY = 'spreads-table-settings';
 
-const formatPercent = (value: number | null | undefined, digits = 4) => {
+const formatPercent = (value: number | null | undefined, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';
   }
   return `${value.toFixed(digits)}%`;
 };
 
-const formatFundingPercent = (value: number | null | undefined, digits = 4) => {
+const formatFundingPercent = (value: number | null | undefined, digits = 2) => {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';
   }
@@ -72,6 +73,17 @@ type SortKey = 'entry' | 'funding';
 
 type WsStatus = 'connecting' | 'open' | 'closed';
 
+interface StoredTableSettings {
+  page?: number;
+  sortKey?: SortKey;
+  sortDir?: 'asc' | 'desc';
+  minEntry?: string;
+  minFunding?: string;
+  exchangeFilters?: Record<string, boolean>;
+  manualExchangeSelection?: boolean;
+  blacklist?: string[];
+}
+
 interface SpreadsTableProps {
   initialStats: ApiStats | null;
 }
@@ -89,6 +101,60 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
   const [minFunding, setMinFunding] = useState('0');
   const [manualExchangeSelection, setManualExchangeSelection] = useState(false);
   const [exchangeFilters, setExchangeFilters] = useState<Record<string, boolean>>({});
+  const [blacklist, setBlacklist] = useState<string[]>([]);
+  const [blacklistQuery, setBlacklistQuery] = useState('');
+  const [blacklistOpen, setBlacklistOpen] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const blacklistRef = useRef<HTMLDivElement | null>(null);
+  const blacklistInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (settingsLoaded) {
+      return;
+    }
+    if (typeof window === 'undefined') {
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        setSettingsLoaded(true);
+        return;
+      }
+      const stored = JSON.parse(raw) as StoredTableSettings;
+      if (stored.sortKey === 'entry' || stored.sortKey === 'funding') {
+        setSortKey(stored.sortKey);
+      }
+      if (stored.sortDir === 'asc' || stored.sortDir === 'desc') {
+        setSortDir(stored.sortDir);
+      }
+      if (typeof stored.page === 'number' && Number.isFinite(stored.page) && stored.page >= 1) {
+        setPage(Math.floor(stored.page));
+      }
+      if (typeof stored.minEntry === 'string') {
+        setMinEntry(stored.minEntry);
+      }
+      if (typeof stored.minFunding === 'string') {
+        setMinFunding(stored.minFunding);
+      }
+      if (typeof stored.manualExchangeSelection === 'boolean') {
+        setManualExchangeSelection(stored.manualExchangeSelection);
+      }
+      if (stored.exchangeFilters) {
+        setExchangeFilters(stored.exchangeFilters);
+      }
+      if (Array.isArray(stored.blacklist)) {
+        const normalized = stored.blacklist
+          .map((item) => String(item).toUpperCase())
+          .filter((item) => item.length > 0);
+        setBlacklist(Array.from(new Set(normalized)));
+      }
+    } catch (error) {
+      console.warn('Failed to load table settings', error);
+    } finally {
+      setSettingsLoaded(true);
+    }
+  }, [settingsLoaded]);
 
   useEffect(() => {
     const wsUrl = `${getWsBaseUrl()}/ws/spreads`;
@@ -142,39 +208,90 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
     return Array.from(collected).sort((a, b) => a.localeCompare(b));
   }, [rows, stats]);
 
+  const availablePairs = useMemo(() => {
+    const collected = new Set<string>();
+    stats?.symbols_subscribed?.forEach((symbol) => {
+      if (symbol) {
+        collected.add(String(symbol).toUpperCase());
+      }
+    });
+    rows.forEach((row) => {
+      if (row.symbol) {
+        collected.add(String(row.symbol).toUpperCase());
+      }
+    });
+    return Array.from(collected).sort((a, b) => a.localeCompare(b));
+  }, [rows, stats?.symbols_subscribed]);
+
+  const blacklistSet = useMemo(() => {
+    return new Set(blacklist.map((item) => item.toUpperCase()));
+  }, [blacklist]);
+
+  const filteredPairs = useMemo(() => {
+    const query = blacklistQuery.trim().toUpperCase();
+    return availablePairs
+      .filter((symbol) => {
+        if (blacklistSet.has(symbol)) {
+          return false;
+        }
+        if (!query) {
+          return true;
+        }
+        return symbol.includes(query);
+      })
+      .slice(0, 20);
+  }, [availablePairs, blacklistQuery, blacklistSet]);
+
   useEffect(() => {
-    if (!discoveredExchanges.length) {
+    if (!blacklistOpen) {
+      return;
+    }
+    const handleClick = (event: MouseEvent) => {
+      if (!blacklistRef.current) return;
+      if (!blacklistRef.current.contains(event.target as Node)) {
+        setBlacklistOpen(false);
+        setBlacklistQuery('');
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+    };
+  }, [blacklistOpen]);
+
+  useEffect(() => {
+    if (!discoveredExchanges.length || !settingsLoaded) {
       return;
     }
     setExchangeFilters((prev) => {
       if (!manualExchangeSelection) {
+        const allEnabled: Record<string, boolean> = {};
+        discoveredExchanges.forEach((ex) => {
+          allEnabled[ex] = true;
+        });
         const same =
           discoveredExchanges.length === Object.keys(prev).length &&
           discoveredExchanges.every((ex) => prev[ex] === true);
-        if (same) {
-          return prev;
-        }
-        const next: Record<string, boolean> = {};
-        discoveredExchanges.forEach((ex) => {
-          next[ex] = true;
-        });
-        return next;
+        return same ? prev : allEnabled;
       }
       const next: Record<string, boolean> = {};
+      let changed = false;
       discoveredExchanges.forEach((ex) => {
-        const key = ex;
-        if (Object.prototype.hasOwnProperty.call(prev, key)) {
-          next[key] = prev[key];
+        if (Object.prototype.hasOwnProperty.call(prev, ex)) {
+          next[ex] = prev[ex];
         } else {
-          next[key] = false;
+          next[ex] = false;
+          changed = true;
         }
       });
-      const same =
-        discoveredExchanges.length === Object.keys(prev).length &&
-        discoveredExchanges.every((ex) => prev[ex] === next[ex]);
-      return same ? prev : next;
+      Object.keys(prev).forEach((key) => {
+        if (!Object.prototype.hasOwnProperty.call(next, key)) {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
     });
-  }, [discoveredExchanges, manualExchangeSelection]);
+  }, [discoveredExchanges, manualExchangeSelection, settingsLoaded]);
 
   const processedRows = useMemo(() => {
     const minEntryValue = Number.parseFloat(minEntry.replace(',', '.'));
@@ -191,6 +308,10 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
     );
 
     const filtered = rows.filter((row) => {
+      const symbolUpper = String(row.symbol).toUpperCase();
+      if (blacklistSet.size > 0 && blacklistSet.has(symbolUpper)) {
+        return false;
+      }
       if (knownExchanges.size > 0) {
         const longKnown = knownExchanges.has(row.long_exchange);
         const shortKnown = knownExchanges.has(row.short_exchange);
@@ -221,7 +342,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
     });
 
     return filtered;
-  }, [rows, exchangeFilters, minEntry, minFunding, sortDir, sortKey]);
+  }, [rows, blacklistSet, exchangeFilters, minEntry, minFunding, sortDir, sortKey]);
 
   useEffect(() => {
     const totalPages = Math.max(1, Math.ceil(processedRows.length / PAGE_SIZE));
@@ -231,11 +352,39 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
     });
   }, [processedRows.length]);
 
+  useEffect(() => {
+    if (!settingsLoaded) {
+      return;
+    }
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const payload: StoredTableSettings = {
+      page,
+      sortKey,
+      sortDir,
+      minEntry,
+      minFunding,
+      exchangeFilters,
+      manualExchangeSelection,
+      blacklist,
+    };
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      console.warn('Failed to persist table settings', error);
+    }
+  }, [blacklist, exchangeFilters, manualExchangeSelection, minEntry, minFunding, page, settingsLoaded, sortDir, sortKey]);
+
   const totalRows = processedRows.length;
   const totalPages = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const start = (currentPage - 1) * PAGE_SIZE;
   const currentRows = processedRows.slice(start, start + PAGE_SIZE);
+  const pageNumbers = useMemo(
+    () => Array.from({ length: totalPages }, (_, index) => index + 1),
+    [totalPages],
+  );
 
   const handleSort = (key: SortKey) => {
     setSortKey((prevKey) => {
@@ -255,6 +404,25 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
       next[exchange] = !next[exchange];
       return next;
     });
+    setPage(1);
+  };
+
+  const handleBlacklistAdd = (symbol: string) => {
+    const upper = symbol.toUpperCase();
+    setBlacklist((prev) => {
+      if (prev.includes(upper)) {
+        return prev;
+      }
+      return [...prev, upper];
+    });
+    setBlacklistQuery('');
+    setBlacklistOpen(false);
+    setPage(1);
+  };
+
+  const handleBlacklistRemove = (symbol: string) => {
+    const upper = symbol.toUpperCase();
+    setBlacklist((prev) => prev.filter((item) => item !== upper));
     setPage(1);
   };
 
@@ -307,6 +475,77 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
             );
           })}
         </div>
+        <div className="blacklist-filter" ref={blacklistRef}>
+          <label>
+            Чёрный список
+            <div
+              className="multi-select"
+              onClick={() => {
+                blacklistInputRef.current?.focus();
+                setBlacklistOpen(true);
+              }}
+            >
+              {blacklist.map((symbol) => (
+                <span key={symbol} className="multi-chip">
+                  {symbol}
+                  <button
+                    type="button"
+                    className="chip-remove"
+                    onClick={() => handleBlacklistRemove(symbol)}
+                    aria-label={`Убрать ${symbol} из чёрного списка`}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              <input
+                ref={blacklistInputRef}
+                type="text"
+                value={blacklistQuery}
+                onChange={(event) => {
+                  setBlacklistQuery(event.target.value);
+                  setBlacklistOpen(true);
+                }}
+                onFocus={() => setBlacklistOpen(true)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    const normalized = event.currentTarget.value.trim().toUpperCase();
+                    if (normalized && availablePairs.includes(normalized)) {
+                      handleBlacklistAdd(normalized);
+                    } else if (filteredPairs.length === 1) {
+                      handleBlacklistAdd(filteredPairs[0]);
+                    }
+                  } else if (event.key === 'Escape') {
+                    setBlacklistOpen(false);
+                    setBlacklistQuery('');
+                    event.currentTarget.blur();
+                  } else if (event.key === 'Backspace' && !event.currentTarget.value && blacklist.length) {
+                    handleBlacklistRemove(blacklist[blacklist.length - 1]);
+                  }
+                }}
+                placeholder="Выберите пары"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+          </label>
+          {blacklistOpen ? (
+            <ul className="multi-options">
+              {filteredPairs.length ? (
+                filteredPairs.map((symbol) => (
+                  <li key={symbol}>
+                    <button type="button" onClick={() => handleBlacklistAdd(symbol)}>
+                      {symbol}
+                    </button>
+                  </li>
+                ))
+              ) : (
+                <li className="multi-empty">Нет совпадений</li>
+              )}
+            </ul>
+          ) : null}
+        </div>
         <div className="number-filter">
           <label>
             Мин. курсовой спред (%)
@@ -338,12 +577,13 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
       </section>
 
       <div className="card table-card">
-        <table className="spreads-table">
-          <thead>
-            <tr>
-              <th>Пара</th>
-              <th>LONG</th>
-              <th>SHORT</th>
+        <div className="table-scroll">
+          <table className="spreads-table">
+            <thead>
+              <tr>
+                <th>Пара</th>
+                <th>LONG</th>
+                <th>SHORT</th>
               <th
                 className="sort"
                 data-active={sortKey === 'entry'}
@@ -389,7 +629,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                         {row.long_exchange.toUpperCase()}
                       </a>
                       <div className="exchange-badge">
-                        фандинг: {formatFundingPercent(row.funding_long, 4)} /{' '}
+                        фандинг: {formatFundingPercent(row.funding_long)} /{' '}
                         {row.funding_interval_long || '—'}
                       </div>
                     </div>
@@ -404,7 +644,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                         {row.short_exchange.toUpperCase()}
                       </a>
                       <div className="exchange-badge">
-                        фандинг: {formatFundingPercent(row.funding_short, 4)} /{' '}
+                        фандинг: {formatFundingPercent(row.funding_short)} /{' '}
                         {row.funding_interval_short || '—'}
                       </div>
                     </div>
@@ -430,27 +670,43 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
               </tr>
             ) : null}
           </tbody>
-        </table>
+          </table>
+        </div>
         <div className="pager">
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-            disabled={currentPage <= 1}
-          >
-            Назад
-          </button>
-          <span>
+          <div className="pager-nav">
+            <button
+              type="button"
+              className="btn"
+              onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+              disabled={currentPage <= 1}
+            >
+              Назад
+            </button>
+            <div className="pager-pages">
+              {pageNumbers.map((pageNumber) => (
+                <button
+                  key={pageNumber}
+                  type="button"
+                  className={`pager-page${pageNumber === currentPage ? ' active' : ''}`}
+                  onClick={() => setPage(pageNumber)}
+                  aria-current={pageNumber === currentPage ? 'page' : undefined}
+                >
+                  {pageNumber}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+              disabled={currentPage >= totalPages}
+            >
+              Вперёд
+            </button>
+          </div>
+          <span className="pager-info">
             Страница {currentPage} из {totalPages} (всего {totalRows})
           </span>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-            disabled={currentPage >= totalPages}
-          >
-            Вперёд
-          </button>
         </div>
       </div>
     </div>
