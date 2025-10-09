@@ -670,24 +670,41 @@ select:focus {
 
 .symbol-select {
   position: relative;
+  display: inline-flex;
 }
 
 .symbol-select-trigger {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 600;
-  border: none;
+  border: 1px solid var(--border);
   background: transparent;
   color: var(--fg);
-  padding: 2px 0;
+  padding: 8px 14px;
+  border-radius: 8px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.symbol-select-trigger:hover {
+  border-color: var(--accent);
 }
 
 .symbol-select-trigger:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.symbol-select.open .symbol-select-trigger {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.symbol-select-label {
+  line-height: 1.2;
 }
 
 .symbol-select-chevron {

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStats } from '../../lib/api';
 import { getWsBaseUrl } from '../../lib/config';
+import { formatPairLabel } from '../../lib/format';
 import type { ApiStats, SpreadRow } from '../../lib/types';
 import { useTheme } from './useTheme';
 
@@ -514,19 +515,22 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                 setBlacklistOpen(true);
               }}
             >
-              {blacklist.map((symbol) => (
-                <span key={symbol} className="multi-chip">
-                  {symbol}
-                  <button
-                    type="button"
-                    className="chip-remove"
-                    onClick={() => handleBlacklistRemove(symbol)}
-                    aria-label={`Убрать ${symbol} из чёрного списка`}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
+              {blacklist.map((symbol) => {
+                const label = formatPairLabel(symbol);
+                return (
+                  <span key={symbol} className="multi-chip">
+                    {label}
+                    <button
+                      type="button"
+                      className="chip-remove"
+                      onClick={() => handleBlacklistRemove(symbol)}
+                      aria-label={`Убрать ${label || symbol} из чёрного списка`}
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })}
               <input
                 ref={blacklistInputRef}
                 type="text"
@@ -553,7 +557,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                     handleBlacklistRemove(blacklist[blacklist.length - 1]);
                   }
                 }}
-                placeholder="Выберите пары"
+                placeholder="Выберите монеты"
                 autoComplete="off"
                 spellCheck={false}
               />
@@ -562,13 +566,16 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
           {blacklistOpen ? (
             <ul className="multi-options">
               {filteredPairs.length ? (
-                filteredPairs.map((symbol) => (
-                  <li key={symbol}>
-                    <button type="button" onClick={() => handleBlacklistAdd(symbol)}>
-                      {symbol}
-                    </button>
-                  </li>
-                ))
+                filteredPairs.map((symbol) => {
+                  const label = formatPairLabel(symbol);
+                  return (
+                    <li key={symbol}>
+                      <button type="button" onClick={() => handleBlacklistAdd(symbol)}>
+                        {label}
+                      </button>
+                    </li>
+                  );
+                })
               ) : (
                 <li className="multi-empty">Нет совпадений</li>
               )}
@@ -610,7 +617,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
           <table className="spreads-table">
             <thead>
               <tr>
-                <th>Пара</th>
+                <th>Монета</th>
                 <th>LONG</th>
                 <th>SHORT</th>
               <th
@@ -636,6 +643,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
           <tbody>
             {currentRows.map((row) => {
               const pairUrl = `/pair/${encodeURIComponent(row.symbol)}?long=${encodeURIComponent(row.long_exchange)}&short=${encodeURIComponent(row.short_exchange)}`;
+              const displaySymbol = formatPairLabel(row.symbol);
               return (
                 <tr key={`${row.symbol}-${row.long_exchange}-${row.short_exchange}`}>
                   <td>
@@ -645,7 +653,7 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                       rel="noopener noreferrer"
                       className="pair-link"
                     >
-                      {row.symbol}
+                      {displaySymbol}
                     </a>
                   </td>
                   <td>

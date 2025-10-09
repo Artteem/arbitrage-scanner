@@ -9,6 +9,7 @@ import {
   usePairSpreads,
   useStats,
 } from '../../lib/api';
+import { formatPairLabel } from '../../lib/format';
 import type { PairSelection, SpreadRow } from '../../lib/types';
 import {
   LineStyle,
@@ -921,10 +922,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const documentTitleEntry = entryPct !== null ? entryPct.toFixed(2) : '—';
   const documentTitleExit = exitPct !== null ? exitPct.toFixed(2) : '—';
 
+  const displaySymbol = useMemo(() => formatPairLabel(symbolUpper), [symbolUpper]);
+
   useEffect(() => {
     if (typeof document === 'undefined') return;
-    document.title = `${documentTitleEntry} | ${documentTitleExit} | ${symbolUpper}`;
-  }, [documentTitleEntry, documentTitleExit, symbolUpper]);
+    document.title = `${documentTitleEntry} | ${documentTitleExit} | ${displaySymbol}`;
+  }, [displaySymbol, documentTitleEntry, documentTitleExit]);
 
   useEffect(() => {
     if (!symbolDropdownOpen) return;
@@ -970,7 +973,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
               aria-haspopup="listbox"
               aria-expanded={symbolDropdownOpen}
             >
-              {symbolUpper}
+              <span className="symbol-select-label">{displaySymbol}</span>
               <span className="symbol-select-chevron" aria-hidden="true" />
             </button>
             {symbolDropdownOpen ? (
@@ -991,7 +994,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                       setSymbolDropdownOpen(false);
                     }
                   }}
-                  placeholder="Поиск пары"
+                  placeholder="Поиск монеты"
                   className="symbol-select-search"
                   spellCheck={false}
                 />
@@ -1006,7 +1009,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                           }`}
                           onClick={() => handleSymbolSelect(item)}
                         >
-                          {item}
+                          {formatPairLabel(item)}
                         </button>
                       </li>
                     ))
