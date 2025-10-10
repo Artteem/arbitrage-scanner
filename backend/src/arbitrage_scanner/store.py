@@ -54,6 +54,7 @@ class TickerStore:
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
         self._listeners: list[Callable[[], None | Awaitable[None]]] = []
+        self._latency_warnings: Dict[Key, float] = {}
 
     def add_listener(self, listener: Callable[[], None | Awaitable[None]]) -> None:
         self._listeners.append(listener)
@@ -94,6 +95,17 @@ class TickerStore:
         ):
             return
         self._latest[key] = t
+
+        latency = t.latency
+        if latency is not None and latency > 1.5:
+            now = time.time()
+            last_warn = self._latency_warnings.get(key, 0.0)
+            if now - last_warn > 5.0:
+                self._latency_warnings[key] = now
+                logger.warning(
+                    "High latency %.3fs for %s %s", latency, t.exchange, t.symbol
+                )
+
         self._notify_listeners()
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:

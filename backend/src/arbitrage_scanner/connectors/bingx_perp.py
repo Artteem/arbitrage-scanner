@@ -187,6 +187,7 @@ async def _run_bingx_ws_tickers(
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
+                    received_at = now_ts()
                     event_ts = pick_timestamp(
                         payload.get("time"),
                         payload.get("ts"),
@@ -195,7 +196,7 @@ async def _run_bingx_ws_tickers(
                         msg.get("ts"),
                         msg.get("time"),
                         msg.get("timestamp"),
-                        default=now_ts(),
+                        default=received_at,
                     )
 
                     bid = _extract_price(
@@ -240,7 +241,8 @@ async def _run_bingx_ws_tickers(
                             symbol=common_symbol,
                             bid=bid,
                             ask=ask,
-                            ts=event_ts,
+                            ts=received_at,
+                            event_ts=event_ts,
                         )
                     )
                     if ready_event and not ready_event.is_set():
@@ -288,6 +290,7 @@ async def _run_bingx_orderbooks(
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
+                    received_at = now_ts()
                     event_ts = pick_timestamp(
                         payload.get("time"),
                         payload.get("ts"),
@@ -296,7 +299,7 @@ async def _run_bingx_orderbooks(
                         msg.get("ts"),
                         msg.get("time"),
                         msg.get("timestamp"),
-                        default=now_ts(),
+                        default=received_at,
                     )
 
                     bids, asks, last_price = _extract_depth_payload(payload)
@@ -308,7 +311,7 @@ async def _run_bingx_orderbooks(
                         common_symbol,
                         bids=bids or None,
                         asks=asks or None,
-                        ts=event_ts,
+                        ts=received_at,
                         last_price=last_price,
                         last_price_ts=event_ts if last_price is not None else None,
                     )
@@ -320,7 +323,8 @@ async def _run_bingx_orderbooks(
                                 symbol=common_symbol,
                                 bid=bids[0][0],
                                 ask=asks[0][0],
-                                ts=event_ts,
+                                ts=received_at,
+                                event_ts=event_ts,
                             )
                         )
         except asyncio.CancelledError:
@@ -759,7 +763,7 @@ async def _poll_bingx_http(
 
     async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
         while True:
-            now = now_ts()
+            batch_received_at = now_ts()
             params = param_candidates[params_idx]
             url = TICKERS_URLS[url_idx]
             try:
@@ -852,7 +856,7 @@ async def _poll_bingx_http(
                     raw.get("ts"),
                     raw.get("time"),
                     raw.get("updateTime"),
-                    default=now,
+                    default=batch_received_at,
                 )
 
                 store.upsert_ticker(
@@ -861,7 +865,8 @@ async def _poll_bingx_http(
                         symbol=common_symbol,
                         bid=bid,
                         ask=ask,
-                        ts=event_ts,
+                        ts=batch_received_at,
+                        event_ts=event_ts,
                     )
                 )
 

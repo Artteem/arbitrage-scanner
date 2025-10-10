@@ -101,17 +101,25 @@ async def _run_bybit_tickers(store: TickerStore, subscribe: Sequence[Symbol]):
                     except Exception:
                         bid = ask = 0.0
 
+                    received_at = now_ts()
                     event_ts = pick_timestamp(
                         item.get("ts"),
                         item.get("time"),
                         item.get("eventTime"),
                         data.get("ts"),
-                        default=now_ts(),
+                        default=received_at,
                     )
 
                     if bid > 0 and ask > 0:
                         store.upsert_ticker(
-                            Ticker(exchange="bybit", symbol=sym, bid=bid, ask=ask, ts=event_ts)
+                            Ticker(
+                                exchange="bybit",
+                                symbol=sym,
+                                bid=bid,
+                                ask=ask,
+                                ts=received_at,
+                                event_ts=event_ts,
+                            )
                         )
 
                     fr = item.get("fundingRate")
@@ -145,6 +153,7 @@ async def _run_bybit_tickers(store: TickerStore, subscribe: Sequence[Symbol]):
                                 "bybit",
                                 sym,
                                 last_price=last_price,
+                                ts=received_at,
                                 last_price_ts=last_price_ts,
                             )
         except ConnectionClosed:
@@ -204,12 +213,13 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                     if not bids and not asks:
                         continue
 
+                    received_at = now_ts()
                     event_ts = pick_timestamp(
                         item.get("ts"),
                         item.get("time"),
                         data.get("ts"),
                         data.get("sentTime"),
-                        default=now_ts(),
+                        default=received_at,
                     )
 
                     book = books.setdefault(sym, _OrderBookState())
@@ -225,7 +235,7 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                             sym,
                             bids=best_bids or None,
                             asks=best_asks or None,
-                            ts=event_ts,
+                            ts=received_at,
                         )
 
                     best_bid_price = best_bids[0][0] if best_bids else book.best_bid_price()
@@ -243,7 +253,8 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                                 symbol=sym,
                                 bid=best_bid_price,
                                 ask=best_ask_price,
-                                ts=event_ts,
+                                ts=received_at,
+                                event_ts=event_ts,
                             )
                         )
         except ConnectionClosed:

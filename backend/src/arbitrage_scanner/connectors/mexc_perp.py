@@ -100,7 +100,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
 
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
-            now = now_ts()
+            batch_received_at = now_ts()
             try:
                 ticker_resp = await client.get(TICKERS_URL)
                 ticker_resp.raise_for_status()
@@ -125,7 +125,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                         item.get("timestamp"),
                         item.get("ts"),
                         item.get("time"),
-                        default=now,
+                        default=batch_received_at,
                     )
                     funding_map[sym_raw] = (rate, interval, funding_ts)
             except Exception:
@@ -153,7 +153,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                     item.get("ts"),
                     item.get("time"),
                     item.get("updateTime"),
-                    default=now,
+                    default=batch_received_at,
                 )
 
                 store.upsert_ticker(
@@ -162,7 +162,8 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                         symbol=sym_common,
                         bid=bid,
                         ask=ask,
-                        ts=event_ts,
+                        ts=batch_received_at,
+                        event_ts=event_ts,
                     )
                 )
 
@@ -229,13 +230,14 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                 bids, asks = book.top_levels()
                 last_price = _extract_last_price(data)
 
+                received_at = now_ts()
                 event_ts = pick_timestamp(
                     data.get("timestamp"),
                     data.get("ts"),
                     data.get("time"),
                     msg.get("ts") if isinstance(msg, dict) else None,
                     msg.get("time") if isinstance(msg, dict) else None,
-                    default=now_ts(),
+                    default=received_at,
                 )
 
                 store.upsert_order_book(
@@ -243,7 +245,7 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                     sym_common,
                     bids=bids or None,
                     asks=asks or None,
-                    ts=event_ts,
+                    ts=received_at,
                     last_price=last_price,
                     last_price_ts=event_ts if last_price is not None else None,
                 )
@@ -255,7 +257,8 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                             symbol=sym_common,
                             bid=bids[0][0],
                             ask=asks[0][0],
-                            ts=event_ts,
+                            ts=received_at,
+                            event_ts=event_ts,
                         )
                     )
         except asyncio.CancelledError:
