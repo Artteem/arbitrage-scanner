@@ -35,6 +35,14 @@ class OrderBookData:
 
 Key = Tuple[ExchangeName, Symbol]
 
+
+def _normalize_exchange(name: ExchangeName) -> ExchangeName:
+    return ExchangeName(str(name).strip().lower())
+
+
+def _normalize_symbol(symbol: Symbol) -> Symbol:
+    return Symbol(str(symbol).strip().upper())
+
 class Funding:
     __slots__ = ("rate", "interval", "ts")
     def __init__(self, rate: float = 0.0, interval: str = "", ts: float = 0.0) -> None:
@@ -85,7 +93,12 @@ class TickerStore:
                     loop.create_task(result)
 
     def upsert_ticker(self, t: Ticker) -> None:
-        key = (t.exchange, t.symbol)
+        exchange = _normalize_exchange(t.exchange)
+        symbol = _normalize_symbol(t.symbol)
+        if t.exchange != exchange or t.symbol != symbol:
+            t = t.model_copy(update={"exchange": exchange, "symbol": symbol})
+
+        key = (exchange, symbol)
         previous = self._latest.get(key)
         if (
             previous is not None
@@ -109,6 +122,8 @@ class TickerStore:
         self._notify_listeners()
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
+        exchange = _normalize_exchange(exchange)
+        symbol = _normalize_symbol(symbol)
         key = (exchange, symbol)
         prev = self._funding.get(key)
         if prev is not None and prev.rate == rate and prev.interval == interval:
@@ -128,6 +143,8 @@ class TickerStore:
         last_price: float | None = None,
         last_price_ts: float | None = None,
     ) -> None:
+        exchange = _normalize_exchange(exchange)
+        symbol = _normalize_symbol(symbol)
         key = (exchange, symbol)
         ob = self._order_books.get(key)
         changed = False
@@ -179,21 +196,28 @@ class TickerStore:
         return {ex for (ex, _) in self._latest.keys()}
 
     def get_ticker(self, exchange: ExchangeName, symbol: Symbol) -> Ticker | None:
+        exchange = _normalize_exchange(exchange)
+        symbol = _normalize_symbol(symbol)
         return self._latest.get((exchange, symbol))
 
     def get_funding(self, exchange: ExchangeName, symbol: Symbol) -> Funding | None:
+        exchange = _normalize_exchange(exchange)
+        symbol = _normalize_symbol(symbol)
         return self._funding.get((exchange, symbol))
 
     def by_symbol(self, symbol: Symbol) -> dict:
+        target = _normalize_symbol(symbol)
         d: Dict[ExchangeName, dict] = {}
         for (ex, sym), t in self._latest.items():
-            if sym == symbol:
+            if sym == target:
                 f = self._funding.get((ex, sym))
                 ob = self._order_books.get((ex, sym))
                 d[ex] = {"ticker": t, "funding": f, "order_book": ob.copy() if ob else None}
         return d
 
     def get_order_book(self, exchange: ExchangeName, symbol: Symbol) -> OrderBookData | None:
+        exchange = _normalize_exchange(exchange)
+        symbol = _normalize_symbol(symbol)
         ob = self._order_books.get((exchange, symbol))
         if not ob:
             return None

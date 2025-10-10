@@ -771,6 +771,24 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     return realtimeRow ?? overviewRow ?? null;
   }, [overviewRow, realtimeRow]);
 
+  const { showSkewIndicator, skewMs } = useMemo(() => {
+    const candidate = activeRow ?? realtimeRow ?? overviewRow ?? null;
+    const skewSeconds =
+      candidate && typeof candidate.skew_seconds === 'number' && Number.isFinite(candidate.skew_seconds)
+        ? candidate.skew_seconds
+        : null;
+    const ms = skewSeconds !== null ? Math.round(skewSeconds * 1000) : null;
+    return {
+      showSkewIndicator: Boolean((candidate?.skewed ?? false) && ms !== null && ms > 0),
+      skewMs: ms,
+    };
+  }, [activeRow, overviewRow, realtimeRow]);
+
+  const skewTitle =
+    showSkewIndicator && skewMs !== null
+      ? `Разница времени обновления ${skewMs.toLocaleString('ru-RU')} мс`
+      : undefined;
+
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
@@ -1372,7 +1390,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
               aria-haspopup="listbox"
               aria-expanded={symbolDropdownOpen}
             >
-              <span className="symbol-select-label">{displaySymbol}</span>
+              <span className="symbol-select-label">
+                <span className="pair-name">
+                  {showSkewIndicator ? <span className="pair-lag-dot" title={skewTitle} /> : null}
+                  <span>{displaySymbol}</span>
+                </span>
+              </span>
               <span className="symbol-select-chevron" aria-hidden="true" />
             </button>
             {symbolDropdownOpen ? (

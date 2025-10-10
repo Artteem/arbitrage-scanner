@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import NotRequired, TypedDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import time
 
 # Биржа теперь задаётся строкой, чтобы можно было подключать произвольные коннекторы
@@ -24,6 +24,16 @@ class Ticker(BaseModel):
     ask: float = Field(gt=0)
     ts: float = Field(default_factory=lambda: time.time())
     event_ts: float | None = None
+
+    @field_validator("exchange", mode="before")
+    @classmethod
+    def _normalize_exchange(cls, value: ExchangeName) -> ExchangeName:
+        return ExchangeName(str(value).strip().lower())
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: Symbol) -> Symbol:
+        return Symbol(str(value).strip().upper())
 
     @property
     def mid(self) -> float:

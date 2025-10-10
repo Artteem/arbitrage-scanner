@@ -1,11 +1,17 @@
 from __future__ import annotations
-import asyncio, json, time, math
+
+import asyncio
+import json
+import time
+import logging
 from typing import Sequence, List
+
 import websockets
+
 from ..domain import Ticker, Symbol
 from ..store import TickerStore
 from .discovery import discover_binance_usdt_perp
-from .utils import pick_timestamp, now_ts
+from .utils import pick_timestamp, now_ts, iter_ws_messages
 
 BOOK_WS = "wss://fstream.binance.com/stream"
 MARK_WS = "wss://fstream.binance.com/stream"
@@ -28,6 +34,8 @@ def _stream_name_trade(sym: str) -> str:
 
 CHUNK = 100  # безопасный размер пакета подписки
 
+logger = logging.getLogger(__name__)
+
 async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
     subscribe = list(dict.fromkeys(symbols))  # сохраняем порядок без дубликатов
     if len(subscribe) < MIN_SYMBOL_THRESHOLD:
@@ -43,18 +51,29 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
 
     async def _consume(endpoint: str, params: List[str], handler):
         # отдельное соединение на каждый батч
+        stream_label = f"{endpoint}:{','.join(params[:3])}" if params else endpoint
         async for ws in _reconnect(endpoint):
             try:
                 sub = {"method": "SUBSCRIBE", "params": params, "id": int(time.time())}
                 await ws.send(json.dumps(sub))
-                async for msg in ws:
+                async for msg in iter_ws_messages(
+                    ws,
+                    ping_interval=5.0,
+                    max_idle=20.0,
+                    name=f"binance:{stream_label}",
+                ):
                     data = json.loads(msg)
                     d = data.get("data")
                     if not d:
                         continue
                     await handler(d)
+            except asyncio.CancelledError:
+                raise
+            except RuntimeError as exc:
+                logger.warning("Binance stream %s idle: %s", stream_label, exc)
             except Exception:
-                await asyncio.sleep(1)
+                logger.exception("Binance stream %s error", stream_label, exc_info=True)
+            await asyncio.sleep(1)
 
     async def _handle_book(d):
         # d: { s, b, a, ... }
@@ -177,7 +196,12 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
 async def _reconnect(url: str):
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=None,
+                close_timeout=5,
+                max_queue=None,
+            ) as ws:
                 yield ws
         except Exception:
             await asyncio.sleep(2)

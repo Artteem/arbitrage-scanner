@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, AsyncIterator
+
+from websockets.exceptions import ConnectionClosed
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_numeric(value: Any) -> float | None:
@@ -59,4 +65,41 @@ def now_ts() -> float:
     """Explicit helper to obtain the current wall clock timestamp in seconds."""
 
     return time.time()
+
+
+async def iter_ws_messages(
+    ws,
+    *,
+    ping_interval: float = 10.0,
+    max_idle: float = 30.0,
+    name: str = "ws",
+) -> AsyncIterator[str | bytes]:
+    """Iterate websocket messages while proactively pinging to avoid stalls."""
+
+    last_message = time.time()
+    while True:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=ping_interval)
+        except asyncio.TimeoutError:
+            idle = time.time() - last_message
+            if idle >= max_idle:
+                raise RuntimeError(f"{name} idle for {idle:.1f}s")
+            try:
+                pong_waiter = ws.ping()
+                if pong_waiter is not None:
+                    await asyncio.wait_for(pong_waiter, timeout=ping_interval)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("%s ping failed: %s", name, exc)
+                raise RuntimeError(f"{name} ping failed") from exc
+            continue
+        except ConnectionClosed:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("%s receive error: %s", name, exc)
+            raise RuntimeError(f"{name} receive failed") from exc
+
+        last_message = time.time()
+        yield raw
 

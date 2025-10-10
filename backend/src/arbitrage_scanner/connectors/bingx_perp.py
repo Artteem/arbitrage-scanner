@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import zlib
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -13,7 +14,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
 from .discovery import discover_bingx_usdt_perp
-from .utils import pick_timestamp, now_ts
+from .utils import pick_timestamp, now_ts, iter_ws_messages
 
 TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
@@ -38,6 +39,8 @@ WS_ENDPOINTS = (
 WS_SUB_CHUNK = 80
 WS_SUB_DELAY = 0.05
 MIN_SYMBOL_THRESHOLD = 5
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
@@ -169,7 +172,12 @@ async def _run_bingx_ws_tickers(
                 await _send_ws_subscriptions(ws, batch)
                 await asyncio.sleep(WS_SUB_DELAY)
 
-            async for raw_msg in ws:
+            async for raw_msg in iter_ws_messages(
+                ws,
+                ping_interval=6.0,
+                max_idle=20.0,
+                name="bingx:ticker",
+            ):
                 msg = _decode_ws_message(raw_msg)
                 if msg is None:
                     continue
@@ -249,7 +257,11 @@ async def _run_bingx_ws_tickers(
                         ready_event.set()
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            logger.warning("BingX ticker stream stalled: %s", exc)
+            await asyncio.sleep(1.0)
         except Exception:
+            logger.exception("BingX ticker stream error", exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -272,7 +284,12 @@ async def _run_bingx_orderbooks(
                 await _send_ws_depth_subscriptions(ws, batch)
                 await asyncio.sleep(WS_SUB_DELAY)
 
-            async for raw_msg in ws:
+            async for raw_msg in iter_ws_messages(
+                ws,
+                ping_interval=6.0,
+                max_idle=20.0,
+                name="bingx:depth",
+            ):
                 msg = _decode_ws_message(raw_msg)
                 if msg is None:
                     continue
@@ -329,7 +346,11 @@ async def _run_bingx_orderbooks(
                         )
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            logger.warning("BingX depth stream stalled: %s", exc)
+            await asyncio.sleep(1.0)
         except Exception:
+            logger.exception("BingX depth stream error", exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -340,7 +361,10 @@ async def _reconnect_ws():
         idx += 1
         try:
             async with websockets.connect(
-                endpoint, ping_interval=20, ping_timeout=20, close_timeout=5
+                endpoint,
+                ping_interval=None,
+                close_timeout=5,
+                max_queue=None,
             ) as ws:
                 yield ws
         except asyncio.CancelledError:
