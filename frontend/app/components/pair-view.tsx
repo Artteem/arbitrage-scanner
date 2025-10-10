@@ -90,6 +90,7 @@ const TIMEFRAME_SECONDS_MAP: Record<(typeof TIMEFRAMES)[number], number> = {
   '1h': 3600,
 };
 const LOOKBACK_SECONDS = LOOKBACK_DAYS * 24 * 60 * 60;
+const DEFAULT_VISIBLE_PERIODS = 60;
 
 const getTimeframeSeconds = (
   explicit: number | null | undefined,
@@ -130,6 +131,44 @@ const pruneBuffer = (buffer: CandleDataPoint[]) => {
     removed += 1;
   }
   return removed;
+};
+
+const applyDefaultVisibleRange = (
+  chart: IChartApi | null,
+  buffer: CandleDataPoint[],
+  timeframeSeconds: number,
+) => {
+  if (!chart || !buffer.length) {
+    return;
+  }
+  if (!Number.isFinite(timeframeSeconds) || timeframeSeconds <= 0) {
+    const scale = chart.timeScale();
+    if (typeof scale.fitContent === 'function') {
+      scale.fitContent();
+    }
+    return;
+  }
+
+  const scale = chart.timeScale();
+  const lastIndex = buffer.length - 1;
+  const lastPoint = buffer[lastIndex];
+  if (!lastPoint) {
+    return;
+  }
+  const lastTime = lastPoint.time;
+
+  const fromIndex = Math.max(0, lastIndex - (DEFAULT_VISIBLE_PERIODS - 1));
+  const rangeFromExisting = buffer[fromIndex]?.time ?? lastTime;
+  const paddedFrom = (lastTime - timeframeSeconds * (DEFAULT_VISIBLE_PERIODS - 1)) as UTCTimestamp;
+  const fromTime = (buffer.length >= DEFAULT_VISIBLE_PERIODS
+    ? rangeFromExisting
+    : (Math.max(0, paddedFrom) as UTCTimestamp));
+
+  if (typeof scale.setVisibleRange === 'function') {
+    scale.setVisibleRange({ from: fromTime, to: lastTime });
+  } else if (typeof scale.fitContent === 'function') {
+    scale.fitContent();
+  }
 };
 
 const appendLiveCandle = (
@@ -183,13 +222,7 @@ const appendLiveCandle = (
   }
   if (chart) {
     const scale = chart.timeScale();
-    if (dropped > 0) {
-      if (buffer.length > 1 && typeof scale.setVisibleRange === 'function') {
-        scale.setVisibleRange({ from: buffer[0].time, to: buffer[buffer.length - 1].time });
-      } else if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
-      }
-    }
+    applyDefaultVisibleRange(chart, buffer, timeframeSeconds);
     if (typeof scale.scrollToRealTime === 'function') {
       scale.scrollToRealTime();
     }
@@ -679,12 +712,28 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const zeroLineRef = useRef<IPriceLine | null>(null);
   const entrySeriesDataRef = useRef<CandleDataPoint[]>([]);
+  const entryTimeframeSecondsRef = useRef<number>(getTimeframeSeconds(null, timeframe));
 
   const exitChartContainerRef = useRef<HTMLDivElement | null>(null);
   const exitChartRef = useRef<IChartApi | null>(null);
   const exitSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const exitZeroLineRef = useRef<IPriceLine | null>(null);
   const exitSeriesDataRef = useRef<CandleDataPoint[]>([]);
+  const exitTimeframeSecondsRef = useRef<number>(getTimeframeSeconds(null, timeframe));
+
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+    const interval = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 250);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -740,10 +789,11 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
     if (entrySeriesDataRef.current.length) {
       series.setData(entrySeriesDataRef.current);
-      const scale = chart.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
+      let timeframeSeconds = entryTimeframeSecondsRef.current;
+      if (!Number.isFinite(timeframeSeconds) || timeframeSeconds <= 0) {
+        timeframeSeconds = getTimeframeSeconds(null, timeframeRef.current);
       }
+      applyDefaultVisibleRange(chart, entrySeriesDataRef.current, timeframeSeconds);
     }
 
     const observer = new ResizeObserver((entries) => {
@@ -825,10 +875,11 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
     if (exitSeriesDataRef.current.length) {
       series.setData(exitSeriesDataRef.current);
-      const scale = chart.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
+      let timeframeSeconds = exitTimeframeSecondsRef.current;
+      if (!Number.isFinite(timeframeSeconds) || timeframeSeconds <= 0) {
+        timeframeSeconds = getTimeframeSeconds(null, timeframeRef.current);
       }
+      applyDefaultVisibleRange(chart, exitSeriesDataRef.current, timeframeSeconds);
     }
 
     const observer = new ResizeObserver((entries) => {
@@ -889,7 +940,10 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       lineStyle: LineStyle.Solid,
       axisLabelVisible: true,
     });
-    chart.timeScale().fitContent();
+    const timeframeSeconds = Number.isFinite(entryTimeframeSecondsRef.current)
+      ? entryTimeframeSecondsRef.current
+      : getTimeframeSeconds(null, timeframeRef.current);
+    applyDefaultVisibleRange(chart, entrySeriesDataRef.current, timeframeSeconds);
   }, [theme, timeframe, timezone]);
 
   useEffect(() => {
@@ -935,7 +989,10 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       lineStyle: LineStyle.Solid,
       axisLabelVisible: true,
     });
-    chart.timeScale().fitContent();
+    const timeframeSeconds = Number.isFinite(exitTimeframeSecondsRef.current)
+      ? exitTimeframeSecondsRef.current
+      : getTimeframeSeconds(null, timeframeRef.current);
+    applyDefaultVisibleRange(chart, exitSeriesDataRef.current, timeframeSeconds);
   }, [theme, timeframe, timezone]);
 
   useEffect(() => {
@@ -950,15 +1007,17 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     }
 
     const data = candles.map(toCandleDataPoint).sort((a, b) => a.time - b.time);
+    const timeframeSeconds = getTimeframeSeconds(
+      entrySpreadsData?.timeframe_seconds,
+      timeframeRef.current,
+    );
+    entryTimeframeSecondsRef.current = timeframeSeconds;
     entrySeriesDataRef.current = data;
     series?.setData(data);
     if (chart) {
-      const scale = chart.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
-      }
+      applyDefaultVisibleRange(chart, data, timeframeSeconds);
     }
-  }, [entrySpreadsData?.candles]);
+  }, [entrySpreadsData?.candles, entrySpreadsData?.timeframe_seconds]);
 
   useEffect(() => {
     const candles = exitSpreadsData?.candles ?? [];
@@ -972,36 +1031,42 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     }
 
     const data = candles.map(toCandleDataPoint).sort((a, b) => a.time - b.time);
+    const timeframeSeconds = getTimeframeSeconds(
+      exitSpreadsData?.timeframe_seconds,
+      timeframeRef.current,
+    );
+    exitTimeframeSecondsRef.current = timeframeSeconds;
     exitSeriesDataRef.current = data;
     series?.setData(data);
     if (chart) {
-      const scale = chart.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
-      }
+      applyDefaultVisibleRange(chart, data, timeframeSeconds);
     }
-  }, [exitSpreadsData?.candles]);
+  }, [exitSpreadsData?.candles, exitSpreadsData?.timeframe_seconds]);
 
   useEffect(() => {
     entrySeriesDataRef.current = [];
+    entryTimeframeSecondsRef.current = getTimeframeSeconds(null, timeframe);
     if (seriesRef.current) {
       seriesRef.current.setData([]);
     }
     if (chartRef.current) {
-      const scale = chartRef.current.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
-      }
+      applyDefaultVisibleRange(
+        chartRef.current,
+        entrySeriesDataRef.current,
+        entryTimeframeSecondsRef.current,
+      );
     }
     exitSeriesDataRef.current = [];
+    exitTimeframeSecondsRef.current = getTimeframeSeconds(null, timeframe);
     if (exitSeriesRef.current) {
       exitSeriesRef.current.setData([]);
     }
     if (exitChartRef.current) {
-      const scale = exitChartRef.current.timeScale();
-      if (typeof scale.fitContent === 'function') {
-        scale.fitContent();
-      }
+      applyDefaultVisibleRange(
+        exitChartRef.current,
+        exitSeriesDataRef.current,
+        exitTimeframeSecondsRef.current,
+      );
     }
   }, [selection, timeframe]);
 
@@ -1096,6 +1161,9 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         minute: '2-digit',
         second: '2-digit',
       }).format(new Date(lastUpdatedTs * 1000))
+    : null;
+  const latencyMs = lastUpdatedTs
+    ? Math.max(0, Math.round(nowMs - lastUpdatedTs * 1000))
     : null;
 
   const handleReverse = () => {
@@ -1298,8 +1366,16 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
             <div className="chart-card">
               <div className="chart-card-header">
                 <h2>Вход %</h2>
-                {lastUpdatedLabel ? (
-                  <span className="muted small">Обновлено: {lastUpdatedLabel}</span>
+                {lastUpdatedLabel || latencyMs !== null ? (
+                  <span className="muted small">
+                    {lastUpdatedLabel ? `Обновлено: ${lastUpdatedLabel}` : null}
+                    {latencyMs !== null ? (
+                      <>
+                        {lastUpdatedLabel ? ' · ' : null}
+                        Задержка: {latencyMs.toLocaleString('ru-RU')} мс
+                      </>
+                    ) : null}
+                  </span>
                 ) : null}
               </div>
               <div className="chart-container">
