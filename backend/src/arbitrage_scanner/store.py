@@ -1,6 +1,8 @@
 from __future__ import annotations
+import asyncio
+import logging
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Tuple
+from typing import Awaitable, Callable, Dict, Iterable, List, Tuple
 from .domain import Ticker, ExchangeName, Symbol
 import time
 
@@ -43,17 +45,64 @@ class Funding:
     def to_dict(self) -> dict:
         return {"rate": self.rate, "interval": self.interval, "ts": self.ts}
 
+logger = logging.getLogger(__name__)
+
+
 class TickerStore:
     def __init__(self) -> None:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
+        self._listeners: list[Callable[[], None | Awaitable[None]]] = []
+
+    def add_listener(self, listener: Callable[[], None | Awaitable[None]]) -> None:
+        self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[], None | Awaitable[None]]) -> None:
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _notify_listeners(self) -> None:
+        if not self._listeners:
+            return
+        loop = None
+        for listener in list(self._listeners):
+            try:
+                result = listener()
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("TickerStore listener failed", exc_info=True)
+                continue
+            if asyncio.iscoroutine(result):
+                if loop is None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                if loop is not None:
+                    loop.create_task(result)
 
     def upsert_ticker(self, t: Ticker) -> None:
-        self._latest[(t.exchange, t.symbol)] = t
+        key = (t.exchange, t.symbol)
+        previous = self._latest.get(key)
+        if (
+            previous is not None
+            and previous.bid == t.bid
+            and previous.ask == t.ask
+        ):
+            return
+        self._latest[key] = t
+        self._notify_listeners()
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
-        self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)
+        key = (exchange, symbol)
+        prev = self._funding.get(key)
+        if prev is not None and prev.rate == rate and prev.interval == interval:
+            if prev.ts and abs(prev.ts - ts) < 1e-6:
+                return
+        self._funding[key] = Funding(rate=rate, interval=interval, ts=ts)
+        self._notify_listeners()
 
     def upsert_order_book(
         self,
@@ -68,21 +117,36 @@ class TickerStore:
     ) -> None:
         key = (exchange, symbol)
         ob = self._order_books.get(key)
+        changed = False
         if ob is None:
             ob = OrderBookData()
+            changed = True
         if bids is not None:
-            ob.bids = [(float(price), float(size)) for price, size in bids if price and size]
+            new_bids = [(float(price), float(size)) for price, size in bids if price and size]
+            if new_bids != ob.bids:
+                ob.bids = new_bids
+                changed = True
         if asks is not None:
-            ob.asks = [(float(price), float(size)) for price, size in asks if price and size]
-        if ts is not None:
+            new_asks = [(float(price), float(size)) for price, size in asks if price and size]
+            if new_asks != ob.asks:
+                ob.asks = new_asks
+                changed = True
+        if ts is not None and ts != ob.ts:
             ob.ts = ts
+            changed = True
         if last_price is not None:
-            ob.last_price = float(last_price)
+            new_last = float(last_price)
+            if ob.last_price != new_last:
+                ob.last_price = new_last
+                changed = True
             if last_price_ts is None:
                 last_price_ts = time.time()
-        if last_price_ts is not None:
+        if last_price_ts is not None and last_price_ts != ob.last_price_ts:
             ob.last_price_ts = last_price_ts
-        self._order_books[key] = ob
+            changed = True
+        if changed:
+            self._order_books[key] = ob
+            self._notify_listeners()
 
     def snapshot(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
