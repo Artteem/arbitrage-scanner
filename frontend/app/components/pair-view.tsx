@@ -92,6 +92,62 @@ const TIMEFRAME_SECONDS_MAP: Record<(typeof TIMEFRAMES)[number], number> = {
 const LOOKBACK_SECONDS = LOOKBACK_DAYS * 24 * 60 * 60;
 const DEFAULT_VISIBLE_PERIODS = 60;
 
+const toPositiveSeconds = (value: unknown): number | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const numeric = typeof value === 'string' ? Number(value) : value;
+  if (typeof numeric !== 'number') {
+    return null;
+  }
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  return numeric;
+};
+
+const extractOrderBookTimestamp = (value: unknown): number | null => {
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const lastPriceTs = toPositiveSeconds(record['last_price_ts']);
+  const snapshotTs = toPositiveSeconds(record['ts']);
+  if (lastPriceTs !== null && snapshotTs !== null) {
+    return Math.max(lastPriceTs, snapshotTs);
+  }
+  return lastPriceTs ?? snapshotTs ?? null;
+};
+
+const resolveLatencyTimestampSeconds = (
+  row: SpreadRow | null | undefined,
+  fallback: number | null | undefined,
+) => {
+  const candidates: number[] = [];
+  if (row) {
+    const rowTs = toPositiveSeconds(row._ts);
+    if (rowTs !== null) {
+      candidates.push(rowTs);
+    }
+    const longTs = extractOrderBookTimestamp(row.orderbook_long);
+    if (longTs !== null) {
+      candidates.push(longTs);
+    }
+    const shortTs = extractOrderBookTimestamp(row.orderbook_short);
+    if (shortTs !== null) {
+      candidates.push(shortTs);
+    }
+  }
+  const fallbackTs = toPositiveSeconds(fallback ?? null);
+  if (fallbackTs !== null) {
+    candidates.push(fallbackTs);
+  }
+  if (!candidates.length) {
+    return null;
+  }
+  return Math.max(...candidates);
+};
+
 const getTimeframeSeconds = (
   explicit: number | null | undefined,
   fallbackKey: (typeof TIMEFRAMES)[number],
@@ -721,14 +777,27 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const exitSeriesDataRef = useRef<CandleDataPoint[]>([]);
   const exitTimeframeSecondsRef = useRef<number>(getTimeframeSeconds(null, timeframe));
 
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const latencySourceSecondsRef = useRef<number | null>(null);
+  const clockOffsetMsRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
       return undefined;
     }
     const interval = window.setInterval(() => {
-      setNowMs(Date.now());
+      const sourceSeconds = latencySourceSecondsRef.current;
+      if (!sourceSeconds) {
+        return;
+      }
+      const now = Date.now();
+      const sourceMs = sourceSeconds * 1000;
+      const diff = now - sourceMs;
+      const offset = clockOffsetMsRef.current ?? 0;
+      const safeOffset = offset < 0 ? offset : 0;
+      const normalized = diff < 0 ? diff - safeOffset : diff;
+      const next = normalized > 0 ? Math.round(normalized) : 0;
+      setLatencyMs((prev) => (prev === next ? prev : next));
     }, 250);
     return () => {
       window.clearInterval(interval);
@@ -1153,7 +1222,37 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const fundingSpread = activeRow?.funding_spread ?? null;
   const feesPct = activeRow?.commission_total_pct ?? null;
 
-  const lastUpdatedTs = realtimeData?.ts ?? realtimeRow?._ts ?? null;
+  const latestDataTimestampSeconds = useMemo(() => {
+    const merged = activeRow ?? realtimeData?.row ?? null;
+    const fallback = realtimeData?.ts ?? null;
+    return resolveLatencyTimestampSeconds(merged, fallback);
+  }, [activeRow, realtimeData?.row, realtimeData?.ts]);
+
+  useEffect(() => {
+    if (!latestDataTimestampSeconds) {
+      latencySourceSecondsRef.current = null;
+      clockOffsetMsRef.current = null;
+      setLatencyMs(null);
+      return;
+    }
+    latencySourceSecondsRef.current = latestDataTimestampSeconds;
+    const arrivalMs = Date.now();
+    const sourceMs = latestDataTimestampSeconds * 1000;
+    const diff = arrivalMs - sourceMs;
+    if (!Number.isFinite(diff)) {
+      return;
+    }
+    if (diff < 0 && (clockOffsetMsRef.current === null || diff < clockOffsetMsRef.current)) {
+      clockOffsetMsRef.current = diff;
+    }
+    const offset = clockOffsetMsRef.current ?? 0;
+    const safeOffset = offset < 0 ? offset : 0;
+    const normalized = diff < 0 ? diff - safeOffset : diff;
+    const next = normalized > 0 ? Math.round(normalized) : 0;
+    setLatencyMs((prev) => (prev === next ? prev : next));
+  }, [latestDataTimestampSeconds]);
+
+  const lastUpdatedTs = latestDataTimestampSeconds;
   const lastUpdatedLabel = lastUpdatedTs
     ? new Intl.DateTimeFormat('ru-RU', {
         timeZone: timezone,
@@ -1161,9 +1260,6 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         minute: '2-digit',
         second: '2-digit',
       }).format(new Date(lastUpdatedTs * 1000))
-    : null;
-  const latencyMs = lastUpdatedTs
-    ? Math.max(0, Math.round(nowMs - lastUpdatedTs * 1000))
     : null;
 
   const handleReverse = () => {
@@ -1366,16 +1462,8 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
             <div className="chart-card">
               <div className="chart-card-header">
                 <h2>Вход %</h2>
-                {lastUpdatedLabel || latencyMs !== null ? (
-                  <span className="muted small">
-                    {lastUpdatedLabel ? `Обновлено: ${lastUpdatedLabel}` : null}
-                    {latencyMs !== null ? (
-                      <>
-                        {lastUpdatedLabel ? ' · ' : null}
-                        Задержка: {latencyMs.toLocaleString('ru-RU')} мс
-                      </>
-                    ) : null}
-                  </span>
+                {lastUpdatedLabel ? (
+                  <span className="muted small">Обновлено: {lastUpdatedLabel}</span>
                 ) : null}
               </div>
               <div className="chart-container">
@@ -1467,6 +1555,17 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                 </label>
               </div>
             </div>
+
+            {latencyMs !== null ? (
+              <div className="latency-indicator">
+                <span>Задержка обновления</span>
+                <span
+                  className={`latency-value ${latencyMs <= 500 ? 'latency-good' : 'latency-bad'}`}
+                >
+                  {latencyMs.toLocaleString('ru-RU')} мс
+                </span>
+              </div>
+            ) : null}
 
             <div className="metrics-grid">
               <div className="metric-card">
