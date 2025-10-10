@@ -1,12 +1,15 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   usePairLimits,
   usePairOverview,
   usePairRealtime,
   usePairSpreads,
+  useStats,
 } from '../../lib/api';
+import { formatPairLabel } from '../../lib/format';
 import type { PairSelection, SpreadRow } from '../../lib/types';
 import {
   LineStyle,
@@ -226,6 +229,8 @@ const formatTimezoneOffsetLabel = (timezone: string) => {
   return timezone;
 };
 
+const PAIR_SETTINGS_KEY_PREFIX = 'pair-view-settings:';
+
 type TimezoneOption = {
   value: string;
   label: string;
@@ -237,13 +242,34 @@ interface PairViewProps {
   initialShort?: string;
 }
 
+interface StoredPairSettings {
+  timeframe?: (typeof TIMEFRAMES)[number];
+  showExitChart?: boolean;
+  volume?: string;
+  timezone?: string;
+  long_exchange?: string;
+  short_exchange?: string;
+}
+
 export default function PairView({ symbol, initialLong, initialShort }: PairViewProps) {
   const symbolUpper = symbol.toUpperCase();
+  const router = useRouter();
   const { theme, toggleTheme } = useTheme();
+  const { data: statsData } = useStats();
+  const settingsKey = useMemo(
+    () => `${PAIR_SETTINGS_KEY_PREFIX}${symbolUpper}`,
+    [symbolUpper],
+  );
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [pendingSelection, setPendingSelection] = useState<
+    { long: string; short: string } | null
+  >(null);
   const [timeframe, setTimeframe] = useState<(typeof TIMEFRAMES)[number]>('5m');
   const [showExitChart, setShowExitChart] = useState(false);
   const [volume, setVolume] = useState('100');
   const [timezone, setTimezone] = useState<string>(resolveDefaultTimezone);
+  const [symbolDropdownOpen, setSymbolDropdownOpen] = useState(false);
+  const [symbolQuery, setSymbolQuery] = useState('');
 
   const timezoneOptions = useMemo<TimezoneOption[]>(() => {
     return getTimezoneOptions().map((zone) => ({
@@ -255,10 +281,47 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const themeRef = useRef(theme);
   const timeframeRef = useRef(timeframe);
   const timezoneRef = useRef(timezone);
+  const symbolDropdownRef = useRef<HTMLDivElement | null>(null);
+  const symbolSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   themeRef.current = theme;
   timeframeRef.current = timeframe;
   timezoneRef.current = timezone;
+
+  useEffect(() => {
+    if (settingsLoaded) return;
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = window.localStorage.getItem(settingsKey);
+      if (!raw) {
+        setSettingsLoaded(true);
+        return;
+      }
+      const stored = JSON.parse(raw) as StoredPairSettings;
+      if (stored.timeframe && TIMEFRAMES.includes(stored.timeframe)) {
+        setTimeframe(stored.timeframe);
+      }
+      if (typeof stored.showExitChart === 'boolean') {
+        setShowExitChart(stored.showExitChart);
+      }
+      if (typeof stored.volume === 'string') {
+        setVolume(stored.volume);
+      }
+      if (stored.timezone) {
+        setTimezone(stored.timezone);
+      }
+      if (stored.long_exchange && stored.short_exchange) {
+        setPendingSelection({
+          long: stored.long_exchange,
+          short: stored.short_exchange,
+        });
+      }
+    } catch (error) {
+      console.warn('Failed to load pair settings', error);
+    } finally {
+      setSettingsLoaded(true);
+    }
+  }, [settingsKey, settingsLoaded]);
 
   const initialSelection = useMemo<PairSelection | null>(() => {
     if (!initialLong || !initialShort) {
@@ -273,14 +336,141 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
 
   const [selection, setSelection] = useState<PairSelection | null>(initialSelection);
 
+  useEffect(() => {
+    setSelection(initialSelection);
+    setPendingSelection(null);
+    setSettingsLoaded(false);
+  }, [initialSelection, settingsKey]);
+
   const { data: overviewData } = usePairOverview(symbolUpper);
   const overviewRows = useMemo(
     () => overviewData?.rows ?? [],
     [overviewData?.rows],
   );
 
+  const availableSymbols = useMemo(() => {
+    const collected = new Set<string>();
+    statsData?.symbols_subscribed?.forEach((item) => {
+      if (item) {
+        collected.add(String(item).toUpperCase());
+      }
+    });
+    if (overviewData?.symbol) {
+      collected.add(overviewData.symbol.toUpperCase());
+    }
+    collected.add(symbolUpper);
+    return Array.from(collected).sort((a, b) => a.localeCompare(b));
+  }, [overviewData?.symbol, statsData?.symbols_subscribed, symbolUpper]);
+
+  const filteredSymbols = useMemo(() => {
+    const normalizedQuery = symbolQuery.trim().toLowerCase();
+    if (!normalizedQuery) {
+      return availableSymbols;
+    }
+    return availableSymbols.filter((item) =>
+      item.toLowerCase().startsWith(normalizedQuery)
+    );
+  }, [availableSymbols, symbolQuery]);
+
+  const longOptions = useMemo(() => {
+    const set = new Set<string>();
+    overviewRows.forEach((row) => {
+      set.add(row.long_exchange);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [overviewRows]);
+
+  const shortOptions = useMemo(() => {
+    const set = new Set<string>();
+    overviewRows.forEach((row) => {
+      set.add(row.short_exchange);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [overviewRows]);
+
+  const selectedLong = selection?.long_exchange ?? longOptions[0] ?? '';
+  const selectedShort = selection?.short_exchange ?? shortOptions[0] ?? '';
+
+  const applySelection = (nextLong: string, nextShort: string) => {
+    if (!overviewRows.length) return;
+    const normalizedLong = nextLong.toLowerCase();
+    const normalizedShort = nextShort.toLowerCase();
+
+    const applyRow = (row: SpreadRow) => {
+      if (
+        selection &&
+        selection.long_exchange === row.long_exchange &&
+        selection.short_exchange === row.short_exchange
+      ) {
+        return;
+      }
+      setSelection({
+        symbol: symbolUpper,
+        long_exchange: row.long_exchange,
+        short_exchange: row.short_exchange,
+      });
+    };
+
+    const exact = overviewRows.find(
+      (row) =>
+        row.long_exchange === normalizedLong && row.short_exchange === normalizedShort,
+    );
+    if (exact) {
+      applyRow(exact);
+      return;
+    }
+    const fallbackLong = overviewRows.find((row) => row.long_exchange === normalizedLong);
+    if (fallbackLong) {
+      applyRow(fallbackLong);
+      return;
+    }
+    const fallbackShort = overviewRows.find((row) => row.short_exchange === normalizedShort);
+    if (fallbackShort) {
+      applyRow(fallbackShort);
+      return;
+    }
+    const first = overviewRows[0];
+    if (first) {
+      applyRow(first);
+    }
+  };
+
+  const handleSymbolChange = (nextSymbol: string) => {
+    const normalized = nextSymbol.trim().toUpperCase();
+    if (!normalized || normalized === symbolUpper) {
+      return;
+    }
+    router.push(`/pair/${encodeURIComponent(normalized)}`);
+  };
+
+  const handleSymbolSelect = (nextSymbol: string) => {
+    setSymbolDropdownOpen(false);
+    setSymbolQuery('');
+    handleSymbolChange(nextSymbol);
+  };
+
   useEffect(() => {
-    if (!selection && overviewRows.length) {
+    if (!overviewRows.length) return;
+
+    if (pendingSelection) {
+      const match = overviewRows.find(
+        (row) =>
+          row.long_exchange === pendingSelection.long &&
+          row.short_exchange === pendingSelection.short,
+      );
+      if (match) {
+        setSelection({
+          symbol: symbolUpper,
+          long_exchange: match.long_exchange,
+          short_exchange: match.short_exchange,
+        });
+        setPendingSelection(null);
+        return;
+      }
+      setPendingSelection(null);
+    }
+
+    if (!selection) {
       if (initialSelection) {
         const match = overviewRows.find((row) => rowMatchesSelection(row, initialSelection));
         if (match) {
@@ -293,13 +483,15 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
         }
       }
       const first = overviewRows[0];
-      setSelection({
-        symbol: symbolUpper,
-        long_exchange: first.long_exchange,
-        short_exchange: first.short_exchange,
-      });
+      if (first) {
+        setSelection({
+          symbol: symbolUpper,
+          long_exchange: first.long_exchange,
+          short_exchange: first.short_exchange,
+        });
+      }
     }
-  }, [initialSelection, overviewRows, selection, symbolUpper]);
+  }, [initialSelection, overviewRows, pendingSelection, selection, symbolUpper]);
 
   useEffect(() => {
     if (!selection || !overviewRows.length) return;
@@ -315,6 +507,24 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       }
     }
   }, [overviewRows, selection, symbolUpper]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    if (typeof window === 'undefined') return;
+    const payload: StoredPairSettings = {
+      timeframe,
+      showExitChart,
+      volume,
+      timezone,
+      long_exchange: selection?.long_exchange,
+      short_exchange: selection?.short_exchange,
+    };
+    try {
+      window.localStorage.setItem(settingsKey, JSON.stringify(payload));
+    } catch (error) {
+      console.warn('Failed to persist pair settings', error);
+    }
+  }, [selection, settingsKey, settingsLoaded, showExitChart, timeframe, timezone, volume]);
 
   const { data: entrySpreadsData } = usePairSpreads(selection, {
     timeframe,
@@ -649,21 +859,10 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     chart.timeScale().fitContent();
   }, [exitCandles]);
 
-  const volumeValue = useMemo(() => {
-    const parsed = Number.parseFloat(volume.replace(',', '.'));
-    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-    return parsed;
-  }, [volume]);
-
   const entryPct = activeRow?.entry_pct ?? null;
   const exitPct = activeRow?.exit_pct ?? null;
   const fundingSpread = activeRow?.funding_spread ?? null;
   const feesPct = activeRow?.commission_total_pct ?? null;
-
-  const entryUsd = entryPct !== null ? (entryPct / 100) * volumeValue : null;
-  const exitUsd = exitPct !== null ? (exitPct / 100) * volumeValue : null;
-  const fundingUsd = fundingSpread !== null ? fundingSpread * volumeValue : null;
-  const feesUsd = feesPct !== null ? (feesPct / 100) * volumeValue : null;
 
   const lastUpdatedTs = realtimeData?.ts ?? realtimeRow?._ts ?? null;
   const lastUpdatedLabel = lastUpdatedTs
@@ -675,26 +874,9 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
       }).format(new Date(lastUpdatedTs * 1000))
     : null;
 
-  const selectionKey = selection
-    ? `${selection.long_exchange}|${selection.short_exchange}`
-    : '';
-
-  const selectionOptions = useMemo(() => {
-    return overviewRows
-      .map((row) => ({
-        key: `${row.long_exchange}|${row.short_exchange}`,
-        label: `${row.long_exchange.toUpperCase()} → ${row.short_exchange.toUpperCase()}`,
-      }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  }, [overviewRows]);
-
   const handleReverse = () => {
     if (!selection) return;
-    setSelection({
-      symbol: selection.symbol,
-      long_exchange: selection.short_exchange,
-      short_exchange: selection.long_exchange,
-    });
+    applySelection(selection.short_exchange, selection.long_exchange);
   };
 
   const longFundingInterval =
@@ -702,44 +884,143 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const shortFundingInterval =
     activeRow?.funding_interval_short ?? overviewRow?.funding_interval_short ?? '—';
 
+  const longFundingValue = activeRow?.funding_long ?? overviewRow?.funding_long ?? null;
+  const shortFundingValue = activeRow?.funding_short ?? overviewRow?.funding_short ?? null;
+
+  const longExchange = activeRow?.long_exchange ?? overviewRow?.long_exchange ?? null;
+  const shortExchange = activeRow?.short_exchange ?? overviewRow?.short_exchange ?? null;
+
   const longLimit = limitsData?.long as Record<string, unknown> | null | undefined;
   const shortLimit = limitsData?.short as Record<string, unknown> | null | undefined;
 
-  const renderLimit = (limit: Record<string, unknown> | null | undefined) => {
-    if (!limit) return 'Нет данных';
-    const entries: string[] = [];
-    const qty = limit['max_qty'];
-    if (qty !== undefined) {
-      const value = Number(qty);
-      if (Number.isFinite(value) && value > 0) {
-        entries.push(`Макс. объём: ${value.toLocaleString('ru-RU')}`);
-      }
+  const longPrice =
+    activeRow?.price_long_ask ?? overviewRow?.price_long_ask ?? overviewRow?.price_long_bid ?? null;
+  const shortPrice =
+    activeRow?.price_short_bid ?? overviewRow?.price_short_bid ?? overviewRow?.price_short_ask ?? null;
+
+  const computeLimitUsd = (
+    limit: Record<string, unknown> | null | undefined,
+    price: number | null,
+  ) => {
+    if (!limit) return null;
+    const notionalRaw = limit['max_notional'];
+    const notional = Number(notionalRaw);
+    if (Number.isFinite(notional) && notional > 0) {
+      return notional;
     }
-    const notional = limit['max_notional'];
-    if (notional !== undefined) {
-      const value = Number(notional);
-      if (Number.isFinite(value) && value > 0) {
-        entries.push(`Макс. нотионал: ${value.toLocaleString('ru-RU')}`);
-      }
+    const qtyRaw = limit['max_qty'];
+    const qty = Number(qtyRaw);
+    if (Number.isFinite(qty) && qty > 0 && Number.isFinite(price ?? NaN) && (price ?? 0) > 0) {
+      return qty * (price as number);
     }
-    const desc = limit['limit_desc'];
-    if (desc) entries.push(String(desc));
-    if (!entries.length) entries.push('Нет данных');
-    return entries.join(' • ');
+    return null;
   };
+
+  const longLimitUsd = computeLimitUsd(longLimit, longPrice);
+  const shortLimitUsd = computeLimitUsd(shortLimit, shortPrice);
 
   const documentTitleEntry = entryPct !== null ? entryPct.toFixed(2) : '—';
   const documentTitleExit = exitPct !== null ? exitPct.toFixed(2) : '—';
 
+  const displaySymbol = useMemo(() => formatPairLabel(symbolUpper), [symbolUpper]);
+
   useEffect(() => {
     if (typeof document === 'undefined') return;
-    document.title = `${documentTitleEntry} | ${documentTitleExit} | ${symbolUpper}`;
-  }, [documentTitleEntry, documentTitleExit, symbolUpper]);
+    document.title = `${documentTitleEntry} | ${documentTitleExit} | ${displaySymbol}`;
+  }, [displaySymbol, documentTitleEntry, documentTitleExit]);
+
+  useEffect(() => {
+    if (!symbolDropdownOpen) return;
+    const handleOutsideClick = (event: MouseEvent | TouchEvent) => {
+      const target = event.target as Node;
+      if (symbolDropdownRef.current && !symbolDropdownRef.current.contains(target)) {
+        setSymbolDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    document.addEventListener('touchstart', handleOutsideClick);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('touchstart', handleOutsideClick);
+    };
+  }, [symbolDropdownOpen]);
+
+  useEffect(() => {
+    if (symbolDropdownOpen) {
+      symbolSearchInputRef.current?.focus();
+    } else {
+      setSymbolQuery('');
+    }
+  }, [symbolDropdownOpen]);
+
+  useEffect(() => {
+    setSymbolDropdownOpen(false);
+    setSymbolQuery('');
+  }, [symbolUpper]);
 
   return (
     <div className="page-container pair-container">
       <header className="pair-header">
-        <h1>{symbolUpper}</h1>
+        <h1 className="pair-title">
+          <div
+            className={`symbol-select ${symbolDropdownOpen ? 'open' : ''}`}
+            ref={symbolDropdownRef}
+          >
+            <button
+              type="button"
+              className="symbol-select-trigger"
+              onClick={() => setSymbolDropdownOpen((prev) => !prev)}
+              aria-haspopup="listbox"
+              aria-expanded={symbolDropdownOpen}
+            >
+              <span className="symbol-select-label">{displaySymbol}</span>
+              <span className="symbol-select-chevron" aria-hidden="true" />
+            </button>
+            {symbolDropdownOpen ? (
+              <div className="symbol-select-menu">
+                <input
+                  ref={symbolSearchInputRef}
+                  type="text"
+                  value={symbolQuery}
+                  onChange={(event) => setSymbolQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      const first = filteredSymbols[0];
+                      if (first) {
+                        handleSymbolSelect(first);
+                      }
+                    } else if (event.key === 'Escape') {
+                      setSymbolDropdownOpen(false);
+                    }
+                  }}
+                  placeholder="Поиск монеты"
+                  className="symbol-select-search"
+                  spellCheck={false}
+                />
+                <ul role="listbox" className="symbol-select-options">
+                  {filteredSymbols.length ? (
+                    filteredSymbols.map((item) => (
+                      <li key={item}>
+                        <button
+                          type="button"
+                          className={`symbol-select-option ${
+                            item === symbolUpper ? 'active' : ''
+                          }`}
+                          onClick={() => handleSymbolSelect(item)}
+                        >
+                          {formatPairLabel(item)}
+                        </button>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="symbol-select-empty">Нет совпадений</li>
+                  )}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        </h1>
         <div className="header-actions">
           <label className="theme-toggle">
             <input
@@ -831,19 +1112,6 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                 </div>
                 <div className="chart-container">
                   <div ref={exitChartContainerRef} className="chart-surface"></div>
-                  <div className="chart-timezone-select">
-                    <select
-                      aria-label="Выбрать часовой пояс"
-                      value={timezone}
-                      onChange={(event) => setTimezone(event.target.value)}
-                    >
-                      {timezoneOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
                 </div>
                 {!exitCandles.length ? (
                   <div className="chart-empty">Нет данных для выбранной комбинации</div>
@@ -864,27 +1132,40 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                   onChange={(event) => setVolume(event.target.value)}
                 />
               </label>
-              <label className="combo-select">
-                Комбинация
-                <select
-                  value={selectionKey}
-                  onChange={(event) => {
-                    const [longExchange, shortExchange] = event.target.value.split('|');
-                    setSelection({
-                      symbol: symbolUpper,
-                      long_exchange: longExchange,
-                      short_exchange: shortExchange,
-                    });
-                  }}
-                  disabled={!selectionOptions.length}
-                >
-                  {selectionOptions.map((option) => (
-                    <option key={option.key} value={option.key}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <div className="leg-selects">
+                <label>
+                  Long
+                  <select
+                    value={selectedLong}
+                    onChange={(event) => {
+                      applySelection(event.target.value, selectedShort);
+                    }}
+                    disabled={!longOptions.length}
+                  >
+                    {longOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Short
+                  <select
+                    value={selectedShort}
+                    onChange={(event) => {
+                      applySelection(selectedLong, event.target.value);
+                    }}
+                    disabled={!shortOptions.length}
+                  >
+                    {shortOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
             </div>
 
             <div className="metrics-grid">
@@ -893,66 +1174,79 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
                 <div className={`metric-value ${entryPct !== null ? (entryPct >= 0 ? 'metric-pos' : 'metric-neg') : ''}`}>
                   {formatPercent(entryPct)}
                 </div>
-                <div className="metric-sub">{formatUsd(entryUsd)}</div>
               </div>
               <div className="metric-card">
                 <div className="metric-label">Выход</div>
                 <div className={`metric-value ${exitPct !== null ? (exitPct >= 0 ? 'metric-pos' : 'metric-neg') : ''}`}>
                   {formatPercent(exitPct)}
                 </div>
-                <div className="metric-sub">{formatUsd(exitUsd)}</div>
               </div>
               <div className="metric-card">
                 <div className="metric-label">Спред фандинга</div>
                 <div className={`metric-value ${fundingSpread !== null ? (fundingSpread >= 0 ? 'metric-pos' : 'metric-neg') : ''}`}>
                   {formatFundingPercent(fundingSpread)}
                 </div>
-                <div className="metric-sub">{formatUsd(fundingUsd)}</div>
               </div>
               <div className="metric-card">
                 <div className="metric-label">Комиссии</div>
                 <div className="metric-value">{formatPercent(feesPct)}</div>
-                <div className="metric-sub">{formatUsd(feesUsd)}</div>
               </div>
             </div>
 
-            {activeRow ? (
-              <div className="exchange-line">
-                <span>
-                  LONG{' '}
-                  <a
-                    href={exchangeUrl(activeRow.long_exchange, symbolUpper)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    {activeRow.long_exchange.toUpperCase()}
-                  </a>
-                  : фандинг {formatFundingPercent(activeRow.funding_long)} / {longFundingInterval}
-                </span>
-                <span>
-                  SHORT{' '}
-                  <a
-                    href={exchangeUrl(activeRow.short_exchange, symbolUpper)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    {activeRow.short_exchange.toUpperCase()}
-                  </a>
-                  : фандинг {formatFundingPercent(activeRow.funding_short)} / {shortFundingInterval}
-                </span>
-              </div>
-            ) : (
-              <p className="muted">Нет данных по выбранной комбинации.</p>
-            )}
-
             <div className="limits-grid">
               <div className="limit-card">
-                <div className="limit-title">{activeRow?.long_exchange.toUpperCase() ?? 'LONG'}</div>
-                <div className="limit-body">{renderLimit(longLimit)}</div>
+                <div className="limit-title">
+                  {longExchange ? (
+                    <a
+                      href={exchangeUrl(longExchange, symbolUpper)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {longExchange.toUpperCase()}
+                    </a>
+                  ) : (
+                    'LONG'
+                  )}
+                </div>
+                <dl className="limit-details">
+                  <div className="limit-row">
+                    <dt>Лимит</dt>
+                    <dd>{longLimitUsd !== null ? `${formatUsd(longLimitUsd)} USDT` : '—'}</dd>
+                  </div>
+                  <div className="limit-row">
+                    <dt>Фандинг</dt>
+                    <dd>
+                      {formatFundingPercent(longFundingValue)} / {longFundingInterval}
+                    </dd>
+                  </div>
+                </dl>
               </div>
               <div className="limit-card">
-                <div className="limit-title">{activeRow?.short_exchange.toUpperCase() ?? 'SHORT'}</div>
-                <div className="limit-body">{renderLimit(shortLimit)}</div>
+                <div className="limit-title">
+                  {shortExchange ? (
+                    <a
+                      href={exchangeUrl(shortExchange, symbolUpper)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {shortExchange.toUpperCase()}
+                    </a>
+                  ) : (
+                    'SHORT'
+                  )}
+                </div>
+                <dl className="limit-details">
+                  <div className="limit-row">
+                    <dt>Лимит</dt>
+                    <dd>{shortLimitUsd !== null ? `${formatUsd(shortLimitUsd)} USDT` : '—'}</dd>
+                  </div>
+                  <div className="limit-row">
+                    <dt>Фандинг</dt>
+                    <dd>
+                      {formatFundingPercent(shortFundingValue)} / {shortFundingInterval}
+                    </dd>
+                  </div>
+                </dl>
               </div>
             </div>
           </div>
