@@ -1008,12 +1008,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const tsCandidate = Number(realtimeData?.ts);
     const fallbackTs = Number(realtimeRow?._ts);
-    const timestamp = Number.isFinite(tsCandidate)
+    const timestamp: number | null = Number.isFinite(tsCandidate)
       ? tsCandidate
       : Number.isFinite(fallbackTs)
       ? fallbackTs
       : null;
-    if (!Number.isFinite(timestamp)) {
+    if (timestamp === null || !Number.isFinite(timestamp)) {
       return;
     }
     const valueCandidate = Number(
@@ -1047,12 +1047,12 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   useEffect(() => {
     const tsCandidate = Number(realtimeData?.ts);
     const fallbackTs = Number(realtimeRow?._ts);
-    const timestamp = Number.isFinite(tsCandidate)
+    const timestamp: number | null = Number.isFinite(tsCandidate)
       ? tsCandidate
       : Number.isFinite(fallbackTs)
       ? fallbackTs
       : null;
-    if (!Number.isFinite(timestamp)) {
+    if (timestamp === null || !Number.isFinite(timestamp)) {
       return;
     }
     const valueCandidate = Number(
