@@ -918,6 +918,27 @@ select:focus {
   align-items: flex-end;
 }
 
+.latency-indicator {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.latency-value {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.latency-good {
+  color: var(--good);
+}
+
+.latency-bad {
+  color: var(--bad);
+}
+
 .leg-selects {
   display: flex;
   flex-wrap: wrap;
