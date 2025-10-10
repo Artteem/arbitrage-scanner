@@ -119,10 +119,15 @@ const extractOrderBookTimestamp = (value: unknown): number | null => {
   return lastPriceTs ?? snapshotTs ?? null;
 };
 
-const resolveLatencyTimestampSeconds = (
+type LatencyTimestampSummary = {
+  newest: number | null;
+  oldest: number | null;
+};
+
+const resolveLatencyTimestampSummary = (
   row: SpreadRow | null | undefined,
   fallback: number | null | undefined,
-) => {
+): LatencyTimestampSummary => {
   const candidates: number[] = [];
   if (row) {
     const rowTs = toPositiveSeconds(row._ts);
@@ -143,9 +148,12 @@ const resolveLatencyTimestampSeconds = (
     candidates.push(fallbackTs);
   }
   if (!candidates.length) {
-    return null;
+    return { newest: null, oldest: null };
   }
-  return Math.max(...candidates);
+  return {
+    newest: Math.max(...candidates),
+    oldest: Math.min(...candidates),
+  };
 };
 
 const getTimeframeSeconds = (
@@ -1222,22 +1230,25 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
   const fundingSpread = activeRow?.funding_spread ?? null;
   const feesPct = activeRow?.commission_total_pct ?? null;
 
-  const latestDataTimestampSeconds = useMemo(() => {
+  const {
+    newest: latestDataTimestampSeconds,
+    oldest: worstLatencyTimestampSeconds,
+  } = useMemo(() => {
     const merged = activeRow ?? realtimeData?.row ?? null;
     const fallback = realtimeData?.ts ?? null;
-    return resolveLatencyTimestampSeconds(merged, fallback);
+    return resolveLatencyTimestampSummary(merged, fallback);
   }, [activeRow, realtimeData?.row, realtimeData?.ts]);
 
   useEffect(() => {
-    if (!latestDataTimestampSeconds) {
+    if (!worstLatencyTimestampSeconds) {
       latencySourceSecondsRef.current = null;
       clockOffsetMsRef.current = null;
       setLatencyMs(null);
       return;
     }
-    latencySourceSecondsRef.current = latestDataTimestampSeconds;
+    latencySourceSecondsRef.current = worstLatencyTimestampSeconds;
     const arrivalMs = Date.now();
-    const sourceMs = latestDataTimestampSeconds * 1000;
+    const sourceMs = worstLatencyTimestampSeconds * 1000;
     const diff = arrivalMs - sourceMs;
     if (!Number.isFinite(diff)) {
       return;
@@ -1250,7 +1261,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     const normalized = diff < 0 ? diff - safeOffset : diff;
     const next = normalized > 0 ? Math.round(normalized) : 0;
     setLatencyMs((prev) => (prev === next ? prev : next));
-  }, [latestDataTimestampSeconds]);
+  }, [worstLatencyTimestampSeconds]);
 
   const lastUpdatedTs = latestDataTimestampSeconds;
   const lastUpdatedLabel = lastUpdatedTs
