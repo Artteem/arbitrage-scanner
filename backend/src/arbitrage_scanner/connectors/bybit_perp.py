@@ -170,6 +170,25 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                             asks=best_asks or None,
                             ts=now,
                         )
+
+                    best_bid_price = best_bids[0][0] if best_bids else book.best_bid_price()
+                    best_ask_price = best_asks[0][0] if best_asks else book.best_ask_price()
+
+                    if (
+                        best_bid_price is not None
+                        and best_ask_price is not None
+                        and best_bid_price > 0
+                        and best_ask_price > 0
+                    ):
+                        store.upsert_ticker(
+                            Ticker(
+                                exchange="bybit",
+                                symbol=sym,
+                                bid=best_bid_price,
+                                ask=best_ask_price,
+                                ts=now,
+                            )
+                        )
         except Exception:
             await asyncio.sleep(1)
 
@@ -206,6 +225,16 @@ class _OrderBookState:
         bids_sorted = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
         asks_sorted = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]
         return bids_sorted, asks_sorted
+
+    def best_bid_price(self) -> float | None:
+        if not self.bids:
+            return None
+        return max(self.bids.keys())
+
+    def best_ask_price(self) -> float | None:
+        if not self.asks:
+            return None
+        return min(self.asks.keys())
 
     def _apply(self, side: Dict[float, float], updates) -> None:
         if not updates:
