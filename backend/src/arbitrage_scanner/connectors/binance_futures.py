@@ -5,6 +5,7 @@ import websockets
 from ..domain import Ticker, Symbol
 from ..store import TickerStore
 from .discovery import discover_binance_usdt_perp
+from .utils import pick_timestamp, now_ts
 
 BOOK_WS = "wss://fstream.binance.com/stream"
 MARK_WS = "wss://fstream.binance.com/stream"
@@ -59,7 +60,16 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
         # d: { s, b, a, ... }
         s = d.get("s"); b = d.get("b"); a = d.get("a")
         if s and b and a:
-            store.upsert_ticker(Ticker(exchange="binance", symbol=s, bid=float(b), ask=float(a), ts=time.time()))
+            event_ts = pick_timestamp(d.get("E"), d.get("T"), d.get("eventTime"), default=now_ts())
+            store.upsert_ticker(
+                Ticker(
+                    exchange="binance",
+                    symbol=s,
+                    bid=float(b),
+                    ask=float(a),
+                    ts=event_ts,
+                )
+            )
 
     async def _handle_depth(d):
         s = d.get("s") or d.get("symbol")
@@ -67,7 +77,7 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
         asks = d.get("asks") or d.get("a") or []
         if not s:
             return
-        now = time.time()
+        event_ts = pick_timestamp(d.get("E"), d.get("T"), d.get("eventTime"), default=now_ts())
         def _convert(levels):
             result = []
             for level in levels[:5]:
@@ -88,11 +98,17 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
                 s,
                 bids=bids_conv or None,
                 asks=asks_conv or None,
-                ts=now,
+                ts=event_ts,
             )
         if bids_conv and asks_conv:
             store.upsert_ticker(
-                Ticker(exchange="binance", symbol=s, bid=bids_conv[0][0], ask=asks_conv[0][0], ts=now)
+                Ticker(
+                    exchange="binance",
+                    symbol=s,
+                    bid=bids_conv[0][0],
+                    ask=asks_conv[0][0],
+                    ts=event_ts,
+                )
             )
 
     async def _handle_mark(d):
@@ -103,7 +119,8 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
                 rate = float(r)
             except Exception:
                 rate = 0.0
-            store.upsert_funding("binance", s, rate=rate, interval="8h", ts=time.time())
+            event_ts = pick_timestamp(d.get("E"), d.get("T"), d.get("eventTime"), default=now_ts())
+            store.upsert_funding("binance", s, rate=rate, interval="8h", ts=event_ts)
 
     async def _handle_trade(d):
         s = d.get("s") or d.get("symbol")
@@ -114,7 +131,15 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
             price = float(p)
         except (TypeError, ValueError):
             return
-        store.upsert_order_book("binance", s, last_price=price, last_price_ts=time.time())
+        event_ts = pick_timestamp(
+            d.get("T"), d.get("E"), d.get("eventTime"), d.get("tradeTime"), default=now_ts()
+        )
+        store.upsert_order_book(
+            "binance",
+            s,
+            last_price=price,
+            last_price_ts=event_ts,
+        )
 
     # батчим
     tasks = []

@@ -13,6 +13,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
 from .discovery import discover_bingx_usdt_perp
+from .utils import pick_timestamp, now_ts
 
 TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
@@ -186,6 +187,17 @@ async def _run_bingx_ws_tickers(
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
+                    event_ts = pick_timestamp(
+                        payload.get("time"),
+                        payload.get("ts"),
+                        payload.get("timestamp"),
+                        payload.get("updateTime"),
+                        msg.get("ts"),
+                        msg.get("time"),
+                        msg.get("timestamp"),
+                        default=now_ts(),
+                    )
+
                     bid = _extract_price(
                         payload,
                         (
@@ -228,7 +240,7 @@ async def _run_bingx_ws_tickers(
                             symbol=common_symbol,
                             bid=bid,
                             ask=ask,
-                            ts=time.time(),
+                            ts=event_ts,
                         )
                     )
                     if ready_event and not ready_event.is_set():
@@ -276,6 +288,17 @@ async def _run_bingx_orderbooks(
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
+                    event_ts = pick_timestamp(
+                        payload.get("time"),
+                        payload.get("ts"),
+                        payload.get("timestamp"),
+                        payload.get("updateTime"),
+                        msg.get("ts"),
+                        msg.get("time"),
+                        msg.get("timestamp"),
+                        default=now_ts(),
+                    )
+
                     bids, asks, last_price = _extract_depth_payload(payload)
                     if not bids and not asks and last_price is None:
                         continue
@@ -285,9 +308,21 @@ async def _run_bingx_orderbooks(
                         common_symbol,
                         bids=bids or None,
                         asks=asks or None,
-                        ts=time.time(),
+                        ts=event_ts,
                         last_price=last_price,
+                        last_price_ts=event_ts if last_price is not None else None,
                     )
+
+                    if bids and asks:
+                        store.upsert_ticker(
+                            Ticker(
+                                exchange="bingx",
+                                symbol=common_symbol,
+                                bid=bids[0][0],
+                                ask=asks[0][0],
+                                ts=event_ts,
+                            )
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -724,7 +759,7 @@ async def _poll_bingx_http(
 
     async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
         while True:
-            now = time.time()
+            now = now_ts()
             params = param_candidates[params_idx]
             url = TICKERS_URLS[url_idx]
             try:
@@ -812,13 +847,21 @@ async def _poll_bingx_http(
                 if wanted_common and (not common_symbol or common_symbol not in wanted_common):
                     continue
 
+                event_ts = pick_timestamp(
+                    raw.get("timestamp"),
+                    raw.get("ts"),
+                    raw.get("time"),
+                    raw.get("updateTime"),
+                    default=now,
+                )
+
                 store.upsert_ticker(
                     Ticker(
                         exchange="bingx",
                         symbol=common_symbol,
                         bid=bid,
                         ask=ask,
-                        ts=now,
+                        ts=event_ts,
                     )
                 )
 

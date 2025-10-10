@@ -12,6 +12,7 @@ import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .utils import pick_timestamp, now_ts
 
 MIN_SYMBOL_THRESHOLD = 5
 
@@ -99,7 +100,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
 
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
-            now = time.time()
+            now = now_ts()
             try:
                 ticker_resp = await client.get(TICKERS_URL)
                 ticker_resp.raise_for_status()
@@ -108,7 +109,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                 await asyncio.sleep(2.0)
                 continue
 
-            funding_map: Dict[str, tuple[float, str]] = {}
+            funding_map: Dict[str, tuple[float, str, float]] = {}
             try:
                 funding_resp = await client.get(FUNDING_URL)
                 funding_resp.raise_for_status()
@@ -119,7 +120,14 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                         continue
                     rate = _as_float(item.get("fundingRate") or item.get("rate"))
                     interval = _parse_interval(item)
-                    funding_map[sym_raw] = (rate, interval)
+                    funding_ts = pick_timestamp(
+                        item.get("fundingTime"),
+                        item.get("timestamp"),
+                        item.get("ts"),
+                        item.get("time"),
+                        default=now,
+                    )
+                    funding_map[sym_raw] = (rate, interval, funding_ts)
             except Exception:
                 funding_map = {}
 
@@ -140,19 +148,29 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                 if not sym_common:
                     continue
 
+                event_ts = pick_timestamp(
+                    item.get("timestamp"),
+                    item.get("ts"),
+                    item.get("time"),
+                    item.get("updateTime"),
+                    default=now,
+                )
+
                 store.upsert_ticker(
                     Ticker(
                         exchange="mexc",
                         symbol=sym_common,
                         bid=bid,
                         ask=ask,
-                        ts=now,
+                        ts=event_ts,
                     )
                 )
 
                 if sym_raw in funding_map:
-                    rate, interval = funding_map[sym_raw]
-                    store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
+                    rate, interval, funding_ts = funding_map[sym_raw]
+                    store.upsert_funding(
+                        "mexc", sym_common, rate=rate, interval=interval, ts=funding_ts
+                    )
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -211,14 +229,35 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                 bids, asks = book.top_levels()
                 last_price = _extract_last_price(data)
 
+                event_ts = pick_timestamp(
+                    data.get("timestamp"),
+                    data.get("ts"),
+                    data.get("time"),
+                    msg.get("ts") if isinstance(msg, dict) else None,
+                    msg.get("time") if isinstance(msg, dict) else None,
+                    default=now_ts(),
+                )
+
                 store.upsert_order_book(
                     "mexc",
                     sym_common,
                     bids=bids or None,
                     asks=asks or None,
-                    ts=time.time(),
+                    ts=event_ts,
                     last_price=last_price,
+                    last_price_ts=event_ts if last_price is not None else None,
                 )
+
+                if bids and asks:
+                    store.upsert_ticker(
+                        Ticker(
+                            exchange="mexc",
+                            symbol=sym_common,
+                            bid=bids[0][0],
+                            ask=asks[0][0],
+                            ts=event_ts,
+                        )
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
