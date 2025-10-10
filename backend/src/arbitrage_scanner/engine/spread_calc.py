@@ -1,5 +1,4 @@
 from __future__ import annotations
-import time
 from dataclasses import dataclass
 from typing import List, Iterable, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
@@ -15,8 +14,6 @@ DEFAULT_TAKER_FEES: dict[ExchangeName, float] = {
 }
 
 MAX_TICKER_SKEW_SECONDS = 0.5
-STALE_TICKER_MAX_AGE = 2.0
-MAX_EVENT_LAG_SECONDS = 2.0
 
 @dataclass
 class Row:
@@ -162,21 +159,11 @@ def compute_rows(
                     continue
                 short_ob = short_payload.get("order_book")
 
-                now = time.time()
-
-                if now - long_t.ts > STALE_TICKER_MAX_AGE or now - short_t.ts > STALE_TICKER_MAX_AGE:
-                    continue
-
                 skew_seconds = abs(long_t.ts - short_t.ts)
                 skewed = skew_seconds > MAX_TICKER_SKEW_SECONDS
 
                 long_latency = long_t.latency
                 short_latency = short_t.latency
-                if (
-                    (long_latency is not None and long_latency > MAX_EVENT_LAG_SECONDS)
-                    or (short_latency is not None and short_latency > MAX_EVENT_LAG_SECONDS)
-                ):
-                    continue
 
                 fl = long_payload.get("funding")
                 fs = short_payload.get("funding")
