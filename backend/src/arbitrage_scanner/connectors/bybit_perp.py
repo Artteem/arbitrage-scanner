@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
@@ -16,6 +18,12 @@ WS = "wss://stream.bybit.com/v5/public/linear"
 CHUNK = 100  # безопасный размер по числу подписок
 
 MIN_SYMBOL_THRESHOLD = 5
+
+PING_INTERVAL = 10.0
+MAX_IDLE_BEFORE_RECONNECT = 30.0
+
+
+logger = logging.getLogger(__name__)
 
 
 async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]):
@@ -57,8 +65,19 @@ async def _run_bybit_tickers(store: TickerStore, subscribe: Sequence[Symbol]):
                 await ws.send(json.dumps({"op": "subscribe", "args": args}))
                 await asyncio.sleep(0.05)
 
-            async for msg in ws:
-                data = json.loads(msg)
+            while True:
+                raw = await _recv_with_keepalive(ws)
+                if raw is None:
+                    break
+
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    logger.exception("Failed to decode Bybit ticker payload", exc_info=True)
+                    continue
+
+                if data.get("op") == "pong":
+                    continue
 
                 topic = data.get("topic", "")
                 if not topic.startswith("tickers."):
@@ -111,8 +130,11 @@ async def _run_bybit_tickers(store: TickerStore, subscribe: Sequence[Symbol]):
                             store.upsert_order_book(
                                 "bybit", sym, last_price=last_price, last_price_ts=now
                             )
+        except ConnectionClosed:
+            logger.warning("Bybit ticker stream connection closed, reconnecting")
         except Exception:
-            await asyncio.sleep(1)
+            logger.exception("Bybit ticker stream error", exc_info=True)
+        await asyncio.sleep(1)
 
 
 async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol]):
@@ -129,8 +151,19 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                 await ws.send(json.dumps({"op": "subscribe", "args": batch}))
                 await asyncio.sleep(0.05)
 
-            async for raw in ws:
-                data = json.loads(raw)
+            while True:
+                raw = await _recv_with_keepalive(ws)
+                if raw is None:
+                    break
+
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    logger.exception("Failed to decode Bybit orderbook payload", exc_info=True)
+                    continue
+
+                if data.get("op") == "pong":
+                    continue
                 topic = data.get("topic", "")
                 if not topic.startswith("orderbook."):
                     continue
@@ -189,18 +222,54 @@ async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol])
                                 ts=now,
                             )
                         )
+        except ConnectionClosed:
+            logger.warning("Bybit orderbook stream connection closed, reconnecting")
         except Exception:
-            await asyncio.sleep(1)
+            logger.exception("Bybit orderbook stream error", exc_info=True)
+        await asyncio.sleep(1)
 
 
 async def _reconnect(url: str):
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=None,
+                close_timeout=5,
+            ) as ws:
                 yield ws
         except Exception:
-            await asyncio.sleep(2)
-            continue
+            logger.exception("Bybit websocket reconnect failed", exc_info=True)
+            await asyncio.sleep(1)
+
+
+async def _recv_with_keepalive(ws: websockets.WebSocketClientProtocol) -> str | None:
+    """Получить сообщение с учётом keepalive/пинга.
+
+    Возвращает None, если соединение нужно переподключить.
+    """
+
+    idle = 0.0
+    while True:
+        try:
+            return await asyncio.wait_for(ws.recv(), timeout=PING_INTERVAL)
+        except asyncio.TimeoutError:
+            idle += PING_INTERVAL
+            if idle >= MAX_IDLE_BEFORE_RECONNECT:
+                logger.warning(
+                    "Bybit websocket idle for %.1fs, reconnecting", idle
+                )
+                return None
+            try:
+                await ws.send(json.dumps({"op": "ping"}))
+            except Exception:
+                logger.exception("Failed to send ping to Bybit websocket", exc_info=True)
+                return None
+        except ConnectionClosed:
+            raise
+        except Exception:
+            logger.exception("Unexpected Bybit websocket receive error", exc_info=True)
+            return None
 
 
 @dataclass

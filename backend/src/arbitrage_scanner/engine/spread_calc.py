@@ -149,6 +149,9 @@ def compute_rows(
                     continue
                 short_ob = short_payload.get("order_book")
 
+                if abs(long_t.ts - short_t.ts) > 0.5:
+                    continue
+
                 fl = long_payload.get("funding")
                 fs = short_payload.get("funding")
 

@@ -90,6 +90,7 @@ class TickerStore:
             previous is not None
             and previous.bid == t.bid
             and previous.ask == t.ask
+            and abs(previous.ts - t.ts) < 1e-6
         ):
             return
         self._latest[key] = t
