@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -12,6 +13,7 @@ import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .utils import pick_timestamp, now_ts, iter_ws_messages
 
 MIN_SYMBOL_THRESHOLD = 5
 
@@ -22,6 +24,8 @@ POLL_INTERVAL = 1.5
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
 WS_SUB_DELAY = 0.05
 WS_DEPTH_LEVELS = 50
+
+logger = logging.getLogger(__name__)
 
 
 def _as_float(value) -> float:
@@ -99,7 +103,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
 
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
-            now = time.time()
+            batch_received_at = now_ts()
             try:
                 ticker_resp = await client.get(TICKERS_URL)
                 ticker_resp.raise_for_status()
@@ -108,7 +112,7 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                 await asyncio.sleep(2.0)
                 continue
 
-            funding_map: Dict[str, tuple[float, str]] = {}
+            funding_map: Dict[str, tuple[float, str, float]] = {}
             try:
                 funding_resp = await client.get(FUNDING_URL)
                 funding_resp.raise_for_status()
@@ -119,7 +123,14 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                         continue
                     rate = _as_float(item.get("fundingRate") or item.get("rate"))
                     interval = _parse_interval(item)
-                    funding_map[sym_raw] = (rate, interval)
+                    funding_ts = pick_timestamp(
+                        item.get("fundingTime"),
+                        item.get("timestamp"),
+                        item.get("ts"),
+                        item.get("time"),
+                        default=batch_received_at,
+                    )
+                    funding_map[sym_raw] = (rate, interval, funding_ts)
             except Exception:
                 funding_map = {}
 
@@ -140,19 +151,30 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                 if not sym_common:
                     continue
 
+                event_ts = pick_timestamp(
+                    item.get("timestamp"),
+                    item.get("ts"),
+                    item.get("time"),
+                    item.get("updateTime"),
+                    default=batch_received_at,
+                )
+
                 store.upsert_ticker(
                     Ticker(
                         exchange="mexc",
                         symbol=sym_common,
                         bid=bid,
                         ask=ask,
-                        ts=now,
+                        ts=batch_received_at,
+                        event_ts=event_ts,
                     )
                 )
 
                 if sym_raw in funding_map:
-                    rate, interval = funding_map[sym_raw]
-                    store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
+                    rate, interval, funding_ts = funding_map[sym_raw]
+                    store.upsert_funding(
+                        "mexc", sym_common, rate=rate, interval=interval, ts=funding_ts
+                    )
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -177,7 +199,12 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                 await ws.send(json.dumps(payload))
                 await asyncio.sleep(WS_SUB_DELAY)
 
-            async for raw in ws:
+            async for raw in iter_ws_messages(
+                ws,
+                ping_interval=6.0,
+                max_idle=18.0,
+                name="mexc:depth",
+            ):
                 msg = _decode_ws_message(raw)
                 if msg is None:
                     continue
@@ -211,17 +238,44 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                 bids, asks = book.top_levels()
                 last_price = _extract_last_price(data)
 
+                received_at = now_ts()
+                event_ts = pick_timestamp(
+                    data.get("timestamp"),
+                    data.get("ts"),
+                    data.get("time"),
+                    msg.get("ts") if isinstance(msg, dict) else None,
+                    msg.get("time") if isinstance(msg, dict) else None,
+                    default=received_at,
+                )
+
                 store.upsert_order_book(
                     "mexc",
                     sym_common,
                     bids=bids or None,
                     asks=asks or None,
-                    ts=time.time(),
+                    ts=received_at,
                     last_price=last_price,
+                    last_price_ts=event_ts if last_price is not None else None,
                 )
+
+                if bids and asks:
+                    store.upsert_ticker(
+                        Ticker(
+                            exchange="mexc",
+                            symbol=sym_common,
+                            bid=bids[0][0],
+                            ask=asks[0][0],
+                            ts=received_at,
+                            event_ts=event_ts,
+                        )
+                    )
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            logger.warning("MEXC depth stream stalled: %s", exc)
+            await asyncio.sleep(1.0)
         except Exception:
+            logger.exception("MEXC depth stream error", exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -229,7 +283,10 @@ async def _reconnect_ws():
     while True:
         try:
             async with websockets.connect(
-                WS_ENDPOINT, ping_interval=20, ping_timeout=20, close_timeout=5
+                WS_ENDPOINT,
+                ping_interval=None,
+                close_timeout=5,
+                max_queue=None,
             ) as ws:
                 yield ws
         except asyncio.CancelledError:
@@ -570,74 +627,6 @@ async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
                     store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
 
             await asyncio.sleep(POLL_INTERVAL)
-
-
-async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
-    wanted = {_to_mexc_symbol(sym) for sym in symbols if sym}
-    if not wanted:
-        return
-
-    ws_symbols = sorted(wanted)
-    books: Dict[str, _MexcOrderBookState] = {}
-    wanted_common = {sym.replace("_", "") for sym in wanted}
-
-    async for ws in _reconnect_ws():
-        try:
-            for sym in ws_symbols:
-                payload = {
-                    "method": "sub.depth",
-                    "params": [sym, WS_DEPTH_LEVELS],
-                    "id": int(time.time() * 1_000),
-                }
-                await ws.send(json.dumps(payload))
-                await asyncio.sleep(WS_SUB_DELAY)
-
-            async for raw in ws:
-                msg = _decode_ws_message(raw)
-                if msg is None:
-                    continue
-
-                if _is_ping(msg):
-                    await _reply_pong(ws, msg)
-                    continue
-
-                parsed = _extract_depth_message(msg)
-                if not parsed:
-                    continue
-
-                snapshot, data, sym_raw = parsed
-                if not isinstance(data, dict):
-                    continue
-
-                sym_common = _from_mexc_symbol(sym_raw)
-                if not sym_common or sym_common not in wanted_common:
-                    continue
-
-                book = books.setdefault(sym_common, _MexcOrderBookState())
-
-                bids_raw = data.get("bids") or data.get("bid") or data.get("buy")
-                asks_raw = data.get("asks") or data.get("ask") or data.get("sell")
-
-                if snapshot:
-                    book.snapshot(bids_raw, asks_raw)
-                else:
-                    book.update(bids_raw, asks_raw)
-
-                bids, asks = book.top_levels()
-                last_price = _extract_last_price(data)
-
-                store.upsert_order_book(
-                    "mexc",
-                    sym_common,
-                    bids=bids or None,
-                    asks=asks or None,
-                    ts=time.time(),
-                    last_price=last_price,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await asyncio.sleep(2.0)
 
 
 async def _reconnect_ws():

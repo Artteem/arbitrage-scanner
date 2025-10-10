@@ -36,7 +36,9 @@ FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 SPREAD_REFRESH_INTERVAL = 0.1
+SPREAD_RECALC_EVENT: asyncio.Event = asyncio.Event()
 SPREAD_EVENT: asyncio.Event = asyncio.Event()
+store.add_listener(lambda: SPREAD_RECALC_EVENT.set())
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
@@ -91,8 +93,18 @@ def _rows_for_symbol(symbol: Symbol) -> list[Row]:
 
 async def _spread_loop() -> None:
     global LAST_ROWS, LAST_ROWS_TS
+    SPREAD_RECALC_EVENT.set()
     while True:
         try:
+            try:
+                await asyncio.wait_for(
+                    SPREAD_RECALC_EVENT.wait(), timeout=SPREAD_REFRESH_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                SPREAD_RECALC_EVENT.clear()
+
             rows = compute_rows(
                 store,
                 symbols=SYMBOLS if SYMBOLS else FALLBACK_SYMBOLS,
@@ -117,7 +129,6 @@ async def _spread_loop() -> None:
             LAST_ROWS = []
             LAST_ROWS_TS = 0.0
             SPREAD_EVENT.set()
-        await asyncio.sleep(SPREAD_REFRESH_INTERVAL)
 
 
 @app.on_event("startup")

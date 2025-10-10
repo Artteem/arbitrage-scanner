@@ -565,6 +565,22 @@ select:focus {
 
 .pair-link {
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+}
+
+.pair-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pair-lag-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--bad);
+  display: inline-block;
 }
 
 .empty-state {

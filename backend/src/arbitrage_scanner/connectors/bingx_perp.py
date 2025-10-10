@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import zlib
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -13,6 +14,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
 from .discovery import discover_bingx_usdt_perp
+from .utils import pick_timestamp, now_ts, iter_ws_messages
 
 TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
@@ -37,6 +39,8 @@ WS_ENDPOINTS = (
 WS_SUB_CHUNK = 80
 WS_SUB_DELAY = 0.05
 MIN_SYMBOL_THRESHOLD = 5
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
@@ -168,7 +172,12 @@ async def _run_bingx_ws_tickers(
                 await _send_ws_subscriptions(ws, batch)
                 await asyncio.sleep(WS_SUB_DELAY)
 
-            async for raw_msg in ws:
+            async for raw_msg in iter_ws_messages(
+                ws,
+                ping_interval=6.0,
+                max_idle=20.0,
+                name="bingx:ticker",
+            ):
                 msg = _decode_ws_message(raw_msg)
                 if msg is None:
                     continue
@@ -185,6 +194,18 @@ async def _run_bingx_ws_tickers(
                     common_symbol = _from_bingx_symbol(exchange_symbol)
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
+
+                    received_at = now_ts()
+                    event_ts = pick_timestamp(
+                        payload.get("time"),
+                        payload.get("ts"),
+                        payload.get("timestamp"),
+                        payload.get("updateTime"),
+                        msg.get("ts"),
+                        msg.get("time"),
+                        msg.get("timestamp"),
+                        default=received_at,
+                    )
 
                     bid = _extract_price(
                         payload,
@@ -228,14 +249,19 @@ async def _run_bingx_ws_tickers(
                             symbol=common_symbol,
                             bid=bid,
                             ask=ask,
-                            ts=time.time(),
+                            ts=received_at,
+                            event_ts=event_ts,
                         )
                     )
                     if ready_event and not ready_event.is_set():
                         ready_event.set()
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            logger.warning("BingX ticker stream stalled: %s", exc)
+            await asyncio.sleep(1.0)
         except Exception:
+            logger.exception("BingX ticker stream error", exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -258,7 +284,12 @@ async def _run_bingx_orderbooks(
                 await _send_ws_depth_subscriptions(ws, batch)
                 await asyncio.sleep(WS_SUB_DELAY)
 
-            async for raw_msg in ws:
+            async for raw_msg in iter_ws_messages(
+                ws,
+                ping_interval=6.0,
+                max_idle=20.0,
+                name="bingx:depth",
+            ):
                 msg = _decode_ws_message(raw_msg)
                 if msg is None:
                     continue
@@ -276,6 +307,18 @@ async def _run_bingx_orderbooks(
                     if not common_symbol or common_symbol not in wanted_common:
                         continue
 
+                    received_at = now_ts()
+                    event_ts = pick_timestamp(
+                        payload.get("time"),
+                        payload.get("ts"),
+                        payload.get("timestamp"),
+                        payload.get("updateTime"),
+                        msg.get("ts"),
+                        msg.get("time"),
+                        msg.get("timestamp"),
+                        default=received_at,
+                    )
+
                     bids, asks, last_price = _extract_depth_payload(payload)
                     if not bids and not asks and last_price is None:
                         continue
@@ -285,12 +328,29 @@ async def _run_bingx_orderbooks(
                         common_symbol,
                         bids=bids or None,
                         asks=asks or None,
-                        ts=time.time(),
+                        ts=received_at,
                         last_price=last_price,
+                        last_price_ts=event_ts if last_price is not None else None,
                     )
+
+                    if bids and asks:
+                        store.upsert_ticker(
+                            Ticker(
+                                exchange="bingx",
+                                symbol=common_symbol,
+                                bid=bids[0][0],
+                                ask=asks[0][0],
+                                ts=received_at,
+                                event_ts=event_ts,
+                            )
+                        )
         except asyncio.CancelledError:
             raise
+        except RuntimeError as exc:
+            logger.warning("BingX depth stream stalled: %s", exc)
+            await asyncio.sleep(1.0)
         except Exception:
+            logger.exception("BingX depth stream error", exc_info=True)
             await asyncio.sleep(2.0)
 
 
@@ -301,7 +361,10 @@ async def _reconnect_ws():
         idx += 1
         try:
             async with websockets.connect(
-                endpoint, ping_interval=20, ping_timeout=20, close_timeout=5
+                endpoint,
+                ping_interval=None,
+                close_timeout=5,
+                max_queue=None,
             ) as ws:
                 yield ws
         except asyncio.CancelledError:
@@ -724,7 +787,7 @@ async def _poll_bingx_http(
 
     async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
         while True:
-            now = time.time()
+            batch_received_at = now_ts()
             params = param_candidates[params_idx]
             url = TICKERS_URLS[url_idx]
             try:
@@ -812,13 +875,22 @@ async def _poll_bingx_http(
                 if wanted_common and (not common_symbol or common_symbol not in wanted_common):
                     continue
 
+                event_ts = pick_timestamp(
+                    raw.get("timestamp"),
+                    raw.get("ts"),
+                    raw.get("time"),
+                    raw.get("updateTime"),
+                    default=batch_received_at,
+                )
+
                 store.upsert_ticker(
                     Ticker(
                         exchange="bingx",
                         symbol=common_symbol,
                         bid=bid,
                         ask=ask,
-                        ts=now,
+                        ts=batch_received_at,
+                        event_ts=event_ts,
                     )
                 )
 

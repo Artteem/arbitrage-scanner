@@ -644,6 +644,16 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
             {currentRows.map((row) => {
               const pairUrl = `/pair/${encodeURIComponent(row.symbol)}?long=${encodeURIComponent(row.long_exchange)}&short=${encodeURIComponent(row.short_exchange)}`;
               const displaySymbol = formatPairLabel(row.symbol);
+              const skewSeconds =
+                typeof row.skew_seconds === 'number' && Number.isFinite(row.skew_seconds)
+                  ? row.skew_seconds
+                  : null;
+              const skewMs = skewSeconds !== null ? Math.round(skewSeconds * 1000) : null;
+              const showSkew = Boolean(row.skewed && skewMs !== null && skewMs > 0);
+              const skewTitle =
+                showSkew && skewMs !== null
+                  ? `Разница времени обновления ${skewMs.toLocaleString('ru-RU')} мс`
+                  : undefined;
               return (
                 <tr key={`${row.symbol}-${row.long_exchange}-${row.short_exchange}`}>
                   <td>
@@ -652,8 +662,12 @@ export default function SpreadsTable({ initialStats }: SpreadsTableProps) {
                       target="_blank"
                       rel="noopener noreferrer"
                       className="pair-link"
+                      data-lag={showSkew ? 'true' : 'false'}
                     >
-                      {displaySymbol}
+                      <span className="pair-name">
+                        {showSkew ? <span className="pair-lag-dot" title={skewTitle} /> : null}
+                        <span>{displaySymbol}</span>
+                      </span>
                     </a>
                   </td>
                   <td>

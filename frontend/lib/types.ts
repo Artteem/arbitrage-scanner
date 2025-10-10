@@ -24,6 +24,10 @@ export interface SpreadRow {
   orderbook_long?: unknown;
   orderbook_short?: unknown;
   _ts?: number;
+  skew_seconds?: number;
+  skewed?: boolean;
+  latency_long?: number | null;
+  latency_short?: number | null;
 }
 
 export interface PairOverviewResponse {

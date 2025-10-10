@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 from dataclasses import dataclass
 from typing import List, Iterable, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
@@ -12,6 +13,10 @@ DEFAULT_TAKER_FEES: dict[ExchangeName, float] = {
     "mexc":   0.0006,  # 0.06%
     "bingx":  0.0005,  # 0.05%
 }
+
+MAX_TICKER_SKEW_SECONDS = 0.5
+STALE_TICKER_MAX_AGE = 2.0
+MAX_EVENT_LAG_SECONDS = 2.0
 
 @dataclass
 class Row:
@@ -32,6 +37,10 @@ class Row:
     price_short_ask: float
     orderbook_long: OrderBookData | None = None
     orderbook_short: OrderBookData | None = None
+    skew_seconds: float = 0.0
+    skewed: bool = False
+    latency_long: float | None = None
+    latency_short: float | None = None
 
     def as_dict(self) -> dict:
         # ВАЖНО: не ломаем фронт. Отдаём и ключ "commission" (как использовалось в UI),
@@ -61,6 +70,10 @@ class Row:
             "price_short_ask": self.price_short_ask,
             "orderbook_long": self.orderbook_long.to_dict() if self.orderbook_long else None,
             "orderbook_short": self.orderbook_short.to_dict() if self.orderbook_short else None,
+            "skew_seconds": round(self.skew_seconds, 6),
+            "skewed": self.skewed,
+            "latency_long": self.latency_long,
+            "latency_short": self.latency_short,
         }
 
 def _entry(bid_short: float, ask_long: float) -> float:
@@ -149,6 +162,22 @@ def compute_rows(
                     continue
                 short_ob = short_payload.get("order_book")
 
+                now = time.time()
+
+                if now - long_t.ts > STALE_TICKER_MAX_AGE or now - short_t.ts > STALE_TICKER_MAX_AGE:
+                    continue
+
+                skew_seconds = abs(long_t.ts - short_t.ts)
+                skewed = skew_seconds > MAX_TICKER_SKEW_SECONDS
+
+                long_latency = long_t.latency
+                short_latency = short_t.latency
+                if (
+                    (long_latency is not None and long_latency > MAX_EVENT_LAG_SECONDS)
+                    or (short_latency is not None and short_latency > MAX_EVENT_LAG_SECONDS)
+                ):
+                    continue
+
                 fl = long_payload.get("funding")
                 fs = short_payload.get("funding")
 
@@ -176,6 +205,10 @@ def compute_rows(
                         price_short_ask=short_t.ask,
                         orderbook_long=long_ob,
                         orderbook_short=short_ob,
+                        skew_seconds=skew_seconds,
+                        skewed=skewed,
+                        latency_long=long_latency,
+                        latency_short=short_latency,
                     )
                 )
 
