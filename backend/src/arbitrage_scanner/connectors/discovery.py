@@ -9,7 +9,7 @@ from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-BINGX_TICKERS = "https://bingx.com/api/v3/contract/tickers"
+BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
 async def discover_binance_usdt_perp() -> Set[str]:
@@ -94,22 +94,24 @@ async def discover_bingx_usdt_perp() -> Set[str]:
     }
 
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        r = await client.get(BINGX_TICKERS, params={"symbol": "ALL"})
-        r.raise_for_status()
-        payload = r.json()
+        response = await client.get(BINGX_CONTRACTS)
+        response.raise_for_status()
+        payload = response.json()
 
     items: Iterable = []
     if isinstance(payload, dict):
-        for key in ("data", "result", "tickers", "items"):
+        for key in ("data", "result", "contracts", "items", "symbols"):
             val = payload.get(key)
             if isinstance(val, list):
                 items = val
                 break
-            if isinstance(val, dict):
-                items = val.values()
-                break
         else:
-            items = list(payload.values())
+            # Некоторые ответы возвращают напрямую список контрактов
+            possible = payload.get("contractInfos") or payload.get("contractList")
+            if isinstance(possible, list):
+                items = possible
+            else:
+                items = list(payload.values())
     elif isinstance(payload, list):
         items = payload
 
@@ -117,12 +119,43 @@ async def discover_bingx_usdt_perp() -> Set[str]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        raw = item.get("symbol") or item.get("market") or item.get("instId")
-        common = _bingx_symbol_to_common(str(raw) if raw else None)
-        if not common:
+
+        quote = str(
+            item.get("quoteAsset")
+            or item.get("quote")
+            or item.get("quoteCurrency")
+            or item.get("settleCurrency")
+            or ""
+        ).upper()
+        if quote and quote != "USDT":
             continue
-        if not common.endswith("USDT"):
+
+        contract_type = str(
+            item.get("contractType")
+            or item.get("type")
+            or item.get("contractKind")
+            or ""
+        ).lower()
+        if contract_type and not any(token in contract_type for token in ("perpetual", "swap")):
             continue
+
+        status = str(item.get("status") or item.get("state") or item.get("isOpen") or "").strip()
+        if status:
+            normalized_status = status.lower()
+            if normalized_status in {"0", "false", "closed", "offline", "delisted"}:
+                continue
+
+        raw_symbol = None
+        for key in ("symbol", "contractId", "contract", "pair", "instId", "market"):
+            val = item.get(key)
+            if isinstance(val, str) and val:
+                raw_symbol = val
+                break
+
+        common = _bingx_symbol_to_common(raw_symbol)
+        if not common or not common.endswith("USDT"):
+            continue
+
         out.add(common)
 
     return out

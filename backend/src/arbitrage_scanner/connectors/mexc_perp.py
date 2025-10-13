@@ -22,7 +22,6 @@ FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
 POLL_INTERVAL = 1.5
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
-WS_SUB_DELAY = 0.05
 WS_DEPTH_LEVELS = 50
 
 logger = logging.getLogger(__name__)
@@ -197,7 +196,6 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                     "id": int(time.time() * 1_000),
                 }
                 await ws.send(json.dumps(payload))
-                await asyncio.sleep(WS_SUB_DELAY)
 
             async for raw in iter_ws_messages(
                 ws,
@@ -492,7 +490,6 @@ FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
 POLL_INTERVAL = 1.5
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
-WS_SUB_DELAY = 0.05
 WS_DEPTH_LEVELS = 50
 
 

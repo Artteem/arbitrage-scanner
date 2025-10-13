@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 import logging
-from typing import Sequence, List
+from typing import Awaitable, Callable, Dict, Sequence
 
 import websockets
 
@@ -13,10 +13,7 @@ from ..store import TickerStore
 from .discovery import discover_binance_usdt_perp
 from .utils import pick_timestamp, now_ts, iter_ws_messages
 
-BOOK_WS = "wss://fstream.binance.com/stream"
-MARK_WS = "wss://fstream.binance.com/stream"
-DEPTH_WS = "wss://fstream.binance.com/stream"
-TRADE_WS = "wss://fstream.binance.com/stream"
+WS_ENDPOINT = "wss://fstream.binance.com/stream"
 
 MIN_SYMBOL_THRESHOLD = 5
 
@@ -32,7 +29,7 @@ def _stream_name_depth(sym: str) -> str:
 def _stream_name_trade(sym: str) -> str:
     return f"{sym.lower()}@aggTrade"
 
-CHUNK = 100  # безопасный размер пакета подписки
+CHUNK = 250  # безопасный размер пакета подписки
 
 logger = logging.getLogger(__name__)
 
@@ -48,32 +45,6 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
 
     if not subscribe:
         return
-
-    async def _consume(endpoint: str, params: List[str], handler):
-        # отдельное соединение на каждый батч
-        stream_label = f"{endpoint}:{','.join(params[:3])}" if params else endpoint
-        async for ws in _reconnect(endpoint):
-            try:
-                sub = {"method": "SUBSCRIBE", "params": params, "id": int(time.time())}
-                await ws.send(json.dumps(sub))
-                async for msg in iter_ws_messages(
-                    ws,
-                    ping_interval=5.0,
-                    max_idle=20.0,
-                    name=f"binance:{stream_label}",
-                ):
-                    data = json.loads(msg)
-                    d = data.get("data")
-                    if not d:
-                        continue
-                    await handler(d)
-            except asyncio.CancelledError:
-                raise
-            except RuntimeError as exc:
-                logger.warning("Binance stream %s idle: %s", stream_label, exc)
-            except Exception:
-                logger.exception("Binance stream %s error", stream_label, exc_info=True)
-            await asyncio.sleep(1)
 
     async def _handle_book(d):
         # d: { s, b, a, ... }
@@ -179,18 +150,81 @@ async def run_binance(store: TickerStore, symbols: Sequence[Symbol]):
             last_price_ts=event_ts,
         )
 
-    # батчим
-    tasks = []
-    for i in range(0, len(subscribe), CHUNK):
-        batch = subscribe[i:i+CHUNK]
-        book_params = [_stream_name_book(s) for s in batch]
-        mark_params = [_stream_name_mark(s) for s in batch]
-        depth_params = [_stream_name_depth(s) for s in batch]
-        trade_params = [_stream_name_trade(s) for s in batch]
-        tasks.append(asyncio.create_task(_consume(BOOK_WS, book_params, _handle_book)))
-        tasks.append(asyncio.create_task(_consume(MARK_WS, mark_params, _handle_mark)))
-        tasks.append(asyncio.create_task(_consume(DEPTH_WS, depth_params, _handle_depth)))
-        tasks.append(asyncio.create_task(_consume(TRADE_WS, trade_params, _handle_trade)))
+    async def _consume_batch(batch: Sequence[Symbol]):
+        if not batch:
+            return
+
+        handler_map: Dict[str, Callable[[dict], Awaitable[None]]] = {}
+        for sym in batch:
+            handler_map[_stream_name_book(sym)] = _handle_book
+            handler_map[_stream_name_mark(sym)] = _handle_mark
+            handler_map[_stream_name_depth(sym)] = _handle_depth
+            handler_map[_stream_name_trade(sym)] = _handle_trade
+
+        params = sorted(handler_map.keys())
+        if not params:
+            return
+
+        label = f"{params[0]}..." if len(params) > 1 else params[0]
+
+        def _infer_stream(event: str | None, symbol: str | None) -> str | None:
+            if not event or not symbol:
+                return None
+            event_norm = event.lower()
+            symbol_norm = symbol.lower()
+            if event_norm == "bookticker":
+                return f"{symbol_norm}@bookTicker"
+            if event_norm == "markpriceupdate":
+                return f"{symbol_norm}@markPrice@1s"
+            if event_norm == "depthupdate":
+                return f"{symbol_norm}@depth5@100ms"
+            if event_norm == "aggtrade":
+                return f"{symbol_norm}@aggTrade"
+            return None
+
+        async for ws in _reconnect(WS_ENDPOINT):
+            sub_id = int(time.time())
+            try:
+                await ws.send(json.dumps({"method": "SUBSCRIBE", "params": params, "id": sub_id}))
+                async for msg in iter_ws_messages(
+                    ws,
+                    ping_interval=5.0,
+                    max_idle=20.0,
+                    name=f"binance:{label}",
+                ):
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        logger.exception("Failed to decode Binance payload", exc_info=True)
+                        continue
+
+                    if data.get("id") == sub_id and data.get("result") in (None, "success"):
+                        continue
+
+                    payload = data.get("data") if isinstance(data, dict) else None
+                    stream = data.get("stream") if isinstance(data, dict) else None
+
+                    if payload is None:
+                        payload = data
+
+                    if stream is None and isinstance(payload, dict):
+                        stream = _infer_stream(payload.get("e"), payload.get("s") or payload.get("symbol"))
+
+                    handler = handler_map.get(stream)
+                    if handler and isinstance(payload, dict):
+                        await handler(payload)
+            except asyncio.CancelledError:
+                raise
+            except RuntimeError as exc:
+                logger.warning("Binance stream %s idle: %s", label, exc)
+            except Exception:
+                logger.exception("Binance stream %s error", label)
+            await asyncio.sleep(1)
+
+    tasks = [
+        asyncio.create_task(_consume_batch(subscribe[i : i + CHUNK]))
+        for i in range(0, len(subscribe), CHUNK)
+    ]
     await asyncio.gather(*tasks)
 
 async def _reconnect(url: str):

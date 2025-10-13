@@ -14,6 +14,7 @@ from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
+from .constants import FALLBACK_SYMBOLS
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
@@ -31,8 +32,6 @@ TAKER_FEES = {**DEFAULT_TAKER_FEES}
 for connector in CONNECTORS:
     if connector.taker_fee is not None:
         TAKER_FEES[connector.name] = connector.taker_fee
-
-FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 SPREAD_REFRESH_INTERVAL = 0.1
