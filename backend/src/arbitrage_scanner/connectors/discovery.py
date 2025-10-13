@@ -8,6 +8,7 @@ from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_PREMIUM_INDEX = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_HEADERS = {
     # Binance начала более агрессивно отсеивать запросы без заголовка User-Agent,
     # поэтому явно укажем типичный браузерный агент, чтобы не получать 403.
@@ -17,22 +18,90 @@ BINANCE_HEADERS = {
         "Chrome/124.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Origin": "https://www.binance.com",
+    "Referer": "https://www.binance.com/",
 }
+_BINANCE_EXPECTED_MIN = 50
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
 BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
-async def discover_binance_usdt_perp() -> Set[str]:
-    async with httpx.AsyncClient(timeout=20, headers=BINANCE_HEADERS) as client:
-        r = await client.get(BINANCE_EXCHANGE_INFO)
-        r.raise_for_status()
-        data = r.json()
+def _extract_binance_perpetuals(payload: dict) -> Set[str]:
     out: Set[str] = set()
-    for s in data.get("symbols", []):
-        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-            sym = s.get("symbol")
-            if sym: out.add(sym)
+    for item in payload.get("symbols", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") != "TRADING":
+            continue
+        if item.get("contractType") != "PERPETUAL":
+            continue
+        if item.get("quoteAsset") != "USDT":
+            continue
+        symbol = item.get("symbol")
+        if symbol:
+            out.add(str(symbol))
     return out
+
+
+async def _discover_binance_from_premium_index(client: httpx.AsyncClient) -> Set[str]:
+    response = await client.get(BINANCE_PREMIUM_INDEX)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        items = payload.get("data") or payload.get("symbols") or []
+    else:
+        items = payload
+    out: Set[str] = set()
+    for entry in items or []:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        if not symbol:
+            continue
+        candidate = str(symbol).upper()
+        if candidate.endswith("USDT"):
+            out.add(candidate)
+    return out
+
+
+async def discover_binance_usdt_perp() -> Set[str]:
+    primary: Set[str] = set()
+    primary_error: Exception | None = None
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0),
+        headers=BINANCE_HEADERS,
+        http2=True,
+    ) as client:
+        try:
+            response = await client.get(BINANCE_EXCHANGE_INFO)
+            response.raise_for_status()
+            payload = response.json()
+            primary = _extract_binance_perpetuals(payload)
+        except Exception as exc:  # noqa: BLE001 - propagate only if fallback fails
+            primary_error = exc
+
+        if len(primary) >= _BINANCE_EXPECTED_MIN:
+            return primary
+
+        fallback: Set[str] = set()
+        fallback_error: Exception | None = None
+        try:
+            fallback = await _discover_binance_from_premium_index(client)
+        except Exception as exc:  # noqa: BLE001
+            fallback_error = exc
+
+        if fallback:
+            return primary | fallback if primary else fallback
+        if primary:
+            return primary
+        if primary_error:
+            raise primary_error
+        if fallback_error:
+            raise fallback_error
+        return set()
 
 async def discover_bybit_linear_usdt() -> Set[str]:
     async with httpx.AsyncClient(timeout=20) as client:
