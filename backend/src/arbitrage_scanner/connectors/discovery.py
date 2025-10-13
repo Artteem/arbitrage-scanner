@@ -9,7 +9,7 @@ from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-BINGX_TICKERS = "https://bingx.com/api/v3/contract/tickers"
+BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
 async def discover_binance_usdt_perp() -> Set[str]:
@@ -85,6 +85,21 @@ def _bingx_symbol_to_common(symbol: str | None) -> str | None:
     return normalize_bingx_symbol(symbol)
 
 
+def _is_usdt_quote(candidate) -> bool:
+    if candidate is None:
+        return False
+    return str(candidate).upper() == "USDT"
+
+
+def _is_perpetual_contract(value) -> bool:
+    if value is None:
+        return True
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return True
+    return any(key in normalized for key in ("perp", "perpetual", "swap"))
+
+
 async def discover_bingx_usdt_perp() -> Set[str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -94,13 +109,13 @@ async def discover_bingx_usdt_perp() -> Set[str]:
     }
 
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        r = await client.get(BINGX_TICKERS, params={"symbol": "ALL"})
+        r = await client.get(BINGX_CONTRACTS)
         r.raise_for_status()
         payload = r.json()
 
     items: Iterable = []
     if isinstance(payload, dict):
-        for key in ("data", "result", "tickers", "items"):
+        for key in ("data", "result", "contracts", "items"):
             val = payload.get(key)
             if isinstance(val, list):
                 items = val
@@ -117,12 +132,36 @@ async def discover_bingx_usdt_perp() -> Set[str]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        raw = item.get("symbol") or item.get("market") or item.get("instId")
-        common = _bingx_symbol_to_common(str(raw) if raw else None)
+
+        raw_symbol = (
+            item.get("symbol")
+            or item.get("tradingPair")
+            or item.get("instId")
+            or item.get("contractId")
+        )
+        common = _bingx_symbol_to_common(str(raw_symbol) if raw_symbol else None)
         if not common:
             continue
-        if not common.endswith("USDT"):
+
+        quote_candidates = (
+            item.get("quoteAsset"),
+            item.get("quoteCurrency"),
+            item.get("quoteCoin"),
+            item.get("settleAsset"),
+            item.get("settleCurrency"),
+            item.get("marginCoin"),
+        )
+        if not any(_is_usdt_quote(candidate) for candidate in quote_candidates):
+            if not common.upper().endswith("USDT"):
+                continue
+
+        if not _is_perpetual_contract(
+            item.get("contractType")
+            or item.get("type")
+            or item.get("productType")
+        ):
             continue
+
         out.add(common)
 
     return out
