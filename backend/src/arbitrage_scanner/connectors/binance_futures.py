@@ -19,7 +19,7 @@ MIN_SYMBOL_THRESHOLD = 5
 
 STREAM_SUFFIX_BOOK = "@bookTicker"
 STREAM_SUFFIX_MARK = "@markPrice@1s"
-STREAM_SUFFIX_DEPTH = "@depth5@100ms"
+STREAM_SUFFIX_DEPTH = "@depth20@100ms"
 STREAM_SUFFIX_TRADE = "@aggTrade"
 
 
@@ -150,9 +150,9 @@ def _handle_depth(store: TickerStore, symbol: str, payload: dict) -> None:
     if not bids and not asks:
         return
 
-    def _convert(levels):
+    def _convert(levels, depth: int = 20):
         out = []
-        for level in levels[:5]:
+        for level in levels[:depth]:
             if not isinstance(level, (list, tuple)) or len(level) < 2:
                 continue
             try:

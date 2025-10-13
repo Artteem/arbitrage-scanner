@@ -1,5 +1,6 @@
 from __future__ import annotations
-import asyncio, json, logging, time
+import asyncio, json, logging, math, time
+from collections import defaultdict
 from typing import Iterable, Sequence
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
@@ -15,9 +16,13 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
-from .exchanges.history import fetch_spread_history
+from .exchanges.history import fetch_spread_history, fetch_bid_ask_history
+from .persistence import DataRecorder, Database, SpreadSnapshotRecord, TickRecord
 
 app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
+
+DATABASE = Database(settings.database_path)
+RECORDER = DataRecorder(DATABASE)
 
 store = TickerStore()
 _tasks: list[asyncio.Task] = []
@@ -39,6 +44,8 @@ SPREAD_REFRESH_INTERVAL = 0.1
 SPREAD_EVENT: asyncio.Event = asyncio.Event()
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
+
+HISTORY_LOOKBACK_DAYS = 10.0
 
 TIMEFRAME_ALIASES: dict[str, int] = {
     "1m": 60,
@@ -89,6 +96,166 @@ def _rows_for_symbol(symbol: Symbol) -> list[Row]:
     )
 
 
+
+
+async def _initialize_historical_data() -> None:
+    if not DATABASE.is_connected:
+        return
+    effective_symbols = SYMBOLS if SYMBOLS else FALLBACK_SYMBOLS
+    exchange_symbols: dict[ExchangeName, list[Symbol]] = {}
+    for connector in CONNECTORS:
+        exchange_symbols[connector.name] = list(
+            dict.fromkeys(CONNECTOR_SYMBOLS.get(connector.name) or effective_symbols)
+        )
+    try:
+        await _backfill_ticks(exchange_symbols, HISTORY_LOOKBACK_DAYS)
+    except Exception:
+        logger.exception("Failed to backfill tick history", exc_info=True)
+    try:
+        await _compose_spreads_from_ticks(effective_symbols, tuple(exchange_symbols.keys()), HISTORY_LOOKBACK_DAYS)
+    except Exception:
+        logger.exception("Failed to build spread history from ticks", exc_info=True)
+
+
+async def _backfill_ticks(
+    exchange_symbols: dict[ExchangeName, list[Symbol]], lookback_days: float
+) -> None:
+    for exchange, symbols in exchange_symbols.items():
+        if not symbols:
+            continue
+        await _fetch_ticks_for_exchange(exchange, symbols, lookback_days)
+
+
+async def _fetch_ticks_for_exchange(
+    exchange: ExchangeName, symbols: Sequence[Symbol], lookback_days: float
+) -> None:
+    for symbol in dict.fromkeys(symbols):
+        try:
+            history = await fetch_bid_ask_history(
+                exchange=exchange,
+                symbol=symbol,
+                timeframe_seconds=60,
+                lookback_days=lookback_days,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to fetch historical ticks",
+                exc_info=True,
+                extra={"exchange": exchange, "symbol": symbol},
+            )
+            continue
+        if not history:
+            continue
+        batch: list[TickRecord] = []
+        for entry in history:
+            ts_ms = int(entry.ts * 1000)
+            batch.append(
+                TickRecord(
+                    exchange=exchange,
+                    symbol=symbol,
+                    ts_ms=ts_ms,
+                    bid=entry.bid,
+                    ask=entry.ask,
+                )
+            )
+            if len(batch) >= 500:
+                await DATABASE.insert_ticks(batch)
+                batch.clear()
+        if batch:
+            await DATABASE.insert_ticks(batch)
+
+
+async def _compose_spreads_from_ticks(
+    symbols: Sequence[Symbol], exchanges: Sequence[ExchangeName], lookback_days: float
+) -> None:
+    if not symbols or not exchanges:
+        return
+    end_ts = int(time.time())
+    start_ts = end_ts - int(max(lookback_days, 0) * 86400)
+    start_ms = start_ts * 1000
+    end_ms = end_ts * 1000
+    for symbol in dict.fromkeys(symbols):
+        ticks = await DATABASE.fetch_ticks(
+            symbol=symbol,
+            start_ts_ms=start_ms,
+            end_ts_ms=end_ms,
+        )
+        if not ticks:
+            continue
+        per_ts: dict[int, dict[str, TickRecord]] = defaultdict(dict)
+        for record in ticks:
+            ts_sec = int(record.ts_ms // 1000)
+            per_ts[ts_sec][str(record.exchange).lower()] = record
+        snapshots: list[SpreadSnapshotRecord] = []
+        for ts, by_exchange in sorted(per_ts.items()):
+            for long_exchange in exchanges:
+                long_rec = by_exchange.get(str(long_exchange).lower())
+                if not long_rec:
+                    continue
+                for short_exchange in exchanges:
+                    if long_exchange == short_exchange:
+                        continue
+                    short_rec = by_exchange.get(str(short_exchange).lower())
+                    if not short_rec:
+                        continue
+                    entry = _compute_entry(short_rec.bid, long_rec.ask)
+                    exit_value = _compute_exit(long_rec.bid, short_rec.ask)
+                    if entry is None or exit_value is None:
+                        continue
+                    snapshots.append(
+                        SpreadSnapshotRecord(
+                            symbol=symbol,
+                            long_exchange=long_exchange,
+                            short_exchange=short_exchange,
+                            ts=ts,
+                            entry_pct=entry,
+                            exit_pct=exit_value,
+                            long_bid=long_rec.bid,
+                            long_ask=long_rec.ask,
+                            short_bid=short_rec.bid,
+                            short_ask=short_rec.ask,
+                            long_bids=[],
+                            long_asks=[],
+                            short_bids=[],
+                            short_asks=[],
+                        )
+                    )
+                    if len(snapshots) >= 500:
+                        await DATABASE.insert_spread_snapshots(snapshots)
+                        snapshots.clear()
+        if snapshots:
+            await DATABASE.insert_spread_snapshots(snapshots)
+
+
+def _compute_entry(short_bid: float, long_ask: float) -> float | None:
+    try:
+        short_bid = float(short_bid)
+        long_ask = float(long_ask)
+    except (TypeError, ValueError):
+        return None
+    if short_bid <= 0 or long_ask <= 0:
+        return None
+    mid = (short_bid + long_ask) / 2.0
+    if mid <= 0:
+        return None
+    value = (short_bid - long_ask) / mid * 100.0
+    return value if math.isfinite(value) else None
+
+
+def _compute_exit(long_bid: float, short_ask: float) -> float | None:
+    try:
+        long_bid = float(long_bid)
+        short_ask = float(short_ask)
+    except (TypeError, ValueError):
+        return None
+    if long_bid <= 0 or short_ask <= 0:
+        return None
+    mid = (long_bid + short_ask) / 2.0
+    if mid <= 0:
+        return None
+    value = (long_bid - short_ask) / mid * 100.0
+    return value if math.isfinite(value) else None
+
 async def _spread_loop() -> None:
     global LAST_ROWS, LAST_ROWS_TS
     while True:
@@ -109,6 +276,7 @@ async def _spread_loop() -> None:
                     exit_value=row.exit_pct,
                     ts=ts,
                 )
+                RECORDER.record_spread_row(row, ts)
             LAST_ROWS = rows
             LAST_ROWS_TS = ts
             SPREAD_EVENT.set()
@@ -124,6 +292,9 @@ async def _spread_loop() -> None:
 async def startup():
     # 1) Автоматически найдём пересечение USDT-перпетуалов
     global SYMBOLS, CONNECTOR_SYMBOLS
+    await DATABASE.connect()
+    await RECORDER.start()
+    store.set_observer(RECORDER)
     try:
         discovery = await discover_symbols_for_connectors(CONNECTORS)
         if discovery.symbols_union:
@@ -137,6 +308,8 @@ async def startup():
         SYMBOLS = FALLBACK_SYMBOLS
         CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
+    await _initialize_historical_data()
+
     # 2) Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
@@ -149,6 +322,8 @@ async def shutdown():
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    await RECORDER.stop()
+    await DATABASE.close()
 
 
 @app.get("/health")
@@ -201,69 +376,59 @@ async def pair_spreads(
     symbol_upper = symbol.upper()
     long_key = long_exchange.lower()
     short_key = short_exchange.lower()
-    candles = SPREAD_HISTORY.get_candles(
+    lookback_seconds = int(max(lookback_days, 0) * 86400)
+    start_ts = int(time.time()) - lookback_seconds if lookback_seconds else 0
+    db_rows = await DATABASE.fetch_spread_candles(
+        metric=metric_key,
+        symbol=symbol_upper,
+        long_exchange=long_key,
+        short_exchange=short_key,
+        timeframe_seconds=tf_value,
+        start_ts=start_ts,
+    )
+    combined: dict[int, dict] = {row.start_ts: row.to_dict() for row in db_rows}
+    realtime = SPREAD_HISTORY.get_candles(
         metric_key,
         symbol=symbol_upper,
         long_exchange=long_key,
         short_exchange=short_key,
         timeframe=tf_value,
     )
-    need_backfill = not candles
-    if lookback_days:
-        cutoff_ts = int(time.time() - lookback_days * 86400)
-        if candles and candles[0].start_ts > cutoff_ts:
-            need_backfill = True
-    if need_backfill:
-        now = time.time()
-        rows = _rows_for_symbol(symbol)
-        if rows:
-            for row in rows:
-                SPREAD_HISTORY.add_point(
-                    symbol=row.symbol,
-                    long_exchange=row.long_ex,
-                    short_exchange=row.short_ex,
-                    entry_value=row.entry_pct,
-                    exit_value=row.exit_pct,
-                    ts=now,
-                )
+    for candle in realtime:
+        combined[candle.start_ts] = {
+            "ts": candle.start_ts,
+            "open": candle.open,
+            "high": candle.high,
+            "low": candle.low,
+            "close": candle.close,
+        }
+    if not combined and lookback_days >= 1.0:
         try:
             entry_hist, exit_hist = await fetch_spread_history(
                 symbol=symbol_upper,
                 long_exchange=long_key,
                 short_exchange=short_key,
                 timeframe_seconds=tf_value,
-                lookback_days=max(lookback_days, 1.0),
+                lookback_days=lookback_days,
             )
-            if entry_hist:
-                SPREAD_HISTORY.merge_external(
-                    "entry",
-                    symbol=symbol_upper,
-                    long_exchange=long_key,
-                    short_exchange=short_key,
-                    timeframe=tf_value,
-                    candles=entry_hist,
-                )
-            if exit_hist:
-                SPREAD_HISTORY.merge_external(
-                    "exit",
-                    symbol=symbol_upper,
-                    long_exchange=long_key,
-                    short_exchange=short_key,
-                    timeframe=tf_value,
-                    candles=exit_hist,
-                )
+            source_hist = entry_hist if metric_key == "entry" else exit_hist
+            for candle in source_hist:
+                combined[int(candle.start_ts)] = {
+                    "ts": int(candle.start_ts),
+                    "open": float(candle.open),
+                    "high": float(candle.high),
+                    "low": float(candle.low),
+                    "close": float(candle.close),
+                }
         except Exception:
-            logger.exception("Failed to backfill spread history", exc_info=True)
-        candles = SPREAD_HISTORY.get_candles(
-            metric_key,
-            symbol=symbol_upper,
-            long_exchange=long_key,
-            short_exchange=short_key,
-            timeframe=tf_value,
-        )
-    if lookback_days:
-        cutoff_ts = int(time.time() - lookback_days * 86400)
-        candles = [c for c in candles if c.start_ts >= cutoff_ts]
+            logger.exception("Failed to fetch fallback spread history", exc_info=True)
+    candles_list = [combined[key] for key in sorted(combined.keys())]
+    if lookback_seconds:
+        cutoff_ts = int(time.time()) - lookback_seconds
+        candles_list = [c for c in candles_list if c["ts"] >= cutoff_ts]
+    history_source = "database+realtime" if db_rows else "realtime"
+    if not db_rows and combined:
+        history_source = "external"
     return {
         "symbol": symbol_upper,
         "long": long_key,
@@ -271,7 +436,8 @@ async def pair_spreads(
         "metric": metric_key,
         "timeframe": timeframe,
         "timeframe_seconds": tf_value,
-        "candles": [c.to_dict() for c in candles],
+        "candles": candles_list,
+        "history_source": history_source,
     }
 
 

@@ -375,7 +375,7 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
     def _next_id() -> str:
         return str(int(time.time() * 1_000))
 
-    topics = [f"swap/depth5:{sym}" for sym in symbols if sym.upper() != "ALL"]
+    topics = [f"swap/depth20:{sym}" for sym in symbols if sym.upper() != "ALL"]
     if not topics:
         return
 

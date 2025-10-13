@@ -172,7 +172,7 @@ def _handle_orderbooks(
         else:
             book.update(bids, asks, now)
 
-        best_bids, best_asks = book.top_levels()
+        best_bids, best_asks = book.top_levels(depth=20)
         if best_bids or best_asks:
             store.upsert_order_book(
                 "bybit",
@@ -202,7 +202,7 @@ class _OrderBookState:
         self.ts = ts
 
     def top_levels(
-        self, depth: int = 5
+        self, depth: int = 20
     ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         bids_sorted = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
         asks_sorted = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]

@@ -29,6 +29,13 @@ class SpreadCandle:
     close: float
 
 
+@dataclass(frozen=True)
+class BidAskRecord:
+    ts: int
+    bid: float
+    ask: float
+
+
 class HistoryFetchError(Exception):
     """Raised when we fail to download history for an exchange."""
 
@@ -85,6 +92,47 @@ async def fetch_spread_history(
 
     entry_candles, exit_candles = _compose_spread_candles(long_candles, short_candles)
     return entry_candles, exit_candles
+
+
+async def fetch_bid_ask_history(
+    *,
+    exchange: ExchangeName,
+    symbol: Symbol,
+    timeframe_seconds: int,
+    lookback_days: float,
+    client: httpx.AsyncClient | None = None,
+) -> list[BidAskRecord]:
+    timeframe = int(timeframe_seconds)
+    if timeframe not in _TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+    end_ts = int(time.time())
+    start_ts = end_ts - int(max(lookback_days, 0) * 86400)
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT)
+
+    try:
+        candles = await _fetch_exchange_candles(
+            client,
+            exchange,
+            symbol,
+            timeframe,
+            start_ts,
+            end_ts,
+        )
+    finally:
+        if own_client and client is not None:
+            await client.aclose()
+
+    records: list[BidAskRecord] = []
+    for candle in candles:
+        bid = min(candle.open, candle.close, candle.low)
+        ask = max(candle.open, candle.close, candle.high)
+        if not all(math.isfinite(x) and x > 0 for x in (bid, ask)):
+            continue
+        records.append(BidAskRecord(ts=candle.start_ts, bid=bid, ask=ask))
+    return records
 
 
 async def _fetch_exchange_candles(

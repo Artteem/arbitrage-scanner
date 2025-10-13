@@ -47,6 +47,7 @@ export interface PairSpreadsResponse {
   timeframe: string;
   timeframe_seconds: number;
   candles: SpreadCandle[];
+  history_source?: string;
 }
 
 export interface PairLimitsResponse {

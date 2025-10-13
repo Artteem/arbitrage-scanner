@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Protocol, Tuple
 from .domain import Ticker, ExchangeName, Symbol
 import time
 
@@ -43,14 +43,29 @@ class Funding:
     def to_dict(self) -> dict:
         return {"rate": self.rate, "interval": self.interval, "ts": self.ts}
 
+class StoreObserver(Protocol):
+    def on_ticker(self, ticker: Ticker) -> None:
+        ...
+
+
 class TickerStore:
-    def __init__(self) -> None:
+    def __init__(self, observer: StoreObserver | None = None) -> None:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
+        self._observer = observer
+
+    def set_observer(self, observer: StoreObserver | None) -> None:
+        self._observer = observer
 
     def upsert_ticker(self, t: Ticker) -> None:
         self._latest[(t.exchange, t.symbol)] = t
+        observer = self._observer
+        if observer is not None:
+            try:
+                observer.on_ticker(t)
+            except Exception:
+                pass
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
         self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)

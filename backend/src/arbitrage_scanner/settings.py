@@ -10,5 +10,6 @@ class Settings(BaseModel):
     ]
     http_timeout: int = int(os.getenv("HTTP_TIMEOUT", "10"))
     ws_connect_timeout: int = int(os.getenv("WS_CONNECT_TIMEOUT", "10"))
+    database_path: str = os.getenv("DATABASE_PATH", "data/arbitrage.sqlite3")
 
 settings = Settings()

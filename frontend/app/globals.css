@@ -814,6 +814,10 @@ select:focus {
   align-items: center;
 }
 
+.pair-controls-note {
+  width: 100%;
+}
+
 
 .pair-main {
   display: grid;

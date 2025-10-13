@@ -739,6 +739,19 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     metric: 'entry',
     days: LOOKBACK_DAYS,
   });
+  const historySourceLabel = useMemo(() => {
+    const source = entrySpreadsData?.history_source;
+    switch (source) {
+      case 'database+realtime':
+        return 'История: база + реалтайм';
+      case 'external':
+        return 'История: внешний источник';
+      case 'realtime':
+        return 'История: только реалтайм';
+      default:
+        return null;
+    }
+  }, [entrySpreadsData?.history_source]);
   const reverseSelection = useMemo(() => {
     if (!selection) return null;
     return {
@@ -1467,6 +1480,9 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
             Перевернуть связку
           </button>
         </div>
+        {historySourceLabel ? (
+          <div className="pair-controls-note muted small">{historySourceLabel}</div>
+        ) : null}
 
         <div className="pair-main">
           <div className="chart-column">

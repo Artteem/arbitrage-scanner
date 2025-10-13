@@ -212,7 +212,7 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                 else:
                     book.update(bids_raw, asks_raw)
 
-                bids, asks = book.top_levels()
+                bids, asks = book.top_levels(depth=20)
                 last_price = _extract_last_price(data)
 
                 store.upsert_order_book(
@@ -396,7 +396,7 @@ class _MexcOrderBookState:
         self._apply(self.bids, bids)
         self._apply(self.asks, asks)
 
-    def top_levels(self, depth: int = 5) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    def top_levels(self, depth: int = 20) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         bids_sorted = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
         asks_sorted = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]
         return bids_sorted, asks_sorted
