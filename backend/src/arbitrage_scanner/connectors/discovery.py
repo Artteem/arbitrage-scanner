@@ -8,6 +8,18 @@ from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_ACTIVE_STATUSES = {"LISTING"}
+
+
+def _is_binance_trading_status(value) -> bool:
+    if value is None:
+        return False
+    status = str(value).strip().upper()
+    if not status:
+        return False
+    if status.endswith("TRADING"):
+        return True
+    return status in BINANCE_ACTIVE_STATUSES
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
 BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
@@ -19,7 +31,11 @@ async def discover_binance_usdt_perp() -> Set[str]:
         data = r.json()
     out: Set[str] = set()
     for s in data.get("symbols", []):
-        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+        if (
+            s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and _is_binance_trading_status(s.get("status"))
+        ):
             sym = s.get("symbol")
             if sym: out.add(sym)
     return out

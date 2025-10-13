@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Dict, Iterable, Sequence
 
@@ -23,19 +24,35 @@ STREAM_SUFFIX_DEPTH = "@depth5@100ms"
 STREAM_SUFFIX_TRADE = "@aggTrade"
 
 
+logger = logging.getLogger(__name__)
+
+
 async def run_binance(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
 
+    logger.info("run_binance received %d symbols", len(subscribe))
+
     if len(subscribe) < MIN_SYMBOL_THRESHOLD:
+        logger.warning(
+            "Binance symbol list below threshold (%d < %d), triggering discovery fallback",
+            len(subscribe),
+            MIN_SYMBOL_THRESHOLD,
+        )
         try:
             discovered = await discover_binance_usdt_perp()
         except Exception:
             discovered = set()
         if discovered:
             subscribe = sorted(discovered)
+            logger.info("Using %d symbols from discovery fallback", len(subscribe))
+        else:
+            logger.error("Discovery fallback did not return any Binance symbols")
 
     if not subscribe:
+        logger.error("No Binance symbols to subscribe to — skipping run_binance startup")
         return
+
+    logger.info("Subscribing to %d Binance symbols", len(subscribe))
 
     tasks = [
         asyncio.create_task(_run_binance_chunk(store, chunk))

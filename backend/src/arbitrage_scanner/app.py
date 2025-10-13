@@ -137,6 +137,20 @@ async def startup():
         SYMBOLS = FALLBACK_SYMBOLS
         CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
+    binance_symbols = CONNECTOR_SYMBOLS.get("binance", [])
+    logger.info(
+        "Binance symbols discovered: %d (BTCUSDT=%s, ETHUSDT=%s)",
+        len(binance_symbols),
+        "BTCUSDT" in binance_symbols,
+        "ETHUSDT" in binance_symbols,
+    )
+    logger.info(
+        "Union symbols discovered: %d (BTCUSDT=%s, ETHUSDT=%s)",
+        len(SYMBOLS),
+        "BTCUSDT" in SYMBOLS,
+        "ETHUSDT" in SYMBOLS,
+    )
+
     # 2) Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
