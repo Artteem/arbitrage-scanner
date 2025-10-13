@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import zlib
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import httpx
@@ -26,17 +25,17 @@ REQUEST_HEADERS = {
     "Origin": "https://bingx.com",
 }
 POLL_INTERVAL = 1.5
-HTTP_RELAX_INTERVAL = 6.0
 
 WS_ENDPOINTS = (
-    "wss://open-api-ws.bingx.com/market",
     "wss://open-api-ws.bingx.com/market?compress=false",
-    "wss://open-api-swap.bingx.com/swap-market",
     "wss://open-api-swap.bingx.com/swap-market?compress=false",
 )
-WS_SUB_CHUNK = 80
-WS_SUB_DELAY = 0.05
+WS_SUB_CHUNK = 250
+WS_RECONNECT_INITIAL = 1.0
+WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
+HTTP_BACKUP_DELAY = 30.0
+FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
@@ -109,8 +108,8 @@ def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, 
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    subscribe = list(dict.fromkeys(symbols))
-    http_fetch_all = False
+    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
+    subscribe_all = False
 
     if len(subscribe) < MIN_SYMBOL_THRESHOLD:
         try:
@@ -120,19 +119,41 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         if discovered:
             subscribe = sorted(discovered)
         else:
-            http_fetch_all = True
+            subscribe = list(FALLBACK_SYMBOLS)
+            subscribe_all = True
 
-    if not subscribe and not http_fetch_all:
+    if not subscribe and not subscribe_all:
         return
 
     ws_ready = asyncio.Event()
     tasks = [
-        asyncio.create_task(_poll_bingx_http(store, subscribe, ws_ready, http_fetch_all)),
-        asyncio.create_task(_run_bingx_ws_tickers(store, subscribe, ws_ready)),
+        asyncio.create_task(
+            _run_bingx_ws_tickers(
+                store,
+                subscribe,
+                ws_ready,
+                subscribe_all=subscribe_all,
+            )
+        ),
+        asyncio.create_task(
+            _maybe_run_bingx_http_backup(
+                store,
+                subscribe,
+                ws_ready,
+                fetch_all=subscribe_all,
+            )
+        ),
     ]
 
     if subscribe:
-        tasks.append(asyncio.create_task(_run_bingx_orderbooks(store, subscribe)))
+        tasks.append(
+            asyncio.create_task(
+                _run_bingx_orderbooks(
+                    store,
+                    subscribe,
+                )
+            )
+        )
 
     try:
         await asyncio.gather(*tasks)
@@ -152,12 +173,15 @@ async def _run_bingx_ws_tickers(
     store: TickerStore,
     symbols: Sequence[Symbol],
     ready_event: asyncio.Event | None = None,
+    *,
+    subscribe_all: bool = False,
 ) -> None:
     wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
-    if not wanted_common:
-        return
+    if subscribe_all:
+        ws_symbols = ["ALL"]
+    else:
+        ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common if sym})
 
-    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common})
     if not ws_symbols:
         return
 
@@ -166,7 +190,6 @@ async def _run_bingx_ws_tickers(
             for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
                 batch = ws_symbols[i : i + WS_SUB_CHUNK]
                 await _send_ws_subscriptions(ws, batch)
-                await asyncio.sleep(WS_SUB_DELAY)
 
             async for raw_msg in ws:
                 msg = _decode_ws_message(raw_msg)
@@ -183,7 +206,9 @@ async def _run_bingx_ws_tickers(
 
                     exchange_symbol = _normalize_ws_symbol(raw_symbol)
                     common_symbol = _from_bingx_symbol(exchange_symbol)
-                    if not common_symbol or common_symbol not in wanted_common:
+                    if not common_symbol:
+                        continue
+                    if wanted_common and common_symbol not in wanted_common:
                         continue
 
                     bid = _extract_price(
@@ -236,7 +261,24 @@ async def _run_bingx_ws_tickers(
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(2.0)
+            continue
+
+
+async def _maybe_run_bingx_http_backup(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+    ws_ready: asyncio.Event | None,
+    *,
+    fetch_all: bool = False,
+) -> None:
+    if ws_ready is not None:
+        try:
+            await asyncio.wait_for(ws_ready.wait(), timeout=HTTP_BACKUP_DELAY)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+    await _poll_bingx_http(store, symbols, ws_ready, fetch_all)
 
 
 async def _run_bingx_orderbooks(
@@ -256,7 +298,6 @@ async def _run_bingx_orderbooks(
             for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
                 batch = ws_symbols[i : i + WS_SUB_CHUNK]
                 await _send_ws_depth_subscriptions(ws, batch)
-                await asyncio.sleep(WS_SUB_DELAY)
 
             async for raw_msg in ws:
                 msg = _decode_ws_message(raw_msg)
@@ -291,23 +332,30 @@ async def _run_bingx_orderbooks(
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(2.0)
+            continue
 
 
 async def _reconnect_ws():
     idx = 0
+    delay = WS_RECONNECT_INITIAL
     while True:
         endpoint = WS_ENDPOINTS[idx % len(WS_ENDPOINTS)]
         idx += 1
         try:
             async with websockets.connect(
-                endpoint, ping_interval=20, ping_timeout=20, close_timeout=5
+                endpoint,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                compression=None,
             ) as ws:
+                delay = WS_RECONNECT_INITIAL
                 yield ws
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
 async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
@@ -316,36 +364,21 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
 
     def _next_id() -> str:
         return str(int(time.time() * 1_000))
+    topics = []
+    for sym in symbols:
+        normalized = sym if sym.upper() == "ALL" else sym.replace("_", "-")
+        topics.append(f"swap/ticker:{normalized}")
 
-    payloads = [
-        {
-            "id": _next_id(),
-            "action": "subscribe",
-            "params": {"channel": "ticker", "instId": list(symbols)},
-        },
-        {
-            "id": _next_id(),
-            "action": "subscribe",
-            "params": {"channel": "ticker", "symbols": list(symbols)},
-        },
-    ]
+    payload = {
+        "id": _next_id(),
+        "reqType": "sub",
+        "dataType": topics,
+    }
 
-    market_topics = [f"market.{sym}.ticker" for sym in symbols]
-    payloads.append({"id": _next_id(), "reqType": "sub", "dataType": market_topics})
-
-    swap_topics = [f"swap/ticker:{sym}" for sym in symbols]
-    payloads.append({"id": _next_id(), "reqType": "sub", "dataType": swap_topics})
-    payloads.extend(
-        {"id": _next_id(), "reqType": "sub", "dataType": topic}
-        for topic in swap_topics
-    )
-
-    for payload in payloads:
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            continue
-        await asyncio.sleep(WS_SUB_DELAY)
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        return
 
 
 async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
@@ -355,60 +388,28 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
     def _next_id() -> str:
         return str(int(time.time() * 1_000))
 
-    depth_topics = [f"market.{sym}.depth5" for sym in symbols]
-    swap_depth_topics = [f"swap/depth:{sym}" for sym in symbols]
-    swap_depth5_topics = [f"swap/depth5:{sym}" for sym in symbols]
+    topics = [f"swap/depth5:{sym}" for sym in symbols if sym.upper() != "ALL"]
+    if not topics:
+        return
 
-    payloads = [
-        {
-            "id": _next_id(),
-            "action": "subscribe",
-            "params": {"channel": "depth5", "instId": list(symbols)},
-        },
-        {
-            "id": _next_id(),
-            "action": "subscribe",
-            "params": {"channel": "depth", "instId": list(symbols)},
-        },
-        {"id": _next_id(), "reqType": "sub", "dataType": depth_topics},
-        {"id": _next_id(), "reqType": "sub", "dataType": swap_depth_topics},
-        {"id": _next_id(), "reqType": "sub", "dataType": swap_depth5_topics},
-    ]
+    payload = {
+        "id": _next_id(),
+        "reqType": "sub",
+        "dataType": topics,
+    }
 
-    for topic in depth_topics + swap_depth_topics + swap_depth5_topics:
-        payloads.append({"id": _next_id(), "reqType": "sub", "dataType": topic})
-
-    for payload in payloads:
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            continue
-        await asyncio.sleep(WS_SUB_DELAY)
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        return
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    raw: str | None
     if isinstance(message, (bytes, bytearray)):
-        raw = None
-        for decoder in (
-            lambda b: zlib.decompress(b, wbits=-zlib.MAX_WBITS),
-            lambda b: zlib.decompress(b),
-            lambda b: b.decode("utf-8"),
-        ):
-            try:
-                data = decoder(message)
-                if isinstance(data, bytes):
-                    raw = data.decode("utf-8")
-                else:
-                    raw = data
-                break
-            except Exception:
-                continue
-        if raw is None:
-            try:
-                raw = message.decode("utf-8", errors="ignore")
-            except Exception:
-                return None
+        try:
+            raw = message.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
     else:
         raw = message
 
@@ -724,6 +725,8 @@ async def _poll_bingx_http(
 
     async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
         while True:
+            if ws_ready and ws_ready.is_set():
+                return
             now = time.time()
             params = param_candidates[params_idx]
             url = TICKERS_URLS[url_idx]
@@ -823,6 +826,6 @@ async def _poll_bingx_http(
                 )
 
             if ws_ready and ws_ready.is_set():
-                await asyncio.sleep(HTTP_RELAX_INTERVAL)
+                return
             else:
                 await asyncio.sleep(POLL_INTERVAL)

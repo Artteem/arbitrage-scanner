@@ -12,14 +12,15 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .discovery import discover_bybit_linear_usdt
 
-WS = "wss://stream.bybit.com/v5/public/linear"
-CHUNK = 100  # безопасный размер по числу подписок
-
+WS_ENDPOINT = "wss://stream.bybit.com/v5/public/linear?compress=false"
+WS_SUB_BATCH = 250
+WS_RECONNECT_INITIAL = 1.0
+WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
 
 
-async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]):
-    subscribe = list(dict.fromkeys(symbols))
+async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
     if len(subscribe) < MIN_SYMBOL_THRESHOLD:
         try:
             discovered = await discover_bybit_linear_usdt()
@@ -32,8 +33,8 @@ async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]):
         return
 
     tasks = [
-        asyncio.create_task(_run_bybit_tickers(store, subscribe)),
-        asyncio.create_task(_run_bybit_orderbooks(store, subscribe)),
+        asyncio.create_task(_run_bybit_chunk(store, chunk))
+        for chunk in _chunk_symbols(subscribe, WS_SUB_BATCH)
     ]
 
     try:
@@ -45,143 +46,141 @@ async def run_bybit(store: TickerStore, symbols: Sequence[Symbol]):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _run_bybit_tickers(store: TickerStore, subscribe: Sequence[Symbol]):
-    if not subscribe:
+def _chunk_symbols(symbols: Sequence[Symbol], size: int) -> Iterable[Sequence[Symbol]]:
+    for idx in range(0, len(symbols), size):
+        yield symbols[idx : idx + size]
+
+
+async def _run_bybit_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    if not symbols:
         return
 
-    async for ws in _reconnect(WS):
-        try:
-            for i in range(0, len(subscribe), CHUNK):
-                batch = subscribe[i : i + CHUNK]
-                args = [f"tickers.{s}" for s in batch]
-                await ws.send(json.dumps({"op": "subscribe", "args": args}))
-                await asyncio.sleep(0.05)
-
-            async for msg in ws:
-                data = json.loads(msg)
-
-                topic = data.get("topic", "")
-                if not topic.startswith("tickers."):
-                    continue
-
-                payload = data.get("data")
-                if payload is None:
-                    continue
-
-                items = payload if isinstance(payload, list) else [payload]
-                for item in items:
-                    sym = item.get("symbol")
-                    if not sym:
-                        continue
-
-                    bid_s = item.get("bid1Price") or item.get("bidPrice")
-                    ask_s = item.get("ask1Price") or item.get("askPrice")
-                    try:
-                        bid = float(bid_s) if bid_s is not None else 0.0
-                        ask = float(ask_s) if ask_s is not None else 0.0
-                    except Exception:
-                        bid = ask = 0.0
-
-                    now = time.time()
-                    if bid > 0 and ask > 0:
-                        store.upsert_ticker(
-                            Ticker(exchange="bybit", symbol=sym, bid=bid, ask=ask, ts=now)
-                        )
-
-                    fr = item.get("fundingRate")
-                    if fr is not None:
-                        try:
-                            rate = float(fr)
-                        except Exception:
-                            rate = 0.0
-                        store.upsert_funding("bybit", sym, rate=rate, interval="8h", ts=now)
-
-                    last_price_raw = (
-                        item.get("lastPrice")
-                        or item.get("markPrice")
-                        or item.get("indexPrice")
-                        or item.get("prevPrice24h")
-                    )
-                    if last_price_raw is not None:
-                        try:
-                            last_price = float(last_price_raw)
-                        except Exception:
-                            last_price = None
-                        if last_price and last_price > 0:
-                            store.upsert_order_book(
-                                "bybit", sym, last_price=last_price, last_price_ts=now
-                            )
-        except Exception:
-            await asyncio.sleep(1)
-
-
-async def _run_bybit_orderbooks(store: TickerStore, subscribe: Sequence[Symbol]):
-    if not subscribe:
-        return
-
-    topics = [f"orderbook.50.{sym}" for sym in subscribe]
+    topics = [f"tickers.{sym}" for sym in symbols]
+    topics.extend(f"orderbook.50.{sym}" for sym in symbols)
     books: Dict[str, _OrderBookState] = {}
 
-    async for ws in _reconnect(WS):
-        try:
-            for i in range(0, len(topics), CHUNK):
-                batch = topics[i : i + CHUNK]
-                await ws.send(json.dumps({"op": "subscribe", "args": batch}))
-                await asyncio.sleep(0.05)
-
-            async for raw in ws:
-                data = json.loads(raw)
-                topic = data.get("topic", "")
-                if not topic.startswith("orderbook."):
-                    continue
-
-                payload = data.get("data")
-                if payload is None:
-                    continue
-
-                items = payload if isinstance(payload, list) else [payload]
-                msg_type = str(data.get("type") or "").lower()
-                now = time.time()
-
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    sym = item.get("s") or item.get("symbol")
-                    if not sym:
-                        continue
-
-                    bids = item.get("b") or item.get("bid") or item.get("bids")
-                    asks = item.get("a") or item.get("ask") or item.get("asks")
-                    if not bids and not asks:
-                        continue
-
-                    book = books.setdefault(sym, _OrderBookState())
-                    if msg_type == "snapshot":
-                        book.snapshot(bids, asks, now)
-                    else:
-                        book.update(bids, asks, now)
-
-                    best_bids, best_asks = book.top_levels()
-                    if best_bids or best_asks:
-                        store.upsert_order_book(
-                            "bybit",
-                            sym,
-                            bids=best_bids or None,
-                            asks=best_asks or None,
-                            ts=now,
-                        )
-        except Exception:
-            await asyncio.sleep(1)
-
-
-async def _reconnect(url: str):
+    delay = WS_RECONNECT_INITIAL
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                yield ws
+            async with websockets.connect(
+                WS_ENDPOINT,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                compression=None,
+            ) as ws:
+                delay = WS_RECONNECT_INITIAL
+                await ws.send(json.dumps({"op": "subscribe", "args": topics}))
+
+                async for raw in ws:
+                    try:
+                        message = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    topic = str(message.get("topic") or "")
+                    if topic.startswith("tickers."):
+                        _handle_tickers(store, message.get("data"))
+                    elif topic.startswith("orderbook."):
+                        _handle_orderbooks(store, books, message)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            await asyncio.sleep(2)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WS_RECONNECT_MAX)
+
+
+def _handle_tickers(store: TickerStore, payload) -> None:
+    if payload is None:
+        return
+
+    items = payload if isinstance(payload, list) else [payload]
+    now = time.time()
+    for item in items:
+        if not isinstance(item, dict):
             continue
+
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+
+        bid_raw = item.get("bid1Price") or item.get("bidPrice")
+        ask_raw = item.get("ask1Price") or item.get("askPrice")
+        try:
+            bid = float(bid_raw) if bid_raw is not None else 0.0
+            ask = float(ask_raw) if ask_raw is not None else 0.0
+        except (TypeError, ValueError):
+            bid = ask = 0.0
+
+        if bid > 0 and ask > 0:
+            store.upsert_ticker(
+                Ticker(exchange="bybit", symbol=symbol, bid=bid, ask=ask, ts=now)
+            )
+
+        funding_raw = item.get("fundingRate")
+        if funding_raw is not None:
+            try:
+                rate = float(funding_raw)
+            except (TypeError, ValueError):
+                rate = 0.0
+            store.upsert_funding("bybit", symbol, rate=rate, interval="8h", ts=now)
+
+        last_price_raw = (
+            item.get("lastPrice")
+            or item.get("markPrice")
+            or item.get("indexPrice")
+            or item.get("prevPrice24h")
+        )
+        if last_price_raw is not None:
+            try:
+                last_price = float(last_price_raw)
+            except (TypeError, ValueError):
+                last_price = None
+            if last_price and last_price > 0:
+                store.upsert_order_book(
+                    "bybit", symbol, last_price=last_price, last_price_ts=now
+                )
+
+
+def _handle_orderbooks(
+    store: TickerStore, books: Dict[str, _OrderBookState], message: dict
+) -> None:
+    payload = message.get("data")
+    if payload is None:
+        return
+
+    items = payload if isinstance(payload, list) else [payload]
+    msg_type = str(message.get("type") or "").lower()
+    now = time.time()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = item.get("s") or item.get("symbol")
+        if not symbol:
+            continue
+
+        bids = item.get("b") or item.get("bid") or item.get("bids")
+        asks = item.get("a") or item.get("ask") or item.get("asks")
+        if not bids and not asks:
+            continue
+
+        book = books.setdefault(symbol, _OrderBookState())
+        if msg_type == "snapshot":
+            book.snapshot(bids, asks, now)
+        else:
+            book.update(bids, asks, now)
+
+        best_bids, best_asks = book.top_levels()
+        if best_bids or best_asks:
+            store.upsert_order_book(
+                "bybit",
+                symbol,
+                bids=best_bids or None,
+                asks=best_asks or None,
+                ts=now,
+            )
 
 
 @dataclass
@@ -202,7 +201,9 @@ class _OrderBookState:
         self._apply(self.asks, asks)
         self.ts = ts
 
-    def top_levels(self, depth: int = 5) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    def top_levels(
+        self, depth: int = 5
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         bids_sorted = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
         asks_sorted = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]
         return bids_sorted, asks_sorted
@@ -217,7 +218,6 @@ class _OrderBookState:
             else:
                 side[price] = size
         if len(side) > 200:
-            # ограничиваем локальное состояние, чтобы не разрасталось
             if side is self.asks:
                 ordered = sorted(side.items(), key=lambda kv: kv[0])
             else:
@@ -278,3 +278,4 @@ def _parse_level(level) -> Tuple[float | None, float | None]:
     if size < 0:
         size = 0.0
     return price, size
+
