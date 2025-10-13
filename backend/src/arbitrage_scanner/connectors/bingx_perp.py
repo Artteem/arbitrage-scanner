@@ -125,24 +125,14 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe and not subscribe_all:
         return
 
-    ws_ready = asyncio.Event()
     tasks = [
         asyncio.create_task(
             _run_bingx_ws_tickers(
                 store,
                 subscribe,
-                ws_ready,
                 subscribe_all=subscribe_all,
             )
-        ),
-        asyncio.create_task(
-            _maybe_run_bingx_http_backup(
-                store,
-                subscribe,
-                ws_ready,
-                fetch_all=subscribe_all,
-            )
-        ),
+        )
     ]
 
     if subscribe:
@@ -169,10 +159,26 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         raise
 
 
+async def run_bingx_http_backup(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+    wait_ready: asyncio.Event | None = None,
+    *,
+    fetch_all: bool = False,
+) -> None:
+    if wait_ready is not None:
+        try:
+            await asyncio.wait_for(wait_ready.wait(), timeout=HTTP_BACKUP_DELAY)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+    await _poll_bingx_http(store, symbols, wait_ready, fetch_all)
+
+
 async def _run_bingx_ws_tickers(
     store: TickerStore,
     symbols: Sequence[Symbol],
-    ready_event: asyncio.Event | None = None,
     *,
     subscribe_all: bool = False,
 ) -> None:
@@ -256,29 +262,10 @@ async def _run_bingx_ws_tickers(
                             ts=time.time(),
                         )
                     )
-                    if ready_event and not ready_event.is_set():
-                        ready_event.set()
         except asyncio.CancelledError:
             raise
         except Exception:
             continue
-
-
-async def _maybe_run_bingx_http_backup(
-    store: TickerStore,
-    symbols: Sequence[Symbol],
-    ws_ready: asyncio.Event | None,
-    *,
-    fetch_all: bool = False,
-) -> None:
-    if ws_ready is not None:
-        try:
-            await asyncio.wait_for(ws_ready.wait(), timeout=HTTP_BACKUP_DELAY)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-    await _poll_bingx_http(store, symbols, ws_ready, fetch_all)
 
 
 async def _run_bingx_orderbooks(
