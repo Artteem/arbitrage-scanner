@@ -8,12 +8,22 @@ from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_HEADERS = {
+    # Binance начала более агрессивно отсеивать запросы без заголовка User-Agent,
+    # поэтому явно укажем типичный браузерный агент, чтобы не получать 403.
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
 BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 
 async def discover_binance_usdt_perp() -> Set[str]:
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, headers=BINANCE_HEADERS) as client:
         r = await client.get(BINANCE_EXCHANGE_INFO)
         r.raise_for_status()
         data = r.json()
