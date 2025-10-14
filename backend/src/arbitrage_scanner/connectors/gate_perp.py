@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Iterable, Sequence
 
-import httpx
+import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .discovery import GATE_HEADERS, discover_gate_usdt_perp
 
-TICKERS_URL = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
-POLL_INTERVAL = 1.5
+WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+WS_SUB_BATCH = 100
+WS_RECONNECT_INITIAL = 2.0
+WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
@@ -78,94 +81,208 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe:
         return
 
-    await _poll_gate_http(store, subscribe)
+    tasks = [
+        asyncio.create_task(_run_gate_ws_chunk(store, chunk))
+        for chunk in _chunk_symbols(subscribe, WS_SUB_BATCH)
+    ]
+
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _poll_gate_http(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    wanted = {_to_gate_symbol(sym) for sym in symbols if sym}
-    async with httpx.AsyncClient(timeout=15, headers=GATE_HEADERS) as client:
-        delay = POLL_INTERVAL
-        while True:
-            now = time.time()
-            try:
-                response = await client.get(TICKERS_URL)
-                response.raise_for_status()
-                payload = response.json()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await asyncio.sleep(min(delay, 5.0))
-                delay = min(delay * 2, 30.0)
-                continue
+async def _run_gate_ws_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    if not symbols:
+        return
 
-            delay = POLL_INTERVAL
-            items = _extract_items(payload)
-            if not items:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+    payload = [_to_gate_symbol(sym) for sym in symbols if sym]
+    payload = [sym for sym in payload if sym]
+    if not payload:
+        return
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
+    delay = WS_RECONNECT_INITIAL
 
-                contract = item.get("contract") or item.get("name") or item.get("symbol")
-                if not contract:
-                    continue
+    while True:
+        try:
+            async with websockets.connect(
+                WS_ENDPOINT,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                extra_headers=GATE_HEADERS,
+            ) as ws:
+                delay = WS_RECONNECT_INITIAL
 
-                contract_str = str(contract)
-                if contract_str.count("_") > 1:
-                    continue
+                await _subscribe(ws, "futures.tickers", payload)
+                await _subscribe(ws, "futures.funding_rate", payload)
 
-                if wanted and contract_str not in wanted:
-                    continue
+                async for raw in ws:
+                    try:
+                        message = json.loads(raw)
+                    except Exception:
+                        continue
 
-                if not _is_active_contract(item):
-                    continue
+                    if await _handle_ping(ws, message):
+                        continue
 
-                sym_common = _from_gate_symbol(contract_str)
-                if not sym_common:
-                    continue
+                    channel = str(message.get("channel") or "")
+                    result = message.get("result")
 
-                bid = _extract_price(
-                    item,
-                    ("best_bid_price", "highest_bid", "bid1", "best_bid"),
-                )
-                ask = _extract_price(
-                    item,
-                    ("best_ask_price", "lowest_ask", "ask1", "best_ask"),
-                )
-                if bid <= 0 or ask <= 0:
-                    continue
-
-                store.upsert_ticker(
-                    Ticker(exchange="gate", symbol=sym_common, bid=bid, ask=ask, ts=now)
-                )
-
-                rate_raw = (
-                    item.get("funding_rate")
-                    or item.get("funding_rate_indicative")
-                    or item.get("next_funding_rate")
-                )
-                if rate_raw is not None:
-                    rate = _as_float(rate_raw)
-                    store.upsert_funding("gate", sym_common, rate=rate, interval="8h", ts=now)
-
-                last_raw = item.get("last") or item.get("last_price") or item.get("mark_price")
-                last_price = _as_float(last_raw)
-                if last_price > 0:
-                    store.upsert_order_book(
-                        "gate", sym_common, last_price=last_price, last_price_ts=now
-                    )
-
-            await asyncio.sleep(POLL_INTERVAL)
+                    if channel == "futures.tickers":
+                        _handle_tickers(store, result)
+                    elif channel == "futures.funding_rate":
+                        _handle_funding(store, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
-def _extract_items(payload) -> list[dict]:
+def _chunk_symbols(symbols: Sequence[Symbol], size: int) -> Iterable[Sequence[Symbol]]:
+    for idx in range(0, len(symbols), size):
+        yield symbols[idx : idx + size]
+
+
+async def _subscribe(ws, channel: str, symbols: Sequence[str]) -> None:
+    now = int(time.time())
+    for symbol in symbols:
+        message = {
+            "time": now,
+            "channel": channel,
+            "event": "subscribe",
+            "payload": [symbol],
+        }
+        try:
+            await ws.send(json.dumps(message))
+        except Exception:
+            return
+
+
+async def _handle_ping(ws, message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+
+    event = str(message.get("event") or "").lower()
+    channel = str(message.get("channel") or "")
+
+    if event not in {"ping", "pong"} and not channel.endswith(".ping"):
+        return False
+
+    if event == "ping" or channel.endswith(".ping"):
+        reply = {
+            "time": int(time.time()),
+            "channel": channel or "futures.ping",
+            "event": "pong",
+        }
+        try:
+            await ws.send(json.dumps(reply))
+        except Exception:
+            pass
+        return True
+
+    return event == "pong"
+
+
+def _iter_items(payload):
     if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("tickers", "data", "items", "result"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-    return []
+        for item in payload:
+            if isinstance(item, dict):
+                yield item
+    elif isinstance(payload, dict):
+        yield payload
+
+
+def _handle_tickers(store: TickerStore, payload) -> None:
+    now = time.time()
+    for item in _iter_items(payload):
+        contract = (
+            item.get("contract")
+            or item.get("name")
+            or item.get("symbol")
+            or item.get("s")
+        )
+        if not contract:
+            continue
+
+        contract_str = str(contract)
+        if contract_str.count("_") > 1:
+            continue
+
+        if not _is_active_contract(item):
+            continue
+
+        sym_common = _from_gate_symbol(contract_str)
+        if not sym_common:
+            continue
+
+        bid = _extract_price(
+            item,
+            (
+                "best_bid_price",
+                "highest_bid",
+                "bid1",
+                "best_bid",
+                "bid",
+            ),
+        )
+        ask = _extract_price(
+            item,
+            (
+                "best_ask_price",
+                "lowest_ask",
+                "ask1",
+                "best_ask",
+                "ask",
+            ),
+        )
+        if bid <= 0 or ask <= 0:
+            continue
+
+        store.upsert_ticker(
+            Ticker(exchange="gate", symbol=sym_common, bid=bid, ask=ask, ts=now)
+        )
+
+        rate_raw = (
+            item.get("funding_rate")
+            or item.get("funding_rate_indicative")
+            or item.get("next_funding_rate")
+        )
+        if rate_raw is not None:
+            rate = _as_float(rate_raw)
+            store.upsert_funding("gate", sym_common, rate=rate, interval="8h", ts=now)
+
+        last_raw = (
+            item.get("last")
+            or item.get("last_price")
+            or item.get("mark_price")
+            or item.get("index_price")
+        )
+        last_price = _as_float(last_raw)
+        if last_price > 0:
+            store.upsert_order_book(
+                "gate", sym_common, last_price=last_price, last_price_ts=now
+            )
+
+
+def _handle_funding(store: TickerStore, payload) -> None:
+    now = time.time()
+    for item in _iter_items(payload):
+        contract = item.get("contract") or item.get("name") or item.get("symbol")
+        if not contract:
+            continue
+
+        sym_common = _from_gate_symbol(str(contract))
+        if not sym_common:
+            continue
+
+        rate_raw = item.get("rate") or item.get("funding_rate")
+        if rate_raw is None:
+            continue
+
+        rate = _as_float(rate_raw)
+        store.upsert_funding("gate", sym_common, rate=rate, interval="8h", ts=now)
