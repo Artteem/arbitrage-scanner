@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Iterable, List, Sequence, Tuple
 
@@ -18,6 +19,8 @@ WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+
+logger = logging.getLogger(__name__)
 
 
 def _to_gate_symbol(symbol: Symbol) -> str:
@@ -147,16 +150,28 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe:
         return
 
-    tasks: list[asyncio.Task] = []
-    for chunk in _chunk(subscribe, WS_SUB_BATCH):
-        tasks.append(asyncio.create_task(_run_gate_ws(store, chunk)))
+    chunks = [tuple(chunk) for chunk in _chunk(subscribe, WS_SUB_BATCH)]
+    if not chunks:
+        return
 
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    while True:
+        tasks: list[asyncio.Task] = [
+            asyncio.create_task(_run_gate_ws(store, chunk)) for chunk in chunks
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Gate websocket workers crashed; restarting")
+            await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:

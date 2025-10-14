@@ -156,27 +156,33 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe and not subscribe_all:
         return
 
-    tasks: list[asyncio.Task] = []
+    chunks = [tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, WS_SUB_CHUNK)]
 
-    if subscribe_all:
-        tasks.append(asyncio.create_task(_run_bingx_all_tickers(store, subscribe)))
+    while True:
+        tasks: list[asyncio.Task] = []
 
-    if subscribe:
-        for chunk in _chunk_bingx_symbols(subscribe, WS_SUB_CHUNK):
+        if subscribe_all:
+            tasks.append(asyncio.create_task(_run_bingx_all_tickers(store, subscribe)))
+
+        for chunk in chunks:
             tasks.append(asyncio.create_task(_run_bingx_ws(store, chunk)))
 
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        if not tasks:
+            return
+
+        try:
+            await asyncio.gather(*tasks)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("BingX websocket workers crashed; restarting")
+            await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:

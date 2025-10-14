@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -16,6 +17,8 @@ WS_SUB_BATCH = 120
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+
+logger = logging.getLogger(__name__)
 
 
 def _as_float(value) -> float:
@@ -77,16 +80,28 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
     if not subscribe:
         return
 
-    tasks: list[asyncio.Task] = []
-    for chunk in _chunk(subscribe, WS_SUB_BATCH):
-        tasks.append(asyncio.create_task(_run_mexc_ws(store, chunk)))
+    chunks = [tuple(chunk) for chunk in _chunk(subscribe, WS_SUB_BATCH)]
+    if not chunks:
+        return
 
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    while True:
+        tasks: list[asyncio.Task] = [
+            asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MEXC websocket workers crashed; restarting")
+            await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
