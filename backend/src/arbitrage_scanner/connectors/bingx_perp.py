@@ -171,6 +171,15 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             )
         )
 
+    tasks.append(
+        asyncio.create_task(
+            _run_bingx_funding(
+                store,
+                subscribe,
+            )
+        )
+    )
+
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -320,6 +329,56 @@ async def _run_bingx_orderbooks(
             continue
 
 
+async def _run_bingx_funding(
+    store: TickerStore,
+    symbols: Sequence[Symbol],
+) -> None:
+    wanted_common = _collect_wanted_common(symbols)
+    if not wanted_common:
+        return
+
+    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common if sym})
+    if not ws_symbols:
+        return
+
+    async for ws in _reconnect_ws():
+        try:
+            for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
+                batch = ws_symbols[i : i + WS_SUB_CHUNK]
+                await _send_ws_funding_subscriptions(ws, batch)
+
+            async for raw_msg in ws:
+                msg = _decode_ws_message(raw_msg)
+                if msg is None:
+                    continue
+
+                if _is_ws_ping(msg):
+                    await _reply_ws_ping(ws, msg)
+                    continue
+
+                now = time.time()
+                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common):
+                    if not isinstance(payload, dict):
+                        continue
+
+                    rate = _extract_price(
+                        payload,
+                        (
+                            "fundingRate",
+                            "funding_rate",
+                            "rate",
+                            "value",
+                        ),
+                    )
+
+                    interval = _parse_funding_interval(payload)
+                    store.upsert_funding("bingx", common_symbol, rate=rate, interval=interval, ts=now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
 async def _reconnect_ws():
     idx = 0
     delay = WS_RECONNECT_INITIAL
@@ -386,6 +445,31 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
     }
 
     _log_ws_subscriptions("depth", topics)
+
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        return
+
+
+async def _send_ws_funding_subscriptions(ws, symbols: Sequence[str]) -> None:
+    if not symbols:
+        return
+
+    def _next_id() -> str:
+        return str(int(time.time() * 1_000))
+
+    topics = [f"swap/fundingRate:{sym}" for sym in symbols if sym.upper() != "ALL"]
+    if not topics:
+        return
+
+    payload = {
+        "id": _next_id(),
+        "reqType": "sub",
+        "dataType": topics,
+    }
+
+    _log_ws_subscriptions("funding", topics)
 
     try:
         await ws.send(json.dumps(payload))
@@ -587,6 +671,15 @@ def _extract_last_price(container: dict) -> float | None:
         if price > 0:
             return price
     return None
+
+
+def _parse_funding_interval(payload: dict) -> str:
+    interval = payload.get("interval") or payload.get("fundingInterval")
+    if isinstance(interval, (int, float)) and interval > 0:
+        return f"{interval}h"
+    if isinstance(interval, str) and interval:
+        return interval
+    return "8h"
 
 
 def _iter_levels(source) -> Iterable[Tuple[float, float]]:

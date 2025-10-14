@@ -104,12 +104,13 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
     async for ws in _reconnect_ws():
         try:
             for batch in _chunk(ws_symbols, WS_SUB_BATCH):
-                payload = {
-                    "method": "sub.depth",
-                    "params": [list(batch), WS_DEPTH_LEVELS],
-                    "id": int(time.time() * 1_000),
-                }
-                await ws.send(json.dumps(payload))
+                for sym in batch:
+                    payload = {
+                        "method": "sub.depth",
+                        "params": [sym, WS_DEPTH_LEVELS],
+                        "id": int(time.time() * 1_000),
+                    }
+                    await ws.send(json.dumps(payload))
 
             async for raw in ws:
                 msg = _decode_ws_message(raw)
