@@ -188,9 +188,9 @@ async def discover_bingx_usdt_perp() -> Set[str]:
     }
 
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        r = await client.get(BINGX_CONTRACTS)
-        r.raise_for_status()
-        payload = r.json()
+        response = await client.get(BINGX_CONTRACTS)
+        response.raise_for_status()
+        payload = response.json()
 
     items: Iterable = []
     if isinstance(payload, dict):
@@ -212,6 +212,10 @@ async def discover_bingx_usdt_perp() -> Set[str]:
         if not isinstance(item, dict):
             continue
 
+        quote_asset = item.get("quoteAsset")
+        if not _is_usdt_quote(quote_asset):
+            continue
+
         raw_symbol = (
             item.get("symbol")
             or item.get("tradingPair")
@@ -222,23 +226,13 @@ async def discover_bingx_usdt_perp() -> Set[str]:
         if not common:
             continue
 
-        quote_candidates = (
-            item.get("quoteAsset"),
-            item.get("quoteCurrency"),
-            item.get("quoteCoin"),
-            item.get("settleAsset"),
-            item.get("settleCurrency"),
-            item.get("marginCoin"),
-        )
-        if not any(_is_usdt_quote(candidate) for candidate in quote_candidates):
-            if not common.upper().endswith("USDT"):
-                continue
-
         if not _is_perpetual_contract(
             item.get("contractType")
             or item.get("type")
             or item.get("productType")
         ):
+            continue
+        if not _is_trading_state(item.get("state") or item.get("status") or item.get("tradingStatus")):
             continue
 
         out.add(common)

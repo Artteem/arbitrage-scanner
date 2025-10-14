@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -12,6 +13,8 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
 from .discovery import discover_bingx_usdt_perp
+
+logger = logging.getLogger(__name__)
 
 TICKERS_URLS: tuple[str, ...] = (
     "https://bingx.com/api/v3/contract/tickers",
@@ -36,6 +39,45 @@ WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
 HTTP_BACKUP_DELAY = 30.0
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+_SUBSCRIPTION_LOG_LIMIT = 20
+_WS_PAYLOAD_LOG_LIMIT = 20
+_LOG_ONCE_TICKERS: set[Symbol] = set()
+_WS_PAYLOAD_LOG_COUNT = 0
+
+
+def _log_ws_subscriptions(kind: str, topics: Sequence[str]) -> None:
+    if not topics:
+        return
+
+    preview = list(topics[:_SUBSCRIPTION_LOG_LIMIT])
+    extra = len(topics) - len(preview)
+    if extra > 0:
+        logger.info(
+            "BingX WS %s subscriptions: %s (+%d more)",
+            kind,
+            preview,
+            extra,
+        )
+    else:
+        logger.info("BingX WS %s subscriptions: %s", kind, preview)
+
+
+def _log_ws_payload_received(symbol: Symbol) -> None:
+    global _WS_PAYLOAD_LOG_COUNT
+    if _WS_PAYLOAD_LOG_COUNT >= _WS_PAYLOAD_LOG_LIMIT:
+        return
+    _WS_PAYLOAD_LOG_COUNT += 1
+    logger.info("BingX WS payload received for %s", symbol)
+
+
+def _log_first_ticker(symbol: Symbol, bid: float, ask: float) -> None:
+    target = symbol.upper()
+    if target not in {"BTCUSDT", "ETHUSDT"}:
+        return
+    if target in _LOG_ONCE_TICKERS:
+        return
+    _LOG_ONCE_TICKERS.add(target)
+    logger.info("BingX first ticker for %s: bid=%s ask=%s", target, bid, ask)
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
@@ -58,6 +100,21 @@ def _normalize_common_symbol(symbol: Symbol) -> str:
         return normalized
     sym = str(symbol).upper()
     return sym.replace("-", "").replace("_", "")
+
+
+def _collect_wanted_common(symbols: Sequence[Symbol]) -> set[str]:
+    wanted: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = normalize_bingx_symbol(symbol)
+        if normalized:
+            wanted.add(str(normalized))
+            continue
+        fallback = _normalize_common_symbol(str(symbol))
+        if fallback:
+            wanted.add(fallback)
+    return wanted
 
 
 def _to_bingx_symbol(symbol: Symbol) -> str:
@@ -182,7 +239,7 @@ async def _run_bingx_ws_tickers(
     *,
     subscribe_all: bool = False,
 ) -> None:
-    wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
+    wanted_common = _collect_wanted_common(symbols)
     if subscribe_all:
         ws_symbols = ["ALL"]
     else:
@@ -206,15 +263,8 @@ async def _run_bingx_ws_tickers(
                     await _reply_ws_ping(ws, msg)
                     continue
 
-                for raw_symbol, payload in _iter_ws_payloads(msg):
+                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common):
                     if not payload:
-                        continue
-
-                    exchange_symbol = _normalize_ws_symbol(raw_symbol)
-                    common_symbol = _from_bingx_symbol(exchange_symbol)
-                    if not common_symbol:
-                        continue
-                    if wanted_common and common_symbol not in wanted_common:
                         continue
 
                     bid = _extract_price(
@@ -262,6 +312,7 @@ async def _run_bingx_ws_tickers(
                             ts=time.time(),
                         )
                     )
+                    _log_first_ticker(common_symbol, bid, ask)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -272,7 +323,7 @@ async def _run_bingx_orderbooks(
     store: TickerStore,
     symbols: Sequence[Symbol],
 ) -> None:
-    wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
+    wanted_common = _collect_wanted_common(symbols)
     if not wanted_common:
         return
 
@@ -295,13 +346,8 @@ async def _run_bingx_orderbooks(
                     await _reply_ws_ping(ws, msg)
                     continue
 
-                for raw_symbol, payload in _iter_ws_payloads(msg):
+                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common):
                     if not isinstance(payload, dict):
-                        continue
-
-                    exchange_symbol = _normalize_ws_symbol(raw_symbol)
-                    common_symbol = _from_bingx_symbol(exchange_symbol)
-                    if not common_symbol or common_symbol not in wanted_common:
                         continue
 
                     bids, asks, last_price = _extract_depth_payload(payload)
@@ -362,6 +408,8 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
         "dataType": topics,
     }
 
+    _log_ws_subscriptions("ticker", topics)
+
     try:
         await ws.send(json.dumps(payload))
     except Exception:
@@ -384,6 +432,8 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
         "reqType": "sub",
         "dataType": topics,
     }
+
+    _log_ws_subscriptions("depth", topics)
 
     try:
         await ws.send(json.dumps(payload))
@@ -427,24 +477,24 @@ async def _reply_ws_ping(ws, message: dict) -> None:
         pass
 
 
-def _iter_ws_payloads(message: dict) -> Iterable[tuple[str, dict]]:
+def _iter_ws_payloads(
+    message: dict,
+    wanted_common: set[str] | None = None,
+) -> Iterable[tuple[str, dict]]:
     if not isinstance(message, dict):
+        logger.debug(
+            "BingX WS message ignored: unexpected type %s", type(message).__name__
+        )
         return []
 
     action = message.get("action")
     if isinstance(action, str):
         normalized = action.strip().lower()
-        # Сообщения о подписке/ошибке не содержат рыночных данных и могут
-        # безболезненно игнорироваться. BingX в последнее время стал
-        # использовать значения вроде "snapshot"/"update" для тикеров, так что
-        # фильтруем только явные служебные статусы.
         if normalized in {"subscribe", "sub", "unsubscribe", "unsub", "error"}:
             return []
 
     payload = message.get("data")
     if payload is None:
-        # На всякий случай поддерживаем альтернативные ключи, которые BingX
-        # возвращает в ряде эндпоинтов.
         for key in ("tickers", "items", "result"):
             cand = message.get(key)
             if cand is not None:
@@ -464,7 +514,39 @@ def _iter_ws_payloads(message: dict) -> Iterable[tuple[str, dict]]:
     if topic_symbol:
         default_symbol = topic_symbol
 
-    return list(_iter_payload_items(payload, default_symbol))
+    accepted: list[tuple[str, dict]] = []
+    for raw_symbol, payload_item in _iter_payload_items(payload, default_symbol):
+        if not isinstance(payload_item, dict):
+            logger.debug(
+                "BingX WS drop %r: payload is not a dict (got %s)",
+                raw_symbol,
+                type(payload_item).__name__,
+            )
+            continue
+
+        if not raw_symbol:
+            logger.debug(
+                "BingX WS drop payload without symbol: keys=%s",
+                list(payload_item.keys())[:5],
+            )
+            continue
+
+        common_symbol = normalize_bingx_symbol(raw_symbol)
+        if not common_symbol:
+            logger.debug("BingX WS drop %r: unable to normalize symbol", raw_symbol)
+            continue
+
+        normalized_common = str(common_symbol)
+        if wanted_common and normalized_common not in wanted_common:
+            logger.debug(
+                "BingX WS drop %s: symbol not requested", normalized_common
+            )
+            continue
+
+        _log_ws_payload_received(normalized_common)
+        accepted.append((normalized_common, payload_item))
+
+    return accepted
 
 
 def _extract_depth_payload(payload: dict) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], float | None]:
@@ -654,14 +736,6 @@ def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str
     return default_symbol
 
 
-def _normalize_ws_symbol(symbol: str) -> str:
-    sym = symbol.strip().upper()
-    sym = sym.replace("/", "-")
-    if "_" in sym and "-" not in sym:
-        sym = sym.replace("_", "-")
-    return sym
-
-
 def _extract_topic_symbol(data_type) -> str | None:
     if isinstance(data_type, (list, tuple, set)):
         for item in data_type:
@@ -701,7 +775,7 @@ async def _poll_bingx_http(
     ws_ready: asyncio.Event | None = None,
     fetch_all: bool = False,
 ) -> None:
-    wanted_common = {_normalize_common_symbol(sym) for sym in symbols if sym}
+    wanted_common = _collect_wanted_common(symbols)
     if not wanted_common and not fetch_all:
         return
 

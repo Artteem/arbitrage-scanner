@@ -22,7 +22,7 @@ def test_iter_ws_payloads_handles_snapshot_action():
 
     assert items == [
         (
-            "BTC-USDT",
+            "BTCUSDT",
             {
                 "symbol": "BTC-USDT",
                 "bestBid": "63000",
@@ -58,7 +58,7 @@ def test_iter_ws_payloads_supports_alternative_keys():
 
     assert items == [
         (
-            "ETH-USDT",
+            "ETHUSDT",
             {
                 "market": "ETH-USDT",
                 "bid": "3500",
@@ -81,7 +81,7 @@ def test_iter_ws_payloads_uses_data_type_symbol():
 
     assert items == [
         (
-            "BTC-USDT",
+            "BTCUSDT",
             {
                 "bp": "63000",
                 "ap": "63010",
@@ -104,7 +104,7 @@ def test_iter_ws_payloads_handles_list_data_type():
 
     assert items == [
         (
-            "ETH-USDT",
+            "ETHUSDT",
             {
                 "pair": "ETH-USDT",
                 "bid1Price": "3500",
