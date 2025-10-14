@@ -11,9 +11,9 @@ class _DummyResponse:
     def json(self):
         return {
             "data": [
-                {"symbol": "BTC-USDT"},
-                {"market": "ETH-USDT"},
-                {"instId": "LTC-USDC"},
+                {"symbol": "BTC-USDT", "quoteAsset": "usdt"},
+                {"market": "ETH-USDT", "quoteAsset": "USDT"},
+                {"instId": "LTC-USDC", "quoteAsset": "USDC"},
             ]
         }
 
@@ -29,8 +29,8 @@ class _DummyClient:
         return False
 
     async def get(self, url, params=None):
-        assert url == discovery.BINGX_TICKERS
-        assert params == {"symbol": "ALL"}
+        assert url == discovery.BINGX_CONTRACTS
+        assert params is None
         return _DummyResponse()
 
 
