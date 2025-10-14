@@ -8,6 +8,7 @@ import httpx
 
 from ..connectors.discovery import (
     BINANCE_EXCHANGE_INFO,
+    BINANCE_HEADERS,
     BYBIT_INSTRUMENTS,
     MEXC_CONTRACTS,
 )
@@ -69,38 +70,89 @@ async def fetch_limits(exchange: str, symbol: str) -> Optional[dict[str, Any]]:
 
 async def _fetch_binance_limits(symbol: str) -> Optional[dict[str, Any]]:
     sym = symbol.upper()
+    entry = await _lookup_binance_symbol(sym)
+    if entry is None:
+        return None
+
+    max_qty = None
+    max_notional = None
+    for flt in entry.get("filters", []):
+        ftype = (flt.get("filterType") or "").upper()
+        if ftype in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+            candidate = _safe_float(flt.get("maxQty"))
+            if candidate is not None:
+                max_qty = candidate
+        if ftype == "NOTIONAL":
+            candidate = _safe_float(flt.get("maxNotionalValue"))
+            if candidate is not None:
+                max_notional = candidate
+    return {
+        "max_qty": max_qty,
+        "max_notional": max_notional,
+    }
+
+
+async def _request_binance_exchange_info(symbol: str | None = None) -> list[dict[str, Any]]:
+    params = {"symbol": symbol} if symbol else None
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(15.0, connect=10.0),
+        headers=BINANCE_HEADERS,
+        http2=True,
+    ) as client:
+        resp = await client.get(BINANCE_EXCHANGE_INFO, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+    entries = payload.get("symbols", []) if isinstance(payload, dict) else []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+async def _lookup_binance_symbol(symbol: str) -> Optional[dict[str, Any]]:
+    global _BINANCE_CACHE
+
+    sym = symbol.upper()
     async with _BINANCE_LOCK:
-        global _BINANCE_CACHE
-        if _BINANCE_CACHE is None or time.time() - _BINANCE_CACHE.get("ts", 0) > _CACHE_TTL:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(BINANCE_EXCHANGE_INFO)
-                resp.raise_for_status()
-                payload = resp.json()
+        now = time.time()
+        cached_symbols = []
+        if _BINANCE_CACHE and now - _BINANCE_CACHE.get("ts", 0) <= _CACHE_TTL:
+            cached_symbols = _BINANCE_CACHE.get("symbols", []) or []
+        else:
+            try:
+                cached_symbols = await _request_binance_exchange_info()
+            except Exception:
+                cached_symbols = []
             _BINANCE_CACHE = {
                 "ts": time.time(),
-                "symbols": payload.get("symbols", []),
+                "symbols": cached_symbols,
             }
-        entries = _BINANCE_CACHE.get("symbols", []) if _BINANCE_CACHE else []
-    for item in entries:
-        if item.get("symbol") != sym:
-            continue
-        max_qty = None
-        max_notional = None
-        for flt in item.get("filters", []):
-            ftype = (flt.get("filterType") or "").upper()
-            if ftype in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
-                candidate = _safe_float(flt.get("maxQty"))
-                if candidate is not None:
-                    max_qty = candidate
-            if ftype == "NOTIONAL":
-                candidate = _safe_float(flt.get("maxNotionalValue"))
-                if candidate is not None:
-                    max_notional = candidate
-        return {
-            "max_qty": max_qty,
-            "max_notional": max_notional,
-        }
-    return None
+
+        for item in cached_symbols:
+            if (item.get("symbol") or "").upper() == sym:
+                return item
+
+    # Символ не нашли в общем списке — попробуем запросить его отдельно.
+    try:
+        entries = await _request_binance_exchange_info(sym)
+    except Exception:
+        return None
+
+    if not entries:
+        return None
+
+    entry = entries[0]
+
+    async with _BINANCE_LOCK:
+        if _BINANCE_CACHE is None:
+            _BINANCE_CACHE = {"ts": time.time(), "symbols": [entry]}
+        else:
+            symbols = _BINANCE_CACHE.get("symbols", []) or []
+            if not any((item.get("symbol") or "").upper() == sym for item in symbols):
+                symbols.append(entry)
+                _BINANCE_CACHE = {
+                    "ts": time.time(),
+                    "symbols": symbols,
+                }
+
+    return entry
 
 
 async def _fetch_bybit_limits(symbol: str) -> Optional[dict[str, Any]]:
