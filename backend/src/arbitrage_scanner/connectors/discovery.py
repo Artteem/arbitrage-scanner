@@ -28,6 +28,17 @@ _BINANCE_EXPECTED_MIN = 50
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
 BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
+GATE_CONTRACTS = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
+GATE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.gate.io",
+    "Referer": "https://www.gate.io/",
+}
 
 def _extract_binance_perpetuals(payload: dict) -> Set[str]:
     out: Set[str] = set()
@@ -157,6 +168,68 @@ async def discover_mexc_usdt_perp() -> Set[str]:
             continue
         if sym:
             out.add(sym)
+    return out
+
+
+def _gate_symbol_to_common(symbol: str | None) -> str | None:
+    if not symbol:
+        return None
+    sym = str(symbol).strip()
+    if not sym:
+        return None
+    sym = sym.replace("-", "_")
+    if sym.count("_") > 1:
+        return None
+    return sym.replace("_", "")
+
+
+def _gate_is_active_contract(item: dict) -> bool:
+    state = str(item.get("state") or item.get("status") or "").strip().lower()
+    if state and state not in {"open", "trading", "live"}:
+        return False
+    if bool(item.get("is_delisted")):
+        return False
+    in_delisting = item.get("in_delisting")
+    if isinstance(in_delisting, str):
+        if in_delisting.strip().lower() in {"true", "1"}:
+            return False
+    elif in_delisting:
+        return False
+    return True
+
+
+async def discover_gate_usdt_perp() -> Set[str]:
+    async with httpx.AsyncClient(timeout=20, headers=GATE_HEADERS) as client:
+        response = await client.get(GATE_CONTRACTS)
+        response.raise_for_status()
+        payload = response.json()
+
+    if isinstance(payload, dict):
+        items = None
+        for key in ("data", "contracts", "items", "result"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                items = val
+                break
+        if items is None:
+            items = []
+    else:
+        items = payload if isinstance(payload, list) else []
+
+    out: Set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        contract = item.get("contract") or item.get("name") or item.get("symbol")
+        if not contract:
+            continue
+        if not _gate_is_active_contract(item):
+            continue
+        if str(contract).count("_") > 1:
+            continue
+        sym_common = _gate_symbol_to_common(contract)
+        if sym_common:
+            out.add(sym_common)
     return out
 
 
