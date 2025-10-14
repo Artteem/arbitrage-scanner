@@ -107,9 +107,10 @@ async def _request_binance_exchange_info(symbol: str | None = None) -> list[dict
 
 
 async def _lookup_binance_symbol(symbol: str) -> Optional[dict[str, Any]]:
+    global _BINANCE_CACHE
+
     sym = symbol.upper()
     async with _BINANCE_LOCK:
-        global _BINANCE_CACHE
         now = time.time()
         cached_symbols = []
         if _BINANCE_CACHE and now - _BINANCE_CACHE.get("ts", 0) <= _CACHE_TTL:
@@ -140,7 +141,6 @@ async def _lookup_binance_symbol(symbol: str) -> Optional[dict[str, Any]]:
     entry = entries[0]
 
     async with _BINANCE_LOCK:
-        global _BINANCE_CACHE
         if _BINANCE_CACHE is None:
             _BINANCE_CACHE = {"ts": time.time(), "symbols": [entry]}
         else:
