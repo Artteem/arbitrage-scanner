@@ -12,7 +12,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws?compress=false"
-WS_SUB_BATCH = 250
+WS_SUB_BATCH = 120
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
@@ -73,44 +73,38 @@ def _chunk(symbols: Sequence[str], size: int) -> Iterable[Sequence[str]]:
 
 
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
-    subscribe = list(dict.fromkeys(symbols))
+    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
     if not subscribe:
         return
 
-    tasks = [
-        asyncio.create_task(_run_mexc_orderbooks(store, subscribe)),
-        asyncio.create_task(_run_mexc_tickers(store, subscribe)),
-        asyncio.create_task(_run_mexc_funding(store, subscribe)),
-    ]
+    tasks: list[asyncio.Task] = []
+    for chunk in _chunk(subscribe, WS_SUB_BATCH):
+        tasks.append(asyncio.create_task(_run_mexc_ws(store, chunk)))
 
     try:
         await asyncio.gather(*tasks)
     finally:
         for task in tasks:
-            if not task.done():
-                task.cancel()
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
-    wanted = {_to_mexc_symbol(sym) for sym in symbols if sym}
-    if not wanted:
+async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    wanted_exchange = [_to_mexc_symbol(sym) for sym in symbols if sym]
+    wanted_exchange = [sym for sym in wanted_exchange if sym]
+    if not wanted_exchange:
         return
 
-    ws_symbols = sorted(wanted)
+    wanted_common = {_from_mexc_symbol(sym) for sym in wanted_exchange if sym}
+    wanted_common = {sym for sym in wanted_common if sym}
+    if not wanted_common:
+        return
+
     books: Dict[str, _MexcOrderBookState] = {}
-    wanted_common = {sym.replace("_", "") for sym in wanted}
 
     async for ws in _reconnect_ws():
         try:
-            for batch in _chunk(ws_symbols, WS_SUB_BATCH):
-                for sym in batch:
-                    payload = {
-                        "method": "sub.depth",
-                        "params": [sym, WS_DEPTH_LEVELS],
-                        "id": int(time.time() * 1_000),
-                    }
-                    await ws.send(json.dumps(payload))
+            await _send_mexc_subscriptions(ws, wanted_exchange)
 
             async for raw in ws:
                 msg = _decode_ws_message(raw)
@@ -121,89 +115,66 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                     await _reply_pong(ws, msg)
                     continue
 
-                parsed = _extract_depth_message(msg)
-                if not parsed:
-                    continue
+                depth_payload = _extract_depth_message(msg)
+                if depth_payload:
+                    snapshot, data, sym_raw = depth_payload
+                    if not isinstance(data, dict):
+                        continue
+                    sym_common = _from_mexc_symbol(sym_raw)
+                    if not sym_common or sym_common not in wanted_common:
+                        continue
 
-                snapshot, data, sym_raw = parsed
-                if not isinstance(data, dict):
-                    continue
+                    bids_raw = data.get("bids") or data.get("b") or data.get("buy")
+                    asks_raw = data.get("asks") or data.get("a") or data.get("sell")
 
-                sym_common = _from_mexc_symbol(sym_raw)
-                if not sym_common or sym_common not in wanted_common:
-                    continue
+                    book = books.setdefault(sym_common, _MexcOrderBookState())
+                    if snapshot:
+                        book.snapshot(bids_raw, asks_raw)
+                    else:
+                        book.update(bids_raw, asks_raw)
 
-                bids_raw = data.get("bids") or data.get("b") or data.get("buy")
-                asks_raw = data.get("asks") or data.get("a") or data.get("sell")
+                    bids, asks = book.top_levels()
+                    last_price = _extract_last_price(data)
 
-                book = books.setdefault(sym_common, _MexcOrderBookState())
-                if snapshot:
-                    book.snapshot(bids_raw, asks_raw)
-                else:
-                    book.update(bids_raw, asks_raw)
-
-                bids, asks = book.top_levels()
-                last_price = _extract_last_price(data)
-
-                store.upsert_order_book(
-                    "mexc",
-                    sym_common,
-                    bids=bids or None,
-                    asks=asks or None,
-                    ts=time.time(),
-                    last_price=last_price,
-                )
-
-                if bids and asks:
-                    best_bid = bids[0][0]
-                    best_ask = asks[0][0]
-                    store.upsert_ticker(
-                        Ticker(
-                            exchange="mexc",
-                            symbol=sym_common,
-                            bid=best_bid,
-                            ask=best_ask,
-                            ts=time.time(),
-                        )
+                    store.upsert_order_book(
+                        "mexc",
+                        sym_common,
+                        bids=bids or None,
+                        asks=asks or None,
+                        ts=time.time(),
+                        last_price=last_price,
                     )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await asyncio.sleep(2.0)
 
-
-async def _run_mexc_tickers(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    wanted = {_to_mexc_symbol(sym) for sym in symbols if sym}
-    if not wanted:
-        return
-
-    ws_symbols = sorted(wanted)
-
-    async for ws in _reconnect_ws():
-        try:
-            for batch in _chunk(ws_symbols, WS_SUB_BATCH):
-                for sym in batch:
-                    payload = {"method": "sub.ticker", "params": [sym], "id": int(time.time() * 1_000)}
-                    await ws.send(json.dumps(payload))
-
-            async for raw in ws:
-                msg = _decode_ws_message(raw)
-                if msg is None:
-                    continue
-
-                if _is_ping(msg):
-                    await _reply_pong(ws, msg)
+                    if bids and asks:
+                        best_bid = bids[0][0]
+                        best_ask = asks[0][0]
+                        store.upsert_ticker(
+                            Ticker(
+                                exchange="mexc",
+                                symbol=sym_common,
+                                bid=best_bid,
+                                ask=best_ask,
+                                ts=time.time(),
+                            )
+                        )
                     continue
 
                 now = time.time()
                 for sym_raw, payload in _iter_mexc_payloads(msg):
-                    if not payload:
+                    if not isinstance(payload, dict):
                         continue
+
                     sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common:
+                    if not sym_common or sym_common not in wanted_common:
                         continue
-                    sym_exchange = _to_mexc_symbol(sym_common)
-                    if sym_raw not in wanted and sym_exchange not in wanted:
+
+                    if _looks_like_depth(payload):
+                        continue
+
+                    rate = _extract_funding_rate(payload)
+                    if rate is not None:
+                        interval = _parse_interval(payload)
+                        store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
                         continue
 
                     bid = _extract_bid(payload)
@@ -212,64 +183,17 @@ async def _run_mexc_tickers(store: TickerStore, symbols: Sequence[Symbol]) -> No
                         continue
 
                     store.upsert_ticker(
-                        Ticker(
-                            exchange="mexc",
-                            symbol=sym_common,
-                            bid=bid,
-                            ask=ask,
-                            ts=now,
+                        Ticker(exchange="mexc", symbol=sym_common, bid=bid, ask=ask, ts=now)
+                    )
+
+                    last_price = _extract_last_price(payload)
+                    if last_price:
+                        store.upsert_order_book(
+                            "mexc",
+                            sym_common,
+                            last_price=last_price,
+                            last_price_ts=now,
                         )
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await asyncio.sleep(2.0)
-
-
-async def _run_mexc_funding(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    wanted = {_to_mexc_symbol(sym) for sym in symbols if sym}
-    if not wanted:
-        return
-
-    ws_symbols = sorted(wanted)
-
-    async for ws in _reconnect_ws():
-        try:
-            for batch in _chunk(ws_symbols, WS_SUB_BATCH):
-                for sym in batch:
-                    payload = {"method": "sub.funding_rate", "params": [sym], "id": int(time.time() * 1_000)}
-                    await ws.send(json.dumps(payload))
-
-            async for raw in ws:
-                msg = _decode_ws_message(raw)
-                if msg is None:
-                    continue
-
-                if _is_ping(msg):
-                    await _reply_pong(ws, msg)
-                    continue
-
-                now = time.time()
-                for sym_raw, payload in _iter_mexc_payloads(msg):
-                    if not payload:
-                        continue
-
-                    sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common:
-                        continue
-                    sym_exchange = _to_mexc_symbol(sym_common)
-                    if sym_raw not in wanted and sym_exchange not in wanted:
-                        continue
-
-                    rate = _as_float(
-                        payload.get("fundingRate")
-                        or payload.get("funding_rate")
-                        or payload.get("rate")
-                        or payload.get("value")
-                    )
-
-                    interval = _parse_interval(payload)
-                    store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -294,6 +218,30 @@ async def _reconnect_ws():
         except Exception:
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_RECONNECT_MAX)
+
+
+async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
+    if not symbols:
+        return
+
+    base_id = int(time.time() * 1_000)
+    req_id = base_id
+
+    for method, extra in (
+        ("sub.ticker", None),
+        ("sub.depth", WS_DEPTH_LEVELS),
+        ("sub.funding_rate", None),
+    ):
+        for sym in symbols:
+            params = [sym]
+            if extra is not None:
+                params.append(extra)
+            payload = {"method": method, "params": params, "id": req_id}
+            req_id += 1
+            try:
+                await ws.send(json.dumps(payload))
+            except Exception:
+                return
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
@@ -387,6 +335,33 @@ def _iter_levels(source) -> Iterable[Tuple[float, float]]:
             continue
         result.append((price, size))
     return result
+
+
+def _looks_like_depth(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("bids") or payload.get("asks"):
+        return True
+    if payload.get("b") or payload.get("a"):
+        return True
+    if payload.get("buy") or payload.get("sell"):
+        return True
+    return False
+
+
+def _extract_funding_rate(payload: dict) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("fundingRate", "funding_rate", "rate", "value"):
+        val = payload.get(key)
+        if val is None:
+            continue
+        try:
+            rate = float(val)
+        except (TypeError, ValueError):
+            continue
+        return rate
+    return None
 
 
 def _iter_mexc_payloads(message) -> Iterable[Tuple[str, dict]]:
