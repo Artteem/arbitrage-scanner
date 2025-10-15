@@ -292,19 +292,19 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
 
     base_id = int(time.time() * 1_000)
     payloads: list[dict] = []
-    req_id = base_id
 
-    for method, extra in (
-        ("sub.ticker", None),
-        ("sub.depth", WS_DEPTH_LEVELS),
-        ("sub.funding_rate", None),
-    ):
-        for sym in symbols:
-            params: list[object] = [sym]
-            if extra is not None:
-                params.append(extra)
-            payloads.append({"method": method, "params": params, "id": req_id})
-            req_id += 1
+    ticker_symbols = list(dict.fromkeys(sym for sym in symbols if sym))
+    if ticker_symbols:
+        payloads.append({"method": "sub.ticker", "params": ticker_symbols, "id": base_id})
+        base_id += 1
+
+    depth_params = [[sym, WS_DEPTH_LEVELS] for sym in ticker_symbols]
+    if depth_params:
+        payloads.append({"method": "sub.depth", "params": depth_params, "id": base_id})
+        base_id += 1
+
+    if ticker_symbols:
+        payloads.append({"method": "sub.funding_rate", "params": ticker_symbols, "id": base_id})
 
     if not payloads:
         return
