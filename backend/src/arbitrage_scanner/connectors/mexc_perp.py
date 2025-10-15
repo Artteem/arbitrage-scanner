@@ -317,19 +317,21 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    if isinstance(message, str):
-        raw = message
-    elif isinstance(message, (bytes, bytearray)):
-        raw = bytes(message).decode("utf-8", errors="ignore")
-    else:
+    if isinstance(message, bytes):
+        try:
+            message = message.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    if not isinstance(message, str):
         return None
 
-    raw = raw.strip()
-    if not raw:
+    message = message.strip()
+    if not message:
         return None
 
     try:
-        return json.loads(raw)
+        return json.loads(message)
     except Exception:
         return None
 

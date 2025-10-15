@@ -110,11 +110,9 @@ def test_parse_interval_formats_hours():
     assert _parse_interval({}) == "8h"
 
 
-def test_decode_ws_message_handles_gzip_bytes():
+def test_decode_ws_message_rejects_compressed_bytes():
     payload = {"channel": "push.ticker", "data": {"symbol": "BTC_USDT"}}
     blob = json.dumps(payload).encode("utf-8")
     compressed = gzip.compress(blob)
 
-    decoded = _decode_ws_message(compressed)
-
-    assert decoded == payload
+    assert _decode_ws_message(compressed) is None
