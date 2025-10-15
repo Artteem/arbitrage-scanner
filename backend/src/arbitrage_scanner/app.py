@@ -159,10 +159,13 @@ async def health():
 @app.get("/stats")
 async def stats():
     snap = store.snapshot()
+    metrics = store.stats()
     return {
         "symbols_subscribed": SYMBOLS,
         "tickers_in_store": len(snap),
         "exchanges": EXCHANGES,
+        "ticker_updates": metrics.get("ticker_updates", 0),
+        "order_book_updates": metrics.get("order_book_updates", 0),
     }
 
 

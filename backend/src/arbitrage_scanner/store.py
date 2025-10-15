@@ -48,9 +48,12 @@ class TickerStore:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
+        self._ticker_updates: int = 0
+        self._order_book_updates: int = 0
 
     def upsert_ticker(self, t: Ticker) -> None:
         self._latest[(t.exchange, t.symbol)] = t
+        self._ticker_updates += 1
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
         self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)
@@ -83,6 +86,13 @@ class TickerStore:
         if last_price_ts is not None:
             ob.last_price_ts = last_price_ts
         self._order_books[key] = ob
+        self._order_book_updates += 1
+
+    def stats(self) -> dict:
+        return {
+            "ticker_updates": self._ticker_updates,
+            "order_book_updates": self._order_book_updates,
+        }
 
     def snapshot(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}

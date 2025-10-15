@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import json
 import logging
 import time
-import zlib
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -15,13 +13,10 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .discovery import discover_mexc_usdt_perp
 
-WS_ENDPOINT = "wss://contract.mexc.com/ws?compress=false"
-WS_SUB_BATCH = 120
+WS_ENDPOINT = "wss://contract.mexc.com/ws"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
-MIN_SYMBOL_THRESHOLD = 5
-FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 MEXC_HEADERS = {
     "User-Agent": (
@@ -53,28 +48,38 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         seen.add(normalized)
         requested.append(normalized)
 
-    discovered: set[str] = set()
     try:
         discovered = await discover_mexc_usdt_perp()
     except Exception:
-        discovered = set()
+        logger.exception("Failed to discover MEXC symbols")
+        return []
 
-    if discovered:
-        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
-        filtered: list[Symbol] = []
-        used: set[str] = set()
-        for symbol in requested:
-            if symbol in discovered_normalized and symbol not in used:
-                filtered.append(symbol)
-                used.add(symbol)
-        if filtered:
-            return filtered
-        return sorted(discovered_normalized)
+    if not discovered:
+        logger.error("MEXC discovery returned no USDT perpetual symbols; connector disabled")
+        return []
 
-    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
-        return list(FALLBACK_SYMBOLS)
+    discovered_normalized: set[str] = set()
+    for sym in discovered:
+        normalized = _normalize_common_symbol(sym)
+        if normalized:
+            discovered_normalized.add(normalized)
+    if not discovered_normalized:
+        logger.error("MEXC discovery produced no usable symbols; connector disabled")
+        return []
 
-    return requested
+    if not requested:
+        requested = sorted(discovered_normalized)
+
+    filtered = [symbol for symbol in requested if symbol in discovered_normalized]
+
+    if not filtered:
+        logger.warning(
+            "Requested symbols are unavailable on MEXC; nothing to subscribe",
+            extra={"requested": requested},
+        )
+        return []
+
+    return filtered
 
 
 def _as_float(value) -> float:
@@ -126,38 +131,27 @@ def _parse_interval(item) -> str:
     return "8h"
 
 
-def _chunk(symbols: Sequence[str], size: int) -> Iterable[Sequence[str]]:
-    for idx in range(0, len(symbols), size):
-        yield symbols[idx : idx + size]
-
-
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
     subscribe = await _resolve_mexc_symbols(symbols)
     if not subscribe:
-        return
-
-    chunks = [tuple(chunk) for chunk in _chunk(subscribe, WS_SUB_BATCH)]
-    if not chunks:
+        logger.warning("No symbols resolved for MEXC connector; skipping startup")
         return
 
     while True:
-        tasks: list[asyncio.Task] = [
-            asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks
-        ]
+        task = asyncio.create_task(_run_mexc_ws(store, tuple(subscribe)))
 
         try:
-            await asyncio.gather(*tasks)
+            await task
             return
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("MEXC websocket workers crashed; restarting")
+            logger.exception("MEXC websocket worker crashed; restarting")
             await asyncio.sleep(WS_RECONNECT_INITIAL)
         finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
@@ -280,7 +274,6 @@ async def _reconnect_ws():
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=5,
-                compression=None,
                 extra_headers=MEXC_HEADERS,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
@@ -297,6 +290,7 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
         return
 
     base_id = int(time.time() * 1_000)
+    payloads: list[dict] = []
     req_id = base_id
 
     for method, extra in (
@@ -305,25 +299,31 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
         ("sub.funding_rate", None),
     ):
         for sym in symbols:
-            params = [sym]
+            params: list[object] = [sym]
             if extra is not None:
                 params.append(extra)
-            payload = {"method": method, "params": params, "id": req_id}
+            payloads.append({"method": method, "params": params, "id": req_id})
             req_id += 1
-            try:
-                await ws.send(json.dumps(payload))
-            except Exception:
-                return
+
+    if not payloads:
+        return
+
+    message = json.dumps(payloads)
+    try:
+        await ws.send(message)
+    except Exception:
+        logger.exception("Failed to send batched MEXC subscriptions")
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
     if isinstance(message, str):
         raw = message
     elif isinstance(message, (bytes, bytearray)):
-        raw = _decode_ws_bytes(bytes(message))
+        raw = bytes(message).decode("utf-8", errors="ignore")
     else:
         return None
 
+    raw = raw.strip()
     if not raw:
         return None
 
@@ -331,36 +331,6 @@ def _decode_ws_message(message: str | bytes) -> dict | None:
         return json.loads(raw)
     except Exception:
         return None
-
-
-def _decode_ws_bytes(data: bytes) -> str | None:
-    if not data:
-        return None
-
-    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
-        try:
-            text = decoder(data)
-        except Exception:
-            continue
-        if text:
-            return text
-    return None
-
-
-def _decode_utf8(data: bytes) -> str:
-    return data.decode("utf-8", errors="strict")
-
-
-def _decode_gzip(data: bytes) -> str:
-    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
-        raise ValueError("not gzip")
-    return gzip.decompress(data).decode("utf-8")
-
-
-def _decode_zlib(data: bytes) -> str:
-    if len(data) < 2 or data[0] != 0x78:
-        raise ValueError("not zlib")
-    return zlib.decompress(data).decode("utf-8")
 
 
 def _is_ping(message: dict) -> bool:
