@@ -25,6 +25,46 @@ FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 logger = logging.getLogger(__name__)
 
 
+def _normalize_common_symbol(symbol: Symbol) -> str:
+    return str(symbol).replace("-", "").replace("_", "").upper()
+
+
+async def _resolve_gate_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
+    requested: list[Symbol] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = _normalize_common_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    discovered: set[str] = set()
+    try:
+        discovered = await discover_gate_usdt_perp()
+    except Exception:
+        discovered = set()
+
+    if discovered:
+        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
+        filtered: list[Symbol] = []
+        used: set[str] = set()
+        for symbol in requested:
+            if symbol in discovered_normalized and symbol not in used:
+                filtered.append(symbol)
+                used.add(symbol)
+        if filtered:
+            return filtered
+        return sorted(discovered_normalized)
+
+    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+        return list(FALLBACK_SYMBOLS)
+
+    return requested
+
+
 def _to_gate_symbol(symbol: Symbol) -> str:
     sym = str(symbol).upper().replace("-", "_")
     if "_" in sym:
@@ -137,18 +177,7 @@ def _chunk(symbols: Sequence[Symbol], size: int) -> Iterable[Sequence[Symbol]]:
 
 
 async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
-
-    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
-        try:
-            discovered = await discover_gate_usdt_perp()
-        except Exception:
-            discovered = set()
-        if discovered:
-            subscribe = sorted(discovered)
-        else:
-            subscribe = list(FALLBACK_SYMBOLS)
-
+    subscribe = await _resolve_gate_symbols(symbols)
     if not subscribe:
         return
 

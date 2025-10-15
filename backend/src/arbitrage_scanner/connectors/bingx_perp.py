@@ -43,6 +43,42 @@ BINGX_HEADERS = {
 }
 
 
+async def _resolve_bingx_symbols(symbols: Sequence[Symbol]) -> tuple[list[Symbol], bool]:
+    requested: list[Symbol] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = _normalize_common_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    discovered: set[str] = set()
+    try:
+        discovered = await discover_bingx_usdt_perp()
+    except Exception:
+        discovered = set()
+
+    if discovered:
+        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
+        filtered: list[Symbol] = []
+        used: set[str] = set()
+        for symbol in requested:
+            if symbol in discovered_normalized and symbol not in used:
+                filtered.append(symbol)
+                used.add(symbol)
+        if filtered:
+            return filtered, False
+        return sorted(discovered_normalized), False
+
+    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+        return list(FALLBACK_SYMBOLS), True
+
+    return requested, False
+
+
 def _log_ws_subscriptions(kind: str, topics: Sequence[str]) -> None:
     if not topics:
         return
@@ -152,19 +188,7 @@ def _from_bingx_symbol(symbol: str | None) -> Symbol | None:
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
-    subscribe_all = False
-
-    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
-        try:
-            discovered = await discover_bingx_usdt_perp()
-        except Exception:
-            discovered = set()
-        if discovered:
-            subscribe = sorted(discovered)
-        else:
-            subscribe = list(FALLBACK_SYMBOLS)
-            subscribe_all = True
+    subscribe, subscribe_all = await _resolve_bingx_symbols(symbols)
 
     if not subscribe and not subscribe_all:
         return

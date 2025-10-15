@@ -12,7 +12,11 @@ from ..store import TickerStore
 from .discovery import discover_binance_usdt_perp
 
 WS_BASE = "wss://fstream.binance.com/stream"
-WS_SUB_BATCH = 250
+# Binance ограничивает количество потоков (streams) до 200 на одно подключение.
+# Для каждого тикера мы подписываемся на четыре стрима (bookTicker, markPrice,
+# depth и trades), поэтому оставим запас и будем отправлять не более 50 тикеров
+# на одно соединение: 50 * 4 = 200 streams.
+WS_SUB_BATCH = 50
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5

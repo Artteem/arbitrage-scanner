@@ -13,12 +13,15 @@ import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .discovery import discover_mexc_usdt_perp
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws?compress=false"
 WS_SUB_BATCH = 120
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+MIN_SYMBOL_THRESHOLD = 5
+FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 MEXC_HEADERS = {
     "User-Agent": (
@@ -32,6 +35,46 @@ MEXC_HEADERS = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_common_symbol(symbol: Symbol) -> str:
+    return str(symbol).replace("-", "").replace("_", "").upper()
+
+
+async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
+    requested: list[Symbol] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = _normalize_common_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    discovered: set[str] = set()
+    try:
+        discovered = await discover_mexc_usdt_perp()
+    except Exception:
+        discovered = set()
+
+    if discovered:
+        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
+        filtered: list[Symbol] = []
+        used: set[str] = set()
+        for symbol in requested:
+            if symbol in discovered_normalized and symbol not in used:
+                filtered.append(symbol)
+                used.add(symbol)
+        if filtered:
+            return filtered
+        return sorted(discovered_normalized)
+
+    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+        return list(FALLBACK_SYMBOLS)
+
+    return requested
 
 
 def _as_float(value) -> float:
@@ -89,7 +132,7 @@ def _chunk(symbols: Sequence[str], size: int) -> Iterable[Sequence[str]]:
 
 
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
-    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
+    subscribe = await _resolve_mexc_symbols(symbols)
     if not subscribe:
         return
 
