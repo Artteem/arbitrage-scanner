@@ -1,28 +1,80 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
+import logging
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-import httpx
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
-
-MIN_SYMBOL_THRESHOLD = 5
-
-TICKERS_URL = "https://contract.mexc.com/api/v1/contract/ticker"
-FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
-POLL_INTERVAL = 1.5
+from .discovery import discover_mexc_usdt_perp
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws?compress=false"
-WS_SUB_BATCH = 250
+WS_SUB_BATCH = 120
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+MIN_SYMBOL_THRESHOLD = 5
+FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+
+MEXC_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Origin": "https://www.mexc.com",
+    "Referer": "https://www.mexc.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_common_symbol(symbol: Symbol) -> str:
+    return str(symbol).replace("-", "").replace("_", "").upper()
+
+
+async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
+    requested: list[Symbol] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = _normalize_common_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    discovered: set[str] = set()
+    try:
+        discovered = await discover_mexc_usdt_perp()
+    except Exception:
+        discovered = set()
+
+    if discovered:
+        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
+        filtered: list[Symbol] = []
+        used: set[str] = set()
+        for symbol in requested:
+            if symbol in discovered_normalized and symbol not in used:
+                filtered.append(symbol)
+                used.add(symbol)
+        if filtered:
+            return filtered
+        return sorted(discovered_normalized)
+
+    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+        return list(FALLBACK_SYMBOLS)
+
+    return requested
 
 
 def _as_float(value) -> float:
@@ -80,107 +132,50 @@ def _chunk(symbols: Sequence[str], size: int) -> Iterable[Sequence[str]]:
 
 
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
-    subscribe = list(dict.fromkeys(symbols))
+    subscribe = await _resolve_mexc_symbols(symbols)
     if not subscribe:
         return
 
-    tasks = [
-        asyncio.create_task(_poll_mexc_http(store, subscribe)),
-        asyncio.create_task(_run_mexc_orderbooks(store, subscribe)),
-    ]
-
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _poll_mexc_http(store: TickerStore, symbols: Sequence[Symbol]):
-    wanted = {_to_mexc_symbol(sym) for sym in symbols}
-    if len(wanted) < MIN_SYMBOL_THRESHOLD:
-        wanted = set()
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        while True:
-            now = time.time()
-            try:
-                ticker_resp = await client.get(TICKERS_URL)
-                ticker_resp.raise_for_status()
-                ticker_data = ticker_resp.json().get("data", [])
-            except Exception:
-                await asyncio.sleep(2.0)
-                continue
-
-            funding_map: Dict[str, tuple[float, str]] = {}
-            try:
-                funding_resp = await client.get(FUNDING_URL)
-                funding_resp.raise_for_status()
-                funding_items = funding_resp.json().get("data", [])
-                for item in funding_items:
-                    sym_raw = item.get("symbol")
-                    if wanted and sym_raw not in wanted:
-                        continue
-                    rate = _as_float(item.get("fundingRate") or item.get("rate"))
-                    interval = _parse_interval(item)
-                    funding_map[sym_raw] = (rate, interval)
-            except Exception:
-                funding_map = {}
-
-            for item in ticker_data:
-                if not isinstance(item, dict):
-                    continue
-
-                sym_raw = item.get("symbol")
-                if wanted and sym_raw not in wanted:
-                    continue
-
-                bid = _extract_bid(item)
-                ask = _extract_ask(item)
-                if bid <= 0 or ask <= 0:
-                    continue
-
-                sym_common = _from_mexc_symbol(sym_raw)
-                if not sym_common:
-                    continue
-
-                store.upsert_ticker(
-                    Ticker(
-                        exchange="mexc",
-                        symbol=sym_common,
-                        bid=bid,
-                        ask=ask,
-                        ts=now,
-                    )
-                )
-
-                if sym_raw in funding_map:
-                    rate, interval = funding_map[sym_raw]
-                    store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
-
-            await asyncio.sleep(POLL_INTERVAL)
-
-
-async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
-    wanted = {_to_mexc_symbol(sym) for sym in symbols if sym}
-    if not wanted:
+    chunks = [tuple(chunk) for chunk in _chunk(subscribe, WS_SUB_BATCH)]
+    if not chunks:
         return
 
-    ws_symbols = sorted(wanted)
+    while True:
+        tasks: list[asyncio.Task] = [
+            asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MEXC websocket workers crashed; restarting")
+            await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    wanted_exchange = [_to_mexc_symbol(sym) for sym in symbols if sym]
+    wanted_exchange = [sym for sym in wanted_exchange if sym]
+    if not wanted_exchange:
+        return
+
+    wanted_common = {_from_mexc_symbol(sym) for sym in wanted_exchange if sym}
+    wanted_common = {sym for sym in wanted_common if sym}
+    if not wanted_common:
+        return
+
     books: Dict[str, _MexcOrderBookState] = {}
-    wanted_common = {sym.replace("_", "") for sym in wanted}
 
     async for ws in _reconnect_ws():
         try:
-            for batch in _chunk(ws_symbols, WS_SUB_BATCH):
-                payload = {
-                    "method": "sub.depth",
-                    "params": [list(batch), WS_DEPTH_LEVELS],
-                    "id": int(time.time() * 1_000),
-                }
-                await ws.send(json.dumps(payload))
+            await _send_mexc_subscriptions(ws, wanted_exchange)
 
             async for raw in ws:
                 msg = _decode_ws_message(raw)
@@ -191,38 +186,85 @@ async def _run_mexc_orderbooks(store: TickerStore, symbols: Sequence[Symbol]):
                     await _reply_pong(ws, msg)
                     continue
 
-                parsed = _extract_depth_message(msg)
-                if not parsed:
+                depth_payload = _extract_depth_message(msg)
+                if depth_payload:
+                    snapshot, data, sym_raw = depth_payload
+                    if not isinstance(data, dict):
+                        continue
+                    sym_common = _from_mexc_symbol(sym_raw)
+                    if not sym_common or sym_common not in wanted_common:
+                        continue
+
+                    bids_raw = data.get("bids") or data.get("b") or data.get("buy")
+                    asks_raw = data.get("asks") or data.get("a") or data.get("sell")
+
+                    book = books.setdefault(sym_common, _MexcOrderBookState())
+                    if snapshot:
+                        book.snapshot(bids_raw, asks_raw)
+                    else:
+                        book.update(bids_raw, asks_raw)
+
+                    bids, asks = book.top_levels()
+                    last_price = _extract_last_price(data)
+
+                    store.upsert_order_book(
+                        "mexc",
+                        sym_common,
+                        bids=bids or None,
+                        asks=asks or None,
+                        ts=time.time(),
+                        last_price=last_price,
+                    )
+
+                    if bids and asks:
+                        best_bid = bids[0][0]
+                        best_ask = asks[0][0]
+                        store.upsert_ticker(
+                            Ticker(
+                                exchange="mexc",
+                                symbol=sym_common,
+                                bid=best_bid,
+                                ask=best_ask,
+                                ts=time.time(),
+                            )
+                        )
                     continue
 
-                snapshot, data, sym_raw = parsed
-                if not isinstance(data, dict):
-                    continue
+                now = time.time()
+                for sym_raw, payload in _iter_mexc_payloads(msg):
+                    if not isinstance(payload, dict):
+                        continue
 
-                sym_common = _from_mexc_symbol(sym_raw)
-                if not sym_common or sym_common not in wanted_common:
-                    continue
+                    sym_common = _from_mexc_symbol(sym_raw)
+                    if not sym_common or sym_common not in wanted_common:
+                        continue
 
-                bids_raw = data.get("bids") or data.get("b") or data.get("buy")
-                asks_raw = data.get("asks") or data.get("a") or data.get("sell")
+                    if _looks_like_depth(payload):
+                        continue
 
-                book = books.setdefault(sym_common, _MexcOrderBookState())
-                if snapshot:
-                    book.snapshot(bids_raw, asks_raw)
-                else:
-                    book.update(bids_raw, asks_raw)
+                    rate = _extract_funding_rate(payload)
+                    if rate is not None:
+                        interval = _parse_interval(payload)
+                        store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
+                        continue
 
-                bids, asks = book.top_levels()
-                last_price = _extract_last_price(data)
+                    bid = _extract_bid(payload)
+                    ask = _extract_ask(payload)
+                    if bid <= 0 or ask <= 0:
+                        continue
 
-                store.upsert_order_book(
-                    "mexc",
-                    sym_common,
-                    bids=bids or None,
-                    asks=asks or None,
-                    ts=time.time(),
-                    last_price=last_price,
-                )
+                    store.upsert_ticker(
+                        Ticker(exchange="mexc", symbol=sym_common, bid=bid, ask=ask, ts=now)
+                    )
+
+                    last_price = _extract_last_price(payload)
+                    if last_price:
+                        store.upsert_order_book(
+                            "mexc",
+                            sym_common,
+                            last_price=last_price,
+                            last_price_ts=now,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -239,6 +281,7 @@ async def _reconnect_ws():
                 ping_timeout=20,
                 close_timeout=5,
                 compression=None,
+                extra_headers=MEXC_HEADERS,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -249,21 +292,75 @@ async def _reconnect_ws():
             delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
+async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
+    if not symbols:
+        return
+
+    base_id = int(time.time() * 1_000)
+    req_id = base_id
+
+    for method, extra in (
+        ("sub.ticker", None),
+        ("sub.depth", WS_DEPTH_LEVELS),
+        ("sub.funding_rate", None),
+    ):
+        for sym in symbols:
+            params = [sym]
+            if extra is not None:
+                params.append(extra)
+            payload = {"method": method, "params": params, "id": req_id}
+            req_id += 1
+            try:
+                await ws.send(json.dumps(payload))
+            except Exception:
+                return
+
+
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    if isinstance(message, (bytes, bytearray)):
-        try:
-            raw = message.decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-    elif isinstance(message, str):
+    if isinstance(message, str):
         raw = message
+    elif isinstance(message, (bytes, bytearray)):
+        raw = _decode_ws_bytes(bytes(message))
     else:
+        return None
+
+    if not raw:
         return None
 
     try:
         return json.loads(raw)
     except Exception:
         return None
+
+
+def _decode_ws_bytes(data: bytes) -> str | None:
+    if not data:
+        return None
+
+    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
+        try:
+            text = decoder(data)
+        except Exception:
+            continue
+        if text:
+            return text
+    return None
+
+
+def _decode_utf8(data: bytes) -> str:
+    return data.decode("utf-8", errors="strict")
+
+
+def _decode_gzip(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
+        raise ValueError("not gzip")
+    return gzip.decompress(data).decode("utf-8")
+
+
+def _decode_zlib(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x78:
+        raise ValueError("not zlib")
+    return zlib.decompress(data).decode("utf-8")
 
 
 def _is_ping(message: dict) -> bool:
@@ -340,6 +437,118 @@ def _iter_levels(source) -> Iterable[Tuple[float, float]]:
             continue
         result.append((price, size))
     return result
+
+
+def _looks_like_depth(payload: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("bids") or payload.get("asks"):
+        return True
+    if payload.get("b") or payload.get("a"):
+        return True
+    if payload.get("buy") or payload.get("sell"):
+        return True
+    return False
+
+
+def _extract_funding_rate(payload: dict) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("fundingRate", "funding_rate", "rate", "value"):
+        val = payload.get(key)
+        if val is None:
+            continue
+        try:
+            rate = float(val)
+        except (TypeError, ValueError):
+            continue
+        return rate
+    return None
+
+
+def _iter_mexc_payloads(message) -> Iterable[Tuple[str, dict]]:
+    if not isinstance(message, dict):
+        return []
+
+    default_symbol: str | None = None
+
+    sym_candidate = message.get("symbol") or message.get("s")
+    if isinstance(sym_candidate, str) and sym_candidate:
+        default_symbol = sym_candidate
+
+    params = message.get("params")
+    if isinstance(params, list):
+        for item in reversed(params):
+            if isinstance(item, str) and item:
+                default_symbol = item
+                break
+
+    payload_candidates = []
+    for key in ("data", "tick", "ticker", "tickers", "result", "payload"):
+        if key in message:
+            payload_candidates.append(message[key])
+
+    if isinstance(params, list):
+        payload_candidates.append(params)
+
+    if not payload_candidates:
+        payload_candidates.append(message)
+
+    seen: set[tuple[str, int]] = set()
+    items: list[tuple[str, dict]] = []
+    for candidate in payload_candidates:
+        for symbol, payload in _iter_payload_items(candidate, default_symbol):
+            key = (symbol, id(payload))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((symbol, payload))
+    return items
+
+
+def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[str, dict]]:
+    if payload is None:
+        return []
+
+    items: list[tuple[str, dict]] = []
+
+    if isinstance(payload, dict):
+        dict_values = list(payload.values())
+        if dict_values and all(isinstance(v, dict) for v in dict_values):
+            for key, value in payload.items():
+                if not isinstance(value, dict):
+                    continue
+                symbol = _extract_symbol(value, key, default_symbol)
+                if symbol:
+                    items.append((symbol, value))
+        else:
+            symbol = _extract_symbol(payload, None, default_symbol)
+            if symbol:
+                items.append((symbol, payload))
+        return items
+
+    if isinstance(payload, list):
+        for value in payload:
+            if not isinstance(value, dict):
+                continue
+            symbol = _extract_symbol(value, None, default_symbol)
+            if symbol:
+                items.append((symbol, value))
+        return items
+
+    return items
+
+
+def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str | None) -> str | None:
+    for key in ("symbol", "s", "instId", "contract", "pair", "market"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            return val
+
+    if fallback_key:
+        return fallback_key
+
+    return default_symbol
 
 
 def _parse_level(level) -> Tuple[float | None, float | None]:

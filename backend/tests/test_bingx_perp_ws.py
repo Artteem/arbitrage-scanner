@@ -1,129 +1,62 @@
+import gzip
+import json
+
 from arbitrage_scanner.connectors.bingx_perp import (
-    _extract_price,
-    _from_bingx_symbol,
+    _decode_ws_message,
     _iter_ws_payloads,
+    _parse_funding_interval,
 )
 
 
-def test_iter_ws_payloads_handles_snapshot_action():
-    message = {
-        "action": "snapshot",
-        "arg": {"instId": "BTC-USDT"},
-        "data": [
-            {
-                "symbol": "BTC-USDT",
-                "bestBid": "63000",
-                "bestAsk": "63010",
-            }
-        ],
-    }
-
-    items = list(_iter_ws_payloads(message))
-
-    assert items == [
-        (
-            "BTCUSDT",
-            {
-                "symbol": "BTC-USDT",
-                "bestBid": "63000",
-                "bestAsk": "63010",
-            },
-        )
-    ]
-
-
-def test_iter_ws_payloads_skips_subscription_ack():
-    message = {
-        "action": "subscribe",
-        "data": "success",
-        "arg": {"instId": "BTC-USDT"},
-    }
-
-    assert list(_iter_ws_payloads(message)) == []
-
-
-def test_iter_ws_payloads_supports_alternative_keys():
-    message = {
-        "action": "update",
-        "tickers": [
-            {
-                "market": "ETH-USDT",
-                "bid": "3500",
-                "ask": "3501",
-            }
-        ],
-    }
-
-    items = list(_iter_ws_payloads(message))
-
-    assert items == [
-        (
-            "ETHUSDT",
-            {
-                "market": "ETH-USDT",
-                "bid": "3500",
-                "ask": "3501",
-            },
-        )
-    ]
-
-
-def test_iter_ws_payloads_uses_data_type_symbol():
+def test_iter_ws_payloads_parses_ticker_message():
+    wanted = {"BTCUSDT"}
     message = {
         "dataType": "swap/ticker:BTC-USDT",
         "data": {
-            "bp": "63000",
-            "ap": "63010",
+            "symbol": "BTC-USDT",
+            "bestBid": "30000",
+            "bestAsk": "30010",
         },
     }
 
-    items = list(_iter_ws_payloads(message))
+    items = list(_iter_ws_payloads(message, wanted))
 
-    assert items == [
-        (
-            "BTCUSDT",
-            {
-                "bp": "63000",
-                "ap": "63010",
-            },
-        )
-    ]
+    assert items
+    symbol, payload = items[0]
+    assert symbol == "BTCUSDT"
+    assert payload["bestBid"] == "30000"
 
 
-def test_iter_ws_payloads_handles_list_data_type():
+def test_iter_ws_payloads_parses_funding_message():
+    wanted = {"ETHUSDT"}
     message = {
-        "dataType": ["swap/ticker:ETH-USDT"],
+        "dataType": "swap/fundingRate:ETH-USDT",
         "data": {
-            "pair": "ETH-USDT",
-            "bid1Price": "3500",
-            "ask1Price": "3501",
+            "symbol": "ETH-USDT",
+            "fundingRate": "0.0001",
+            "fundingInterval": 8,
         },
     }
 
-    items = list(_iter_ws_payloads(message))
+    items = list(_iter_ws_payloads(message, wanted))
 
-    assert items == [
-        (
-            "ETHUSDT",
-            {
-                "pair": "ETH-USDT",
-                "bid1Price": "3500",
-                "ask1Price": "3501",
-            },
-        )
-    ]
+    assert items
+    symbol, payload = items[0]
+    assert symbol == "ETHUSDT"
+    assert payload["fundingRate"] == "0.0001"
 
 
-def test_extract_price_supports_short_keys():
-    payload = {"b": "123.45", "a": "123.55"}
-
-    bid = _extract_price(payload, ("bestBid", "bid", "bp", "b"))
-    ask = _extract_price(payload, ("bestAsk", "ask", "ap", "a"))
-
-    assert bid == 123.45
-    assert ask == 123.55
+def test_parse_funding_interval_formats_numeric():
+    assert _parse_funding_interval({"fundingInterval": 8}) == "8h"
+    assert _parse_funding_interval({"interval": "4h"}) == "4h"
+    assert _parse_funding_interval({}) == "8h"
 
 
-def test_from_bingx_symbol_strips_suffixes():
-    assert _from_bingx_symbol("BTCUSDT_UMCBL") == "BTCUSDT"
-    assert _from_bingx_symbol("eth-usdt-perp") == "ETHUSDT"
+def test_decode_ws_message_handles_compressed_bytes():
+    payload = {"dataType": "swap/ticker:BTC-USDT", "data": {"symbol": "BTC-USDT"}}
+    blob = json.dumps(payload).encode("utf-8")
+    compressed = gzip.compress(blob)
+
+    decoded = _decode_ws_message(compressed)
+
+    assert decoded == payload

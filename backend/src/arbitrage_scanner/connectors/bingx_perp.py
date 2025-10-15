@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import time
+import zlib
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-import httpx
 import websockets
 
 from ..domain import Symbol, Ticker
@@ -16,19 +17,6 @@ from .discovery import discover_bingx_usdt_perp
 
 logger = logging.getLogger(__name__)
 
-TICKERS_URLS: tuple[str, ...] = (
-    "https://bingx.com/api/v3/contract/tickers",
-    "https://open-api.bingx.com/openApi/swap/v2/market/getLatest",
-    "https://open-api.bingx.com/openApi/swap/v3/market/getLatest",
-)
-REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://bingx.com/",
-    "Origin": "https://bingx.com",
-}
-POLL_INTERVAL = 1.5
-
 WS_ENDPOINTS = (
     "wss://open-api-ws.bingx.com/market?compress=false",
     "wss://open-api-swap.bingx.com/swap-market?compress=false",
@@ -37,12 +25,58 @@ WS_SUB_CHUNK = 250
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
-HTTP_BACKUP_DELAY = 30.0
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 _SUBSCRIPTION_LOG_LIMIT = 20
 _WS_PAYLOAD_LOG_LIMIT = 20
 _LOG_ONCE_TICKERS: set[Symbol] = set()
 _WS_PAYLOAD_LOG_COUNT = 0
+
+BINGX_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Origin": "https://bingx.com",
+    "Referer": "https://bingx.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+async def _resolve_bingx_symbols(symbols: Sequence[Symbol]) -> tuple[list[Symbol], bool]:
+    requested: list[Symbol] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if not symbol:
+            continue
+        normalized = _normalize_common_symbol(symbol)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    discovered: set[str] = set()
+    try:
+        discovered = await discover_bingx_usdt_perp()
+    except Exception:
+        discovered = set()
+
+    if discovered:
+        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
+        filtered: list[Symbol] = []
+        used: set[str] = set()
+        for symbol in requested:
+            if symbol in discovered_normalized and symbol not in used:
+                filtered.append(symbol)
+                used.add(symbol)
+        if filtered:
+            return filtered, False
+        return sorted(discovered_normalized), False
+
+    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+        return list(FALLBACK_SYMBOLS), True
+
+    return requested, False
 
 
 def _log_ws_subscriptions(kind: str, topics: Sequence[str]) -> None:
@@ -117,6 +151,11 @@ def _collect_wanted_common(symbols: Sequence[Symbol]) -> set[str]:
     return wanted
 
 
+def _chunk_bingx_symbols(symbols: Sequence[Symbol], size: int) -> Iterable[Sequence[Symbol]]:
+    for idx in range(0, len(symbols), size):
+        yield symbols[idx : idx + size]
+
+
 def _to_bingx_symbol(symbol: Symbol) -> str:
     sym = str(symbol).upper()
     if "-" in sym:
@@ -148,111 +187,55 @@ def _from_bingx_symbol(symbol: str | None) -> Symbol | None:
     return normalize_bingx_symbol(symbol)
 
 
-def _build_param_candidates(wanted_exchange: set[str] | None) -> list[dict[str, str] | None]:
-    candidates: list[dict[str, str] | None] = []
-
-    def _add(candidate: dict[str, str] | None) -> None:
-        if candidate not in candidates:
-            candidates.append(candidate)
-
-    if wanted_exchange:
-        joined = ",".join(sorted(wanted_exchange))
-        _add({"symbols": joined})
-        _add({"symbol": joined})
-    _add({"symbol": "ALL"})
-    _add(None)
-    return candidates
-
-
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    subscribe = [sym for sym in dict.fromkeys(symbols) if sym]
-    subscribe_all = False
-
-    if len(subscribe) < MIN_SYMBOL_THRESHOLD:
-        try:
-            discovered = await discover_bingx_usdt_perp()
-        except Exception:
-            discovered = set()
-        if discovered:
-            subscribe = sorted(discovered)
-        else:
-            subscribe = list(FALLBACK_SYMBOLS)
-            subscribe_all = True
+    subscribe, subscribe_all = await _resolve_bingx_symbols(symbols)
 
     if not subscribe and not subscribe_all:
         return
 
-    tasks = [
-        asyncio.create_task(
-            _run_bingx_ws_tickers(
-                store,
-                subscribe,
-                subscribe_all=subscribe_all,
-            )
-        )
-    ]
+    chunks = [tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, WS_SUB_CHUNK)]
 
-    if subscribe:
-        tasks.append(
-            asyncio.create_task(
-                _run_bingx_orderbooks(
-                    store,
-                    subscribe,
-                )
-            )
-        )
+    while True:
+        tasks: list[asyncio.Task] = []
 
-    try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    except Exception:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        if subscribe_all:
+            tasks.append(asyncio.create_task(_run_bingx_all_tickers(store, subscribe)))
 
+        for chunk in chunks:
+            tasks.append(asyncio.create_task(_run_bingx_ws(store, chunk)))
 
-async def run_bingx_http_backup(
-    store: TickerStore,
-    symbols: Sequence[Symbol],
-    wait_ready: asyncio.Event | None = None,
-    *,
-    fetch_all: bool = False,
-) -> None:
-    if wait_ready is not None:
-        try:
-            await asyncio.wait_for(wait_ready.wait(), timeout=HTTP_BACKUP_DELAY)
+        if not tasks:
             return
-        except asyncio.TimeoutError:
-            pass
 
-    await _poll_bingx_http(store, symbols, wait_ready, fetch_all)
+        try:
+            await asyncio.gather(*tasks)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("BingX websocket workers crashed; restarting")
+            await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _run_bingx_ws_tickers(
-    store: TickerStore,
-    symbols: Sequence[Symbol],
-    *,
-    subscribe_all: bool = False,
-) -> None:
+async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     wanted_common = _collect_wanted_common(symbols)
-    if subscribe_all:
-        ws_symbols = ["ALL"]
-    else:
-        ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common if sym})
+    if not wanted_common:
+        return
 
+    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common if sym})
     if not ws_symbols:
         return
 
     async for ws in _reconnect_ws():
         try:
-            for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
-                batch = ws_symbols[i : i + WS_SUB_CHUNK]
-                await _send_ws_subscriptions(ws, batch)
+            await _send_ws_subscriptions(ws, ws_symbols)
+            await _send_ws_depth_subscriptions(ws, ws_symbols)
+            await _send_ws_funding_subscriptions(ws, ws_symbols)
 
             async for raw_msg in ws:
                 msg = _decode_ws_message(raw_msg)
@@ -263,7 +246,134 @@ async def _run_bingx_ws_tickers(
                     await _reply_ws_ping(ws, msg)
                     continue
 
+                data_type = str(msg.get("dataType") or "").lower()
+                now = time.time()
+
                 for common_symbol, payload in _iter_ws_payloads(msg, wanted_common):
+                    if not payload:
+                        continue
+
+                    if "fundingrate" in data_type:
+                        rate = _extract_price(
+                            payload,
+                            (
+                                "fundingRate",
+                                "funding_rate",
+                                "rate",
+                                "value",
+                            ),
+                        )
+                        interval = _parse_funding_interval(payload)
+                        store.upsert_funding(
+                            "bingx", common_symbol, rate=rate, interval=interval, ts=now
+                        )
+                        continue
+
+                    if "depth" in data_type or (
+                        isinstance(payload, dict)
+                        and (payload.get("bids") or payload.get("asks"))
+                    ):
+                        bids, asks, last_price = _extract_depth_payload(payload)
+                        if not bids and not asks and last_price is None:
+                            continue
+                        store.upsert_order_book(
+                            "bingx",
+                            common_symbol,
+                            bids=bids or None,
+                            asks=asks or None,
+                            ts=now,
+                            last_price=last_price,
+                        )
+                        continue
+
+                    bid = _extract_price(
+                        payload,
+                        (
+                            "bestBid",
+                            "bestBidPrice",
+                            "bid",
+                            "bidPrice",
+                            "bid1",
+                            "bid1Price",
+                            "bp",
+                            "bidPx",
+                            "bestBidPx",
+                            "b",
+                            "buyPrice",
+                        ),
+                    )
+                    ask = _extract_price(
+                        payload,
+                        (
+                            "bestAsk",
+                            "bestAskPrice",
+                            "ask",
+                            "askPrice",
+                            "ask1",
+                            "ask1Price",
+                            "ap",
+                            "askPx",
+                            "bestAskPx",
+                            "a",
+                            "sellPrice",
+                        ),
+                    )
+
+                    if bid <= 0 or ask <= 0:
+                        continue
+
+                    store.upsert_ticker(
+                        Ticker(
+                            exchange="bingx",
+                            symbol=common_symbol,
+                            bid=bid,
+                            ask=ask,
+                            ts=now,
+                        )
+                    )
+                    _log_first_ticker(common_symbol, bid, ask)
+
+                    last_price = _extract_price(
+                        payload,
+                        (
+                            "lastPrice",
+                            "last",
+                            "close",
+                            "px",
+                        ),
+                    )
+                    if last_price > 0:
+                        store.upsert_order_book(
+                            "bingx",
+                            common_symbol,
+                            last_price=last_price,
+                            last_price_ts=now,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
+async def _run_bingx_all_tickers(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    wanted_common = _collect_wanted_common(symbols)
+    ws_symbols = ["ALL"]
+
+    async for ws in _reconnect_ws():
+        try:
+            await _send_ws_subscriptions(ws, ws_symbols)
+
+            async for raw_msg in ws:
+                msg = _decode_ws_message(raw_msg)
+                if msg is None:
+                    continue
+
+                if _is_ws_ping(msg):
+                    await _reply_ws_ping(ws, msg)
+                    continue
+
+                now = time.time()
+                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common or None):
                     if not payload:
                         continue
 
@@ -309,59 +419,10 @@ async def _run_bingx_ws_tickers(
                             symbol=common_symbol,
                             bid=bid,
                             ask=ask,
-                            ts=time.time(),
+                            ts=now,
                         )
                     )
                     _log_first_ticker(common_symbol, bid, ask)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            continue
-
-
-async def _run_bingx_orderbooks(
-    store: TickerStore,
-    symbols: Sequence[Symbol],
-) -> None:
-    wanted_common = _collect_wanted_common(symbols)
-    if not wanted_common:
-        return
-
-    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common})
-    if not ws_symbols:
-        return
-
-    async for ws in _reconnect_ws():
-        try:
-            for i in range(0, len(ws_symbols), WS_SUB_CHUNK):
-                batch = ws_symbols[i : i + WS_SUB_CHUNK]
-                await _send_ws_depth_subscriptions(ws, batch)
-
-            async for raw_msg in ws:
-                msg = _decode_ws_message(raw_msg)
-                if msg is None:
-                    continue
-
-                if _is_ws_ping(msg):
-                    await _reply_ws_ping(ws, msg)
-                    continue
-
-                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common):
-                    if not isinstance(payload, dict):
-                        continue
-
-                    bids, asks, last_price = _extract_depth_payload(payload)
-                    if not bids and not asks and last_price is None:
-                        continue
-
-                    store.upsert_order_book(
-                        "bingx",
-                        common_symbol,
-                        bids=bids or None,
-                        asks=asks or None,
-                        ts=time.time(),
-                        last_price=last_price,
-                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -381,6 +442,7 @@ async def _reconnect_ws():
                 ping_timeout=20,
                 close_timeout=5,
                 compression=None,
+                extra_headers=BINGX_HEADERS,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -441,19 +503,76 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
         return
 
 
+async def _send_ws_funding_subscriptions(ws, symbols: Sequence[str]) -> None:
+    if not symbols:
+        return
+
+    def _next_id() -> str:
+        return str(int(time.time() * 1_000))
+
+    topics = [f"swap/fundingRate:{sym}" for sym in symbols if sym.upper() != "ALL"]
+    if not topics:
+        return
+
+    payload = {
+        "id": _next_id(),
+        "reqType": "sub",
+        "dataType": topics,
+    }
+
+    _log_ws_subscriptions("funding", topics)
+
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        return
+
+
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    if isinstance(message, (bytes, bytearray)):
-        try:
-            raw = message.decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-    else:
+    if isinstance(message, str):
         raw = message
+    elif isinstance(message, (bytes, bytearray)):
+        raw = _decode_ws_bytes(bytes(message))
+    else:
+        return None
+
+    if not raw:
+        return None
 
     try:
         return json.loads(raw)
     except Exception:
         return None
+
+
+def _decode_ws_bytes(data: bytes) -> str | None:
+    if not data:
+        return None
+
+    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
+        try:
+            text = decoder(data)
+        except Exception:
+            continue
+        if text:
+            return text
+    return None
+
+
+def _decode_utf8(data: bytes) -> str:
+    return data.decode("utf-8", errors="strict")
+
+
+def _decode_gzip(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
+        raise ValueError("not gzip")
+    return gzip.decompress(data).decode("utf-8")
+
+
+def _decode_zlib(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x78:
+        raise ValueError("not zlib")
+    return zlib.decompress(data).decode("utf-8")
 
 
 def _is_ws_ping(message: dict) -> bool:
@@ -637,6 +756,15 @@ def _extract_last_price(container: dict) -> float | None:
     return None
 
 
+def _parse_funding_interval(payload: dict) -> str:
+    interval = payload.get("interval") or payload.get("fundingInterval")
+    if isinstance(interval, (int, float)) and interval > 0:
+        return f"{interval}h"
+    if isinstance(interval, str) and interval:
+        return interval
+    return "8h"
+
+
 def _iter_levels(source) -> Iterable[Tuple[float, float]]:
     if isinstance(source, dict):
         source = source.get("levels") or source.get("data") or source.get("list") or []
@@ -769,124 +897,4 @@ def _extract_topic_symbol(data_type) -> str | None:
     return None
 
 
-async def _poll_bingx_http(
-    store: TickerStore,
-    symbols: Sequence[Symbol],
-    ws_ready: asyncio.Event | None = None,
-    fetch_all: bool = False,
-) -> None:
-    wanted_common = _collect_wanted_common(symbols)
-    if not wanted_common and not fetch_all:
-        return
 
-    wanted_exchange = None if fetch_all else {_to_bingx_symbol(sym) for sym in wanted_common}
-    param_candidates = _build_param_candidates(wanted_exchange)
-    params_idx = 0
-    url_idx = 0
-
-    async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
-        while True:
-            if ws_ready and ws_ready.is_set():
-                return
-            now = time.time()
-            params = param_candidates[params_idx]
-            url = TICKERS_URLS[url_idx]
-            try:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
-            except httpx.HTTPStatusError:
-                params_idx = (params_idx + 1) % len(param_candidates)
-                url_idx = (url_idx + 1) % len(TICKERS_URLS)
-                await asyncio.sleep(1.5)
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                url_idx = (url_idx + 1) % len(TICKERS_URLS)
-                await asyncio.sleep(2.0)
-                continue
-
-            items: Iterable[dict] = []
-            if isinstance(data, dict):
-                for key in ("data", "result", "tickers", "items"):
-                    value = data.get(key)
-                    if isinstance(value, list):
-                        items = value
-                        break
-                    if isinstance(value, dict):
-                        items = value.values()
-                        break
-                else:
-                    items = list(data.values()) if isinstance(data, dict) else []
-            elif isinstance(data, list):
-                items = data
-
-            for raw in items:
-                if not isinstance(raw, dict):
-                    continue
-
-                raw_symbol = raw.get("symbol") or raw.get("market") or raw.get("instId")
-                if not raw_symbol:
-                    continue
-
-                normalized_exchange_symbol = _to_bingx_symbol(raw_symbol)
-                if wanted_exchange is not None and normalized_exchange_symbol not in wanted_exchange:
-                    normalized_common = _from_bingx_symbol(raw_symbol)
-                    if not normalized_common or normalized_common not in wanted_common:
-                        continue
-                    normalized_exchange_symbol = _to_bingx_symbol(normalized_common)
-
-                bid = _extract_price(
-                    raw,
-                    (
-                        "bestBid",
-                        "bestBidPrice",
-                        "bid",
-                        "bidPrice",
-                        "bid1",
-                        "bid1Price",
-                        "bp",
-                        "bidPx",
-                        "bestBidPx",
-                        "b",
-                        "buyPrice",
-                    ),
-                )
-                ask = _extract_price(
-                    raw,
-                    (
-                        "bestAsk",
-                        "bestAskPrice",
-                        "ask",
-                        "askPrice",
-                        "ask1",
-                        "ask1Price",
-                        "ap",
-                        "askPx",
-                        "bestAskPx",
-                        "a",
-                        "sellPrice",
-                    ),
-                )
-                if bid <= 0 or ask <= 0:
-                    continue
-
-                common_symbol = _from_bingx_symbol(normalized_exchange_symbol)
-                if wanted_common and (not common_symbol or common_symbol not in wanted_common):
-                    continue
-
-                store.upsert_ticker(
-                    Ticker(
-                        exchange="bingx",
-                        symbol=common_symbol,
-                        bid=bid,
-                        ask=ask,
-                        ts=now,
-                    )
-                )
-
-            if ws_ready and ws_ready.is_set():
-                return
-            else:
-                await asyncio.sleep(POLL_INTERVAL)
