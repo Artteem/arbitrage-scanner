@@ -38,6 +38,26 @@ def _normalize_common_symbol(symbol: Symbol) -> str:
 
 
 async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
+    try:
+        discovered = await discover_mexc_usdt_perp()
+    except Exception:
+        logger.exception("Failed to discover MEXC symbols")
+        return []
+
+    if not discovered:
+        logger.error("MEXC discovery returned no USDT perpetual symbols; connector disabled")
+        return []
+
+    discovered_normalized: dict[str, Symbol] = {}
+    for sym in discovered:
+        normalized = _normalize_common_symbol(sym)
+        if normalized and normalized not in discovered_normalized:
+            discovered_normalized[normalized] = normalized
+
+    if not discovered_normalized:
+        logger.error("MEXC discovery produced no usable symbols; connector disabled")
+        return []
+
     requested: list[Symbol] = []
     seen: set[str] = set()
     for symbol in symbols:
@@ -49,30 +69,10 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         seen.add(normalized)
         requested.append(normalized)
 
-    try:
-        discovered = await discover_mexc_usdt_perp()
-    except Exception:
-        logger.exception("Failed to discover MEXC symbols")
-        return []
-
-    if not discovered:
-        logger.error("MEXC discovery returned no USDT perpetual symbols; connector disabled")
-        return []
-
-    discovered_normalized: set[str] = set()
-    for sym in discovered:
-        normalized = _normalize_common_symbol(sym)
-        if normalized:
-            discovered_normalized.add(normalized)
-    if not discovered_normalized:
-        logger.error("MEXC discovery produced no usable symbols; connector disabled")
-        return []
-
-    if len(requested) < MIN_SYMBOL_THRESHOLD:
-        requested = sorted(discovered_normalized)
+    if not requested:
+        return sorted(discovered_normalized.keys())
 
     filtered = [symbol for symbol in requested if symbol in discovered_normalized]
-
     if not filtered:
         logger.warning(
             "Requested symbols are unavailable on MEXC; nothing to subscribe",
