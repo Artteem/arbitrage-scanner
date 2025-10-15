@@ -17,6 +17,7 @@ WS_ENDPOINT = "wss://contract.mexc.com/ws"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+MIN_SYMBOL_THRESHOLD = 1
 
 MEXC_HEADERS = {
     "User-Agent": (
@@ -67,7 +68,7 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         logger.error("MEXC discovery produced no usable symbols; connector disabled")
         return []
 
-    if not requested:
+    if len(requested) < MIN_SYMBOL_THRESHOLD:
         requested = sorted(discovered_normalized)
 
     filtered = [symbol for symbol in requested if symbol in discovered_normalized]
