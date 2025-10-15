@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -17,6 +19,17 @@ WS_SUB_BATCH = 120
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+
+MEXC_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Origin": "https://www.mexc.com",
+    "Referer": "https://www.mexc.com/",
+    "Accept": "application/json, text/plain, */*",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +238,7 @@ async def _reconnect_ws():
                 ping_timeout=20,
                 close_timeout=5,
                 compression=None,
+                extra_headers=MEXC_HEADERS,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -260,20 +274,50 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    if isinstance(message, (bytes, bytearray)):
-        try:
-            raw = message.decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-    elif isinstance(message, str):
+    if isinstance(message, str):
         raw = message
+    elif isinstance(message, (bytes, bytearray)):
+        raw = _decode_ws_bytes(bytes(message))
     else:
+        return None
+
+    if not raw:
         return None
 
     try:
         return json.loads(raw)
     except Exception:
         return None
+
+
+def _decode_ws_bytes(data: bytes) -> str | None:
+    if not data:
+        return None
+
+    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
+        try:
+            text = decoder(data)
+        except Exception:
+            continue
+        if text:
+            return text
+    return None
+
+
+def _decode_utf8(data: bytes) -> str:
+    return data.decode("utf-8", errors="strict")
+
+
+def _decode_gzip(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
+        raise ValueError("not gzip")
+    return gzip.decompress(data).decode("utf-8")
+
+
+def _decode_zlib(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x78:
+        raise ValueError("not zlib")
+    return zlib.decompress(data).decode("utf-8")
 
 
 def _is_ping(message: dict) -> bool:

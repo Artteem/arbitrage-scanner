@@ -1,4 +1,8 @@
+import gzip
+import json
+
 from arbitrage_scanner.connectors.mexc_perp import (
+    _decode_ws_message,
     _extract_ask,
     _extract_bid,
     _iter_mexc_payloads,
@@ -104,3 +108,13 @@ def test_parse_interval_formats_hours():
     assert _parse_interval({"fundingInterval": 8}) == "8h"
     assert _parse_interval({"interval": "4h"}) == "4h"
     assert _parse_interval({}) == "8h"
+
+
+def test_decode_ws_message_handles_gzip_bytes():
+    payload = {"channel": "push.ticker", "data": {"symbol": "BTC_USDT"}}
+    blob = json.dumps(payload).encode("utf-8")
+    compressed = gzip.compress(blob)
+
+    decoded = _decode_ws_message(compressed)
+
+    assert decoded == payload

@@ -1,4 +1,8 @@
+import gzip
+import json
+
 from arbitrage_scanner.connectors.gate_perp import (
+    _decode_ws_message,
     _handle_orderbook,
     _handle_tickers,
 )
@@ -47,3 +51,13 @@ def test_gate_handle_orderbook_updates_depth():
     assert order_book.bids[0] == (2000.0, 5.0)
     assert order_book.asks[0] == (2001.0, 4.0)
     assert order_book.last_price == 2000.5
+
+
+def test_gate_decode_ws_message_handles_gzip():
+    payload = {"channel": "futures.tickers", "result": {"contract": "BTC_USDT"}}
+    blob = json.dumps(payload).encode("utf-8")
+    compressed = gzip.compress(blob)
+
+    decoded = _decode_ws_message(compressed)
+
+    assert decoded == payload

@@ -1,4 +1,8 @@
+import gzip
+import json
+
 from arbitrage_scanner.connectors.bingx_perp import (
+    _decode_ws_message,
     _iter_ws_payloads,
     _parse_funding_interval,
 )
@@ -46,3 +50,13 @@ def test_parse_funding_interval_formats_numeric():
     assert _parse_funding_interval({"fundingInterval": 8}) == "8h"
     assert _parse_funding_interval({"interval": "4h"}) == "4h"
     assert _parse_funding_interval({}) == "8h"
+
+
+def test_decode_ws_message_handles_compressed_bytes():
+    payload = {"dataType": "swap/ticker:BTC-USDT", "data": {"symbol": "BTC-USDT"}}
+    blob = json.dumps(payload).encode("utf-8")
+    compressed = gzip.compress(blob)
+
+    decoded = _decode_ws_message(compressed)
+
+    assert decoded == payload
