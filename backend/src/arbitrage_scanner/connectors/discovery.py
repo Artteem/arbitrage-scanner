@@ -291,6 +291,7 @@ async def discover_bingx_usdt_perp() -> Set[str]:
 
         raw_symbol = (
             item.get("symbol")
+            or item.get("market")
             or item.get("tradingPair")
             or item.get("instId")
             or item.get("contractId")

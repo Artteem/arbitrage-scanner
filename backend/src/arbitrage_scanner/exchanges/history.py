@@ -138,8 +138,6 @@ async def _fetch_binance(
             if not isinstance(item, list) or len(item) < 5:
                 continue
             open_time = int(item[0]) // 1000
-            if open_time < start_ts:
-                continue
             open_price = _safe_float(item[1])
             high_price = _safe_float(item[2])
             low_price = _safe_float(item[3])
@@ -197,8 +195,6 @@ async def _fetch_bybit(
             if not isinstance(item, (list, tuple)) or len(item) < 5:
                 continue
             open_time = int(item[0]) // 1000
-            if open_time < start_ts:
-                continue
             open_price = _safe_float(item[1])
             high_price = _safe_float(item[2])
             low_price = _safe_float(item[3])
@@ -254,8 +250,6 @@ async def _fetch_mexc(
                 continue
             open_time = int(item.get("time") or item.get("t") or item.get("timestamp") or 0)
             if open_time <= 0:
-                continue
-            if open_time < start_ts:
                 continue
             open_price = _safe_float(item.get("open") or item.get("o") or item.get("openPrice"))
             high_price = _safe_float(item.get("high") or item.get("h") or item.get("highestPrice"))
@@ -325,8 +319,6 @@ async def _fetch_bingx(
             if open_time <= 0:
                 continue
             open_sec = open_time // 1000
-            if open_sec < start_ts:
-                continue
             if None in (open_price, high_price, low_price, close_price):
                 continue
             candle = PriceCandle(
