@@ -5,17 +5,36 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
+    Contract,
+    ContractType,
+    Exchange,
     FundingRate,
     OrderBookEntry,
     OrderBookSide,
     Quote,
     Spread,
 )
+
+
+@dataclass(slots=True)
+class ContractUpsert:
+    exchange_id: int
+    original_name: str
+    normalized_name: str
+    base_asset: str
+    quote_asset: str
+    contract_type: ContractType
+    is_active: bool = True
+    contract_size: Decimal | None = None
+    tick_size: Decimal | None = None
+    lot_size: Decimal | None = None
+    taker_fee: Decimal | None = None
+    funding_symbol: str | None = None
 
 
 @dataclass(slots=True)
@@ -53,6 +72,93 @@ class SpreadCreate:
     exit_pct: Decimal
     commission_pct_total: Decimal
     funding_spread: Optional[Decimal]
+
+
+async def upsert_exchange(
+    session: AsyncSession, *, name: str, taker_fee: Decimal | None, maker_fee: Decimal | None
+) -> int:
+    stmt = insert(Exchange).values(name=name, taker_fee=taker_fee, maker_fee=maker_fee)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[Exchange.name],
+        set_={
+            "taker_fee": stmt.excluded.taker_fee,
+            "maker_fee": stmt.excluded.maker_fee,
+        },
+    )
+    stmt = stmt.returning(Exchange.id)
+    result = await session.execute(stmt)
+    exchange_id = result.scalar_one()
+    return exchange_id
+
+
+async def upsert_contracts(
+    session: AsyncSession, contracts: Sequence[ContractUpsert]
+) -> Dict[str, int]:
+    if not contracts:
+        return {}
+
+    values = [
+        {
+            "exchange_id": contract.exchange_id,
+            "original_name": contract.original_name,
+            "normalized_name": contract.normalized_name,
+            "base_asset": contract.base_asset,
+            "quote_asset": contract.quote_asset,
+            "type": contract.contract_type,
+            "is_active": contract.is_active,
+            "contract_size": contract.contract_size,
+            "tick_size": contract.tick_size,
+            "lot_size": contract.lot_size,
+            "taker_fee": contract.taker_fee,
+            "funding_symbol": contract.funding_symbol,
+        }
+        for contract in contracts
+    ]
+
+    stmt = insert(Contract).values(values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_contract_normalized",
+        set_={
+            "original_name": stmt.excluded.original_name,
+            "base_asset": stmt.excluded.base_asset,
+            "quote_asset": stmt.excluded.quote_asset,
+            "type": stmt.excluded.type,
+            "is_active": stmt.excluded.is_active,
+            "contract_size": stmt.excluded.contract_size,
+            "tick_size": stmt.excluded.tick_size,
+            "lot_size": stmt.excluded.lot_size,
+            "taker_fee": stmt.excluded.taker_fee,
+            "funding_symbol": stmt.excluded.funding_symbol,
+        },
+    )
+    stmt = stmt.returning(Contract.id, Contract.exchange_id, Contract.normalized_name)
+    result = await session.execute(stmt)
+    rows = result.all()
+    mapping: Dict[str, int] = {}
+    active_by_exchange: Dict[int, List[str]] = {}
+    for row in rows:
+        mapping[row.normalized_name] = row.id
+        active_by_exchange.setdefault(row.exchange_id, []).append(row.normalized_name)
+
+    for exchange_id, active_symbols in active_by_exchange.items():
+        if not active_symbols:
+            continue
+        await session.execute(
+            update(Contract)
+            .where(Contract.exchange_id == exchange_id)
+            .where(Contract.normalized_name.notin_(active_symbols))
+            .values(is_active=False)
+        )
+
+    return mapping
+
+
+async def update_contract_taker_fee(
+    session: AsyncSession, contract_id: int, taker_fee: Decimal | None
+) -> None:
+    await session.execute(
+        update(Contract).where(Contract.id == contract_id).values(taker_fee=taker_fee)
+    )
 
 
 async def bulk_insert_quotes(session: AsyncSession, quotes: Sequence[QuoteCreate]) -> None:

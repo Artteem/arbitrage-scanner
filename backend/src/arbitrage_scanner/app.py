@@ -14,6 +14,7 @@ from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
+from .db.sync import DataSyncSummary, perform_initial_sync, periodic_history_sync
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
@@ -23,6 +24,7 @@ store = TickerStore()
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
+DATA_SYNC: DataSyncSummary | None = None
 
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
@@ -122,22 +124,39 @@ async def _spread_loop() -> None:
 
 @app.on_event("startup")
 async def startup():
-    # 1) Автоматически найдём пересечение USDT-перпетуалов
-    global SYMBOLS, CONNECTOR_SYMBOLS
+    # 1) Синхронизируем метаданные бирж и исторические данные
+    global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC
+    metadata_summary: DataSyncSummary | None = None
     try:
-        discovery = await discover_symbols_for_connectors(CONNECTORS)
-        if discovery.symbols_union:
-            SYMBOLS = discovery.symbols_union
-            CONNECTOR_SYMBOLS = discovery.per_connector
-        else:
+        metadata_summary = await perform_initial_sync(CONNECTORS)
+        DATA_SYNC = metadata_summary
+    except Exception:  # noqa: BLE001 - логируем и продолжаем с фоллбеком
+        logger.exception("Initial database synchronization failed")
+        metadata_summary = None
+
+    if metadata_summary and metadata_summary.symbols_union:
+        SYMBOLS = metadata_summary.symbols_union
+        CONNECTOR_SYMBOLS = {
+            spec.name: metadata_summary.per_exchange.get(spec.name, metadata_summary.symbols_union)
+            for spec in CONNECTORS
+        }
+    else:
+        try:
+            discovery = await discover_symbols_for_connectors(CONNECTORS)
+            if discovery.symbols_union:
+                SYMBOLS = discovery.symbols_union
+                CONNECTOR_SYMBOLS = discovery.per_connector
+            else:
+                SYMBOLS = FALLBACK_SYMBOLS
+                CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
+        except Exception:
             SYMBOLS = FALLBACK_SYMBOLS
             CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
-    except Exception:
-        # Фоллбек: базовый набор
-        SYMBOLS = FALLBACK_SYMBOLS
-        CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
-    # 2) Запустим ридеры бирж
+    # 2) Запустим периодическую синхронизацию истории
+    _tasks.append(asyncio.create_task(periodic_history_sync(CONNECTORS)))
+
+    # 3) Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))

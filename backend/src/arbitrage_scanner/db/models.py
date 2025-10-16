@@ -57,8 +57,15 @@ class Contract(Base):
     normalized_name: Mapped[str] = mapped_column(String(200), nullable=False)
     base_asset: Mapped[str] = mapped_column(String(50), nullable=False)
     quote_asset: Mapped[str] = mapped_column(String(50), nullable=False)
-    type: Mapped[ContractType] = mapped_column(SQLEnum(ContractType, name="contract_type"), nullable=False)
+    type: Mapped[ContractType] = mapped_column(
+        SQLEnum(ContractType, name="contract_type"), nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    contract_size: Mapped[Optional[Decimal]] = mapped_column(Numeric(30, 10))
+    tick_size: Mapped[Optional[Decimal]] = mapped_column(Numeric(30, 10))
+    lot_size: Mapped[Optional[Decimal]] = mapped_column(Numeric(30, 10))
+    taker_fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6))
+    funding_symbol: Mapped[Optional[str]] = mapped_column(String(200))
 
     exchange: Mapped[Exchange] = relationship(back_populates="contracts")
     quotes: Mapped[List["Quote"]] = relationship(back_populates="contract", cascade="all, delete-orphan")
