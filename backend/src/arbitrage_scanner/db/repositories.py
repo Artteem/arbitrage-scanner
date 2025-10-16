@@ -280,6 +280,20 @@ async def get_quotes_history(
     return list(result)
 
 
+async def get_latest_quote_before(
+    session: AsyncSession, contract_id: int, ts: datetime
+) -> Quote | None:
+    stmt: Select[Quote] = (
+        select(Quote)
+        .where(Quote.contract_id == contract_id)
+        .where(Quote.timestamp < ts)
+        .order_by(Quote.timestamp.desc())
+        .limit(1)
+    )
+    result = await session.scalars(stmt)
+    return result.first()
+
+
 async def get_latest_quotes(
     session: AsyncSession, contract_ids: Iterable[int]
 ) -> Dict[int, Quote]:
