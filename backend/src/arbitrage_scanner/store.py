@@ -1,8 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Tuple
-from .domain import Ticker, ExchangeName, Symbol
+from typing import TYPE_CHECKING, Dict, Iterable, List, Tuple
+from .domain import ExchangeName, Symbol, Ticker
 import time
+
+if TYPE_CHECKING:
+    from .db.live import RealtimeDatabaseSink
 
 
 @dataclass
@@ -44,19 +47,39 @@ class Funding:
         return {"rate": self.rate, "interval": self.interval, "ts": self.ts}
 
 class TickerStore:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        persistence: "RealtimeDatabaseSink | None" = None,
+        max_order_book_levels: int = 50,
+    ) -> None:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
         self._ticker_updates: int = 0
         self._order_book_updates: int = 0
+        self._persistence: "RealtimeDatabaseSink | None" = persistence
+        self._max_levels = max_order_book_levels
+
+    def set_persistence(self, persistence: "RealtimeDatabaseSink | None") -> None:
+        self._persistence = persistence
 
     def upsert_ticker(self, t: Ticker) -> None:
         self._latest[(t.exchange, t.symbol)] = t
         self._ticker_updates += 1
+        if self._persistence is not None:
+            self._persistence.submit_ticker(
+                t.exchange,
+                t.symbol,
+                bid=t.bid,
+                ask=t.ask,
+                ts=t.ts,
+            )
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
         self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)
+        if self._persistence is not None:
+            self._persistence.submit_funding(exchange, symbol, rate=rate, interval=interval, ts=ts)
 
     def upsert_order_book(
         self,
@@ -73,10 +96,24 @@ class TickerStore:
         ob = self._order_books.get(key)
         if ob is None:
             ob = OrderBookData()
+        bids_clean: List[Tuple[float, float]] | None = None
+        asks_clean: List[Tuple[float, float]] | None = None
         if bids is not None:
-            ob.bids = [(float(price), float(size)) for price, size in bids if price and size]
+            bids_clean = [
+                (float(price), float(size))
+                for price, size in bids[: self._max_levels]
+                if price and size
+            ]
+            if bids_clean:
+                ob.bids = bids_clean
         if asks is not None:
-            ob.asks = [(float(price), float(size)) for price, size in asks if price and size]
+            asks_clean = [
+                (float(price), float(size))
+                for price, size in asks[: self._max_levels]
+                if price and size
+            ]
+            if asks_clean:
+                ob.asks = asks_clean
         if ts is not None:
             ob.ts = ts
         if last_price is not None:
@@ -87,6 +124,15 @@ class TickerStore:
             ob.last_price_ts = last_price_ts
         self._order_books[key] = ob
         self._order_book_updates += 1
+        if self._persistence is not None and (bids_clean or asks_clean):
+            ts_value = ob.ts or time.time()
+            self._persistence.submit_order_book(
+                exchange,
+                symbol,
+                bids=bids_clean or ob.bids,
+                asks=asks_clean or ob.asks,
+                ts=ts_value,
+            )
 
     def stats(self) -> dict:
         return {

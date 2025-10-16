@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Iterable, Mapping, Sequence
+from typing import Iterable, List, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
 from ..store import OrderBookData, TickerStore
 
@@ -33,15 +33,68 @@ class Row:
     orderbook_long: OrderBookData | None = None
     orderbook_short: OrderBookData | None = None
 
-    def as_dict(self) -> dict:
+    def as_dict(self, *, volume_usdt: float | None = None) -> dict:
         # ВАЖНО: не ломаем фронт. Отдаём и ключ "commission" (как использовалось в UI),
         # и "commission_total_pct" для совместимости.
+        price_long_ask = self.price_long_ask
+        price_short_bid = self.price_short_bid
+        price_long_bid = self.price_long_bid
+        price_short_ask = self.price_short_ask
+
+        entry = self.entry_pct
+        exitv = self.exit_pct
+
+        entry_depth_usdt: float | None = None
+        exit_depth_usdt: float | None = None
+
+        if volume_usdt and volume_usdt > 0:
+            long_ob = self.orderbook_long
+            short_ob = self.orderbook_short
+
+            long_ask_vwap, long_ask_cost = _vwap_for_volume(
+                long_ob.asks if long_ob else None, volume_usdt
+            )
+            short_bid_vwap, short_bid_cost = _vwap_for_volume(
+                short_ob.bids if short_ob else None, volume_usdt
+            )
+
+            long_bid_vwap, long_bid_cost = _vwap_for_volume(
+                long_ob.bids if long_ob else None, volume_usdt
+            )
+            short_ask_vwap, short_ask_cost = _vwap_for_volume(
+                short_ob.asks if short_ob else None, volume_usdt
+            )
+
+            if long_ask_vwap is not None and short_bid_vwap is not None:
+                price_long_ask = long_ask_vwap
+                price_short_bid = short_bid_vwap
+                entry = _entry(price_short_bid, price_long_ask)
+                entry_depth_usdt = min(volume_usdt, long_ask_cost, short_bid_cost)
+                if entry_depth_usdt == 0:
+                    entry_depth_usdt = None
+            else:
+                entry_depth_usdt = min(long_ask_cost, short_bid_cost)
+                if entry_depth_usdt == 0:
+                    entry_depth_usdt = None
+
+            if long_bid_vwap is not None and short_ask_vwap is not None:
+                price_long_bid = long_bid_vwap
+                price_short_ask = short_ask_vwap
+                exitv = _exit(price_long_bid, price_short_ask)
+                exit_depth_usdt = min(volume_usdt, long_bid_cost, short_ask_cost)
+                if exit_depth_usdt == 0:
+                    exit_depth_usdt = None
+            else:
+                exit_depth_usdt = min(long_bid_cost, short_ask_cost)
+                if exit_depth_usdt == 0:
+                    exit_depth_usdt = None
+
         return {
             "symbol": self.symbol,
             "long_exchange": self.long_ex,
             "short_exchange": self.short_ex,
-            "entry_pct": round(self.entry_pct, 4),
-            "exit_pct": round(self.exit_pct, 4),
+            "entry_pct": round(entry, 4),
+            "exit_pct": round(exitv, 4),
             "funding_long": self.funding_long,
             "funding_short": self.funding_short,
             "funding_interval_long": self.funding_interval_long,
@@ -55,13 +108,55 @@ class Row:
             "commission": round(self.commission_pct_total, 4),
             "commission_total_pct": round(self.commission_pct_total, 4),
 
-            "price_long_ask": self.price_long_ask,
-            "price_short_bid": self.price_short_bid,
-            "price_long_bid": self.price_long_bid,
-            "price_short_ask": self.price_short_ask,
+            "price_long_ask": price_long_ask,
+            "price_short_bid": price_short_bid,
+            "price_long_bid": price_long_bid,
+            "price_short_ask": price_short_ask,
             "orderbook_long": self.orderbook_long.to_dict() if self.orderbook_long else None,
             "orderbook_short": self.orderbook_short.to_dict() if self.orderbook_short else None,
+            "volume_usdt": volume_usdt,
+            "entry_volume_covered_usdt": entry_depth_usdt,
+            "exit_volume_covered_usdt": exit_depth_usdt,
         }
+
+
+def _vwap_for_volume(
+    levels: Sequence[tuple[float, float]] | None,
+    volume_usdt: float,
+) -> tuple[float | None, float]:
+    """Return VWAP for the requested notional volume and the filled notional."""
+
+    if not levels or volume_usdt <= 0:
+        return (None, 0.0)
+
+    remaining = float(volume_usdt)
+    total_cost = 0.0
+    total_qty = 0.0
+
+    for price, qty in levels:
+        if price <= 0 or qty <= 0:
+            continue
+
+        level_cost = float(price) * float(qty)
+        if level_cost >= remaining:
+            qty_used = remaining / float(price)
+            total_cost += remaining
+            total_qty += qty_used
+            remaining = 0.0
+            break
+
+        total_cost += level_cost
+        total_qty += float(qty)
+        remaining -= level_cost
+
+    if total_qty == 0.0:
+        return (None, 0.0)
+
+    if remaining > max(1e-6 * volume_usdt, 1e-6):
+        # Недостаточная глубина — сообщаем, что VWAP недоступен.
+        return (None, total_cost)
+
+    return (total_cost / total_qty, total_cost)
 
 def _entry(bid_short: float, ask_long: float) -> float:
     # (bid(B) - ask(A)) / mid * 100
