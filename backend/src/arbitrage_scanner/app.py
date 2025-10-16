@@ -156,14 +156,26 @@ async def health():
     return {"status": "ok", "env": settings.model_dump(), "symbols": SYMBOLS}
 
 
-@app.get("/stats")
-async def stats():
+def _stats_payload() -> dict:
     snap = store.snapshot()
+    metrics = store.stats()
     return {
         "symbols_subscribed": SYMBOLS,
         "tickers_in_store": len(snap),
         "exchanges": EXCHANGES,
+        "ticker_updates": metrics.get("ticker_updates", 0),
+        "order_book_updates": metrics.get("order_book_updates", 0),
     }
+
+
+@app.get("/stats")
+async def stats():
+    return _stats_payload()
+
+
+@app.get("/api/stats")
+async def api_stats():
+    return _stats_payload()
 
 
 @app.get("/ui")
