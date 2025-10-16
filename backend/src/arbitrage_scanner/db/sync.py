@@ -5,7 +5,8 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Dict, Iterable, List, Mapping, Sequence
+from types import MappingProxyType
+from typing import Awaitable, Callable, Dict, Iterable, List, Mapping, Sequence
 
 from ..connectors.base import (
     ConnectorContract,
@@ -50,6 +51,7 @@ class ExchangeContractsState:
 class DataSyncSummary:
     per_exchange: Mapping[ExchangeName, List[Symbol]]
     symbols_union: List[Symbol]
+    contracts: Mapping[ExchangeName, Mapping[Symbol, int]]
 
 
 def _to_decimal(value: float | None) -> Decimal | None:
@@ -75,13 +77,24 @@ def _contract_type(value: str | ContractType | None) -> ContractType:
 
 def _build_summary(states: Mapping[ExchangeName, ExchangeContractsState]) -> DataSyncSummary:
     per_exchange: Dict[ExchangeName, List[Symbol]] = {}
+    per_exchange_contracts: Dict[ExchangeName, Dict[Symbol, int]] = {}
     union: set[Symbol] = set()
     for name, state in states.items():
         symbols = sorted(state.contracts.keys())
-        if symbols:
-            per_exchange[name] = symbols
-            union.update(symbols)
-    return DataSyncSummary(per_exchange=per_exchange, symbols_union=sorted(union))
+        if not symbols:
+            continue
+        per_exchange[name] = symbols
+        union.update(symbols)
+        per_exchange_contracts[name] = {
+            symbol: synced.contract_id for symbol, synced in state.contracts.items()
+        }
+    return DataSyncSummary(
+        per_exchange=MappingProxyType(per_exchange),
+        symbols_union=sorted(union),
+        contracts=MappingProxyType(
+            {name: MappingProxyType(mapping) for name, mapping in per_exchange_contracts.items()}
+        ),
+    )
 
 
 async def _fetch_contracts_for_connector(
@@ -148,13 +161,13 @@ async def _fetch_contracts_for_connector(
 
 async def refresh_exchange_metadata(
     connectors: Sequence[ConnectorSpec],
-) -> Mapping[ExchangeName, ExchangeContractsState]:
+) -> tuple[Mapping[ExchangeName, ExchangeContractsState], DataSyncSummary]:
     states: Dict[ExchangeName, ExchangeContractsState] = {}
     for connector in connectors:
         state, _symbols = await _fetch_contracts_for_connector(connector)
         if state is not None:
             states[connector.name] = state
-    return states
+    return states, _build_summary(states)
 
 
 async def perform_initial_sync(
@@ -163,11 +176,10 @@ async def perform_initial_sync(
     lookback_days: int = _DEFAULT_LOOKBACK_DAYS,
     interval: timedelta = _DEFAULT_INTERVAL,
 ) -> DataSyncSummary:
-    states = await refresh_exchange_metadata(connectors)
-    summary = _build_summary(states)
+    states, summary = await refresh_exchange_metadata(connectors)
     if not states:
         logger.warning("No exchange metadata could be synchronized during startup")
-        return DataSyncSummary(per_exchange={}, symbols_union=[])
+        return DataSyncSummary(per_exchange={}, symbols_union=[], contracts={})
 
     await _update_contract_taker_fees(connectors, states)
 
@@ -313,11 +325,14 @@ async def periodic_history_sync(
     *,
     interval: timedelta = _PERIODIC_SYNC_INTERVAL,
     lookback: timedelta = timedelta(days=1),
+    on_summary: Callable[[DataSyncSummary], Awaitable[None]] | None = None,
 ) -> None:
     while True:
         try:
-            states = await refresh_exchange_metadata(connectors)
+            states, summary = await refresh_exchange_metadata(connectors)
             if states:
+                if on_summary is not None:
+                    await on_summary(summary)
                 await _update_contract_taker_fees(connectors, states)
                 end = datetime.now(tz=UTC)
                 start = end - lookback

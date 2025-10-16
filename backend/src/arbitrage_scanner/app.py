@@ -14,6 +14,7 @@ from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.discovery import discover_symbols_for_connectors
+from .db.live import RealtimeDatabaseSink
 from .db.sync import DataSyncSummary, perform_initial_sync, periodic_history_sync
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
@@ -25,6 +26,8 @@ _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
 DATA_SYNC: DataSyncSummary | None = None
+LIVE_SINK: RealtimeDatabaseSink | None = None
+CONTRACT_LOOKUP: dict[tuple[ExchangeName, Symbol], int] = {}
 
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
@@ -49,6 +52,27 @@ TIMEFRAME_ALIASES: dict[str, int] = {
 }
 
 logger = logging.getLogger(__name__)
+
+ORDER_BOOK_POLL_INTERVAL = 0.5
+PAIR_POLL_INTERVAL = 0.5
+
+
+def _build_contract_lookup(summary: DataSyncSummary | None) -> dict[tuple[ExchangeName, Symbol], int]:
+    mapping: dict[tuple[ExchangeName, Symbol], int] = {}
+    if not summary:
+        return mapping
+    for exchange, contracts in summary.contracts.items():
+        for symbol, contract_id in contracts.items():
+            mapping[(exchange.lower(), symbol.upper())] = contract_id
+    return mapping
+
+
+async def _on_sync_summary(summary: DataSyncSummary) -> None:
+    global DATA_SYNC, CONTRACT_LOOKUP
+    DATA_SYNC = summary
+    CONTRACT_LOOKUP = _build_contract_lookup(summary)
+    if LIVE_SINK is not None:
+        LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
 
 
 def _parse_timeframe(value: str | int) -> int:
@@ -125,7 +149,7 @@ async def _spread_loop() -> None:
 @app.on_event("startup")
 async def startup():
     # 1) Синхронизируем метаданные бирж и исторические данные
-    global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC
+    global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC, LIVE_SINK, CONTRACT_LOOKUP
     metadata_summary: DataSyncSummary | None = None
     try:
         metadata_summary = await perform_initial_sync(CONNECTORS)
@@ -133,6 +157,19 @@ async def startup():
     except Exception:  # noqa: BLE001 - логируем и продолжаем с фоллбеком
         logger.exception("Initial database synchronization failed")
         metadata_summary = None
+
+    if metadata_summary is not None:
+        await _on_sync_summary(metadata_summary)
+    else:
+        CONTRACT_LOOKUP = {}
+
+    if LIVE_SINK is None:
+        LIVE_SINK = RealtimeDatabaseSink(
+            max_order_book_levels=getattr(store, "_max_levels", 50),
+        )
+    LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
+    LIVE_SINK.start()
+    store.set_persistence(LIVE_SINK)
 
     if metadata_summary and metadata_summary.symbols_union:
         SYMBOLS = metadata_summary.symbols_union
@@ -154,7 +191,9 @@ async def startup():
             CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
     # 2) Запустим периодическую синхронизацию истории
-    _tasks.append(asyncio.create_task(periodic_history_sync(CONNECTORS)))
+    _tasks.append(
+        asyncio.create_task(periodic_history_sync(CONNECTORS, on_summary=_on_sync_summary))
+    )
 
     # 3) Запустим ридеры бирж
     for connector in CONNECTORS:
@@ -168,6 +207,9 @@ async def shutdown():
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    if LIVE_SINK is not None:
+        await LIVE_SINK.close()
+        store.set_persistence(None)
 
 
 @app.get("/health")
@@ -195,6 +237,19 @@ async def stats():
 @app.get("/api/stats")
 async def api_stats():
     return _stats_payload()
+
+
+def _serialize_pair_entry(entry: dict | None) -> dict | None:
+    if not entry:
+        return None
+    ticker = entry.get("ticker")
+    funding = entry.get("funding")
+    order_book = entry.get("order_book")
+    return {
+        "ticker": ticker.to_dict() if ticker else None,
+        "funding": funding.to_dict() if funding else None,
+        "order_book": order_book.to_dict() if order_book else None,
+    }
 
 
 @app.get("/ui")
@@ -383,6 +438,103 @@ async def ws_spreads(ws: WebSocket):
     except WebSocketDisconnect:
         return
     except Exception:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/orderbook")
+async def ws_orderbook(ws: WebSocket):
+    await ws.accept()
+    symbol = (ws.query_params.get("symbol") or "").upper()
+    exchange = (ws.query_params.get("exchange") or "").lower()
+    if not symbol or not exchange:
+        await ws.close(code=4400, reason="symbol and exchange query params are required")
+        return
+
+    last_payload: str | None = None
+    try:
+        while True:
+            snapshot = store.get_order_book(exchange, symbol)
+            payload = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "order_book": snapshot.to_dict() if snapshot else None,
+            }
+            message = json.dumps(payload)
+            if message != last_payload:
+                await ws.send_text(message)
+                last_payload = message
+            await asyncio.sleep(ORDER_BOOK_POLL_INTERVAL)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        logger.exception("Order book websocket failed", exc_info=True)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/pair")
+async def ws_pair(ws: WebSocket):
+    await ws.accept()
+    symbol = (ws.query_params.get("symbol") or "").upper()
+    long_exchange = (ws.query_params.get("long") or "").lower()
+    short_exchange = (ws.query_params.get("short") or "").lower()
+    if not symbol or not long_exchange or not short_exchange:
+        await ws.close(code=4400, reason="symbol, long and short query params are required")
+        return
+
+    last_payload: str | None = None
+    try:
+        while True:
+            rows = _rows_for_symbol(symbol)
+            ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+            row_payload: dict | None = None
+            for row in rows:
+                if row.long_ex.lower() == long_exchange and row.short_ex.lower() == short_exchange:
+                    row_payload = row.as_dict()
+                    if row_payload is not None:
+                        row_payload["_ts"] = ts
+                    break
+
+            symbol_state = store.by_symbol(symbol)
+            long_state_raw = symbol_state.get(long_exchange)
+            short_state_raw = symbol_state.get(short_exchange)
+            long_state = _serialize_pair_entry(long_state_raw)
+            short_state = _serialize_pair_entry(short_state_raw)
+
+            funding_spread: float | None = None
+            long_funding = long_state_raw.get("funding") if long_state_raw else None
+            short_funding = short_state_raw.get("funding") if short_state_raw else None
+            if long_funding and short_funding:
+                try:
+                    funding_spread = float(long_funding.rate) - float(short_funding.rate)
+                except Exception:
+                    funding_spread = None
+
+            payload = {
+                "symbol": symbol,
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "row": row_payload,
+                "long": long_state,
+                "short": short_state,
+                "funding_spread": funding_spread,
+                "ts": ts,
+            }
+
+            message = json.dumps(payload)
+            if message != last_payload:
+                await ws.send_text(message)
+                last_payload = message
+            await asyncio.sleep(PAIR_POLL_INTERVAL)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        logger.exception("Pair websocket failed", exc_info=True)
         try:
             await ws.close()
         except Exception:
