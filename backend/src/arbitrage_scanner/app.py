@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, time
+import asyncio, json, logging, math, time
 from typing import Iterable, Sequence
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
@@ -379,7 +379,10 @@ async def pair_realtime(
     symbol: str,
     long_exchange: str = Query(..., alias="long"),
     short_exchange: str = Query(..., alias="short"),
+    volume: float | None = Query(None, ge=0.0),
 ):
+    if volume is not None and not math.isfinite(volume):
+        raise HTTPException(status_code=400, detail="volume must be finite")
     rows = _rows_for_symbol(symbol)
     long_key = long_exchange.lower()
     short_key = short_exchange.lower()
@@ -387,7 +390,7 @@ async def pair_realtime(
     payload: dict[str, object] | None = None
     for row in rows:
         if row.long_ex.lower() == long_key and row.short_ex.lower() == short_key:
-            payload = row.as_dict()
+            payload = row.as_dict(volume_usdt=volume)
             if payload is not None:
                 payload["_ts"] = ts
             break
@@ -395,6 +398,7 @@ async def pair_realtime(
         "symbol": symbol.upper(),
         "long_exchange": long_key,
         "short_exchange": short_key,
+        "volume": volume,
         "ts": ts,
         "row": payload,
     }
@@ -483,6 +487,19 @@ async def ws_pair(ws: WebSocket):
     symbol = (ws.query_params.get("symbol") or "").upper()
     long_exchange = (ws.query_params.get("long") or "").lower()
     short_exchange = (ws.query_params.get("short") or "").lower()
+    volume_param = ws.query_params.get("volume")
+    volume: float | None
+    if volume_param is None or volume_param == "":
+        volume = None
+    else:
+        try:
+            volume = float(volume_param)
+        except ValueError:
+            await ws.close(code=4400, reason="invalid volume")
+            return
+        if not math.isfinite(volume) or volume < 0:
+            await ws.close(code=4400, reason="volume must be non-negative")
+            return
     if not symbol or not long_exchange or not short_exchange:
         await ws.close(code=4400, reason="symbol, long and short query params are required")
         return
@@ -495,7 +512,7 @@ async def ws_pair(ws: WebSocket):
             row_payload: dict | None = None
             for row in rows:
                 if row.long_ex.lower() == long_exchange and row.short_ex.lower() == short_exchange:
-                    row_payload = row.as_dict()
+                    row_payload = row.as_dict(volume_usdt=volume)
                     if row_payload is not None:
                         row_payload["_ts"] = ts
                     break
@@ -519,6 +536,7 @@ async def ws_pair(ws: WebSocket):
                 "symbol": symbol,
                 "long_exchange": long_exchange,
                 "short_exchange": short_exchange,
+                "volume": volume,
                 "row": row_payload,
                 "long": long_state,
                 "short": short_state,
