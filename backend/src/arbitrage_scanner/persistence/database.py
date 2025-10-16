@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import aiosqlite
+try:  # pragma: no cover - runtime import guard
+    import aiosqlite  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    aiosqlite = None
+
+import sqlite3
 
 from ..domain import ExchangeName, Symbol
 from .normalization import NormalizedSymbol, normalize_symbol, split_symbol
@@ -30,19 +35,75 @@ class FundingPoint:
     interval: str
 
 
+class _SyncCursor:
+    """Async-compatible wrapper over sqlite3 cursor for fallback mode."""
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self._cursor = cursor
+
+    def __await__(self):  # pragma: no cover - thin wrapper
+        async def _await_self() -> "_SyncCursor":
+            return self
+
+        return _await_self().__await__()
+
+    async def __aenter__(self) -> "_SyncCursor":  # pragma: no cover - passthrough
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - passthrough
+        await asyncio.to_thread(self._cursor.close)
+
+    async def fetchone(self):  # pragma: no cover - passthrough
+        return await asyncio.to_thread(self._cursor.fetchone)
+
+    async def fetchall(self):  # pragma: no cover - passthrough
+        return await asyncio.to_thread(self._cursor.fetchall)
+
+
+class _SQLiteAdapter:
+    """Expose an async-like API backed by sqlite3 for environments without aiosqlite."""
+
+    def __init__(self, path: Path) -> None:
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+
+    async def execute(self, sql: str, parameters: tuple | list | None = None):  # pragma: no cover - IO wrapper
+        params = parameters or ()
+        cursor = await asyncio.to_thread(self._conn.execute, sql, params)
+        return _SyncCursor(cursor)
+
+    async def executemany(self, sql: str, seq_of_parameters):  # pragma: no cover - IO wrapper
+        await asyncio.to_thread(self._conn.executemany, sql, seq_of_parameters)
+
+    async def executescript(self, script: str):  # pragma: no cover - IO wrapper
+        await asyncio.to_thread(self._conn.executescript, script)
+
+    async def commit(self):  # pragma: no cover - IO wrapper
+        await asyncio.to_thread(self._conn.commit)
+
+    async def close(self):  # pragma: no cover - IO wrapper
+        await asyncio.to_thread(self._conn.close)
+
+
 class Database:
     """Manages a SQLite database with normalized market data."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._conn: aiosqlite.Connection | None = None
+        self._conn: object | None = None
         self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self._conn is not None:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(str(self._path))
+        if aiosqlite is not None:
+            self._conn = await aiosqlite.connect(str(self._path))
+        else:
+            logger.warning(
+                "aiosqlite не найден — включен синхронный режим БД. "
+                "Установите пакет aiosqlite для полноценной асинхронной работы."
+            )
+            self._conn = _SQLiteAdapter(self._path)
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
