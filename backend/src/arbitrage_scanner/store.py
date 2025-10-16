@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 from .domain import Ticker, ExchangeName, Symbol
+from .persistence.worker import DataPersistence
 import time
 
 
@@ -44,19 +45,27 @@ class Funding:
         return {"rate": self.rate, "interval": self.interval, "ts": self.ts}
 
 class TickerStore:
-    def __init__(self) -> None:
+    def __init__(self, *, persistence: DataPersistence | None = None) -> None:
         self._latest: Dict[Key, Ticker] = {}
         self._funding: Dict[Key, Funding] = {}
         self._order_books: Dict[Key, OrderBookData] = {}
         self._ticker_updates: int = 0
         self._order_book_updates: int = 0
+        self._persistence = persistence
+
+    def attach_persistence(self, persistence: DataPersistence | None) -> None:
+        self._persistence = persistence
 
     def upsert_ticker(self, t: Ticker) -> None:
         self._latest[(t.exchange, t.symbol)] = t
         self._ticker_updates += 1
+        if self._persistence is not None:
+            self._persistence.submit_bbo(t.exchange, t.symbol, t.ts, t.bid, t.ask)
 
     def upsert_funding(self, exchange: ExchangeName, symbol: Symbol, rate: float, interval: str, ts: float) -> None:
         self._funding[(exchange, symbol)] = Funding(rate=rate, interval=interval, ts=ts)
+        if self._persistence is not None:
+            self._persistence.submit_funding(exchange, symbol, ts, rate, interval)
 
     def upsert_order_book(
         self,

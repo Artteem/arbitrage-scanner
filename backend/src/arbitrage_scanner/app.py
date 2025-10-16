@@ -8,18 +8,22 @@ from starlette.websockets import WebSocketDisconnect
 
 from .settings import settings
 from .store import TickerStore
-from .domain import Symbol, ExchangeName
+from .domain import ExchangeName, Symbol
 from .engine.spread_calc import DEFAULT_TAKER_FEES, Row, compute_rows
 from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
-from .connectors.discovery import discover_symbols_for_connectors
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
+from .persistence import DataPersistence, Database, normalize_symbol
+from .services.bootstrap import Bootstrapper
+from .services.funding import poll_funding_loop
 
-app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
+app = FastAPI(title="Arbitrage Scanner API", version="1.3.0")
 
-store = TickerStore()
+database = Database(settings.database_path)
+persistence = DataPersistence(database)
+store = TickerStore(persistence=persistence)
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
@@ -40,6 +44,12 @@ SPREAD_EVENT: asyncio.Event = asyncio.Event()
 LAST_ROWS: list[Row] = []
 LAST_ROWS_TS: float = 0.0
 
+DEFAULT_NOTIONAL: float | None = (
+    float(settings.default_trade_volume)
+    if settings.default_trade_volume and settings.default_trade_volume > 0
+    else None
+)
+
 TIMEFRAME_ALIASES: dict[str, int] = {
     "1m": 60,
     "5m": 300,
@@ -47,6 +57,32 @@ TIMEFRAME_ALIASES: dict[str, int] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_notional(volume: float | None) -> float | None:
+    if volume is None:
+        return DEFAULT_NOTIONAL
+    try:
+        vol = float(volume)
+    except (TypeError, ValueError):
+        return DEFAULT_NOTIONAL
+    if vol <= 0:
+        return None
+    return vol
+
+
+def _entry_pct(bid_short: float, ask_long: float) -> float:
+    mid = (bid_short + ask_long) / 2.0
+    if mid == 0:
+        return 0.0
+    return (bid_short - ask_long) / mid * 100.0
+
+
+def _exit_pct(bid_long: float, ask_short: float) -> float:
+    mid = (bid_long + ask_short) / 2.0
+    if mid == 0:
+        return 0.0
+    return (bid_long - ask_short) / mid * 100.0
 
 
 def _parse_timeframe(value: str | int) -> int:
@@ -65,28 +101,84 @@ def _parse_timeframe(value: str | int) -> int:
     return candidate
 
 
-def _current_rows() -> Sequence[Row]:
-    if LAST_ROWS:
+def _current_rows(volume: float | None = None) -> Sequence[Row]:
+    notional = _resolve_notional(volume)
+    if notional == DEFAULT_NOTIONAL and LAST_ROWS:
         return LAST_ROWS
     return compute_rows(
         store,
         symbols=SYMBOLS if SYMBOLS else FALLBACK_SYMBOLS,
         exchanges=EXCHANGES,
         taker_fees=TAKER_FEES,
+        target_notional=notional,
     )
 
 
-def _rows_for_symbol(symbol: Symbol) -> list[Row]:
+def _rows_for_symbol(symbol: Symbol, volume: float | None = None) -> list[Row]:
     target = symbol.upper()
-    rows = [row for row in _current_rows() if row.symbol.upper() == target]
+    rows = [row for row in _current_rows(volume) if row.symbol.upper() == target]
     if rows:
         return rows
+    notional = _resolve_notional(volume)
     return compute_rows(
         store,
         symbols=[target],
         exchanges=EXCHANGES,
         taker_fees=TAKER_FEES,
+        target_notional=notional,
     )
+
+
+async def _backfill_from_database(
+    symbol: Symbol,
+    long_exchange: ExchangeName,
+    short_exchange: ExchangeName,
+    timeframe: int,
+    start_ts: int,
+) -> None:
+    normalized = normalize_symbol(symbol)
+    if not normalized:
+        return
+    end_ts = int(time.time())
+    try:
+        long_points = await database.load_bbo_points(long_exchange, normalized, start_ts, end_ts)
+        short_points = await database.load_bbo_points(short_exchange, normalized, start_ts, end_ts)
+    except Exception:
+        logger.exception("Failed to load cached BBO history for %s %s/%s", symbol, long_exchange, short_exchange)
+        return
+    if not long_points or not short_points:
+        return
+
+    def _bucket(points: Sequence) -> dict[int, object]:
+        buckets: dict[int, object] = {}
+        for point in points:
+            ts = int(getattr(point, "ts", 0))
+            bucket = (ts // timeframe) * timeframe
+            buckets[bucket] = point
+        return buckets
+
+    buckets_long = _bucket(long_points)
+    buckets_short = _bucket(short_points)
+    common = sorted(set(buckets_long.keys()) & set(buckets_short.keys()))
+    if not common:
+        return
+    for bucket in common:
+        lp = buckets_long[bucket]
+        sp = buckets_short[bucket]
+        bid_short = float(getattr(sp, "bid", 0.0))
+        ask_long = float(getattr(lp, "ask", 0.0))
+        bid_long = float(getattr(lp, "bid", ask_long))
+        ask_short = float(getattr(sp, "ask", bid_short))
+        entry_value = _entry_pct(bid_short, ask_long)
+        exit_value = _exit_pct(bid_long, ask_short)
+        SPREAD_HISTORY.add_point(
+            symbol=symbol,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            entry_value=entry_value,
+            exit_value=exit_value,
+            ts=float(bucket),
+        )
 
 
 async def _spread_loop() -> None:
@@ -98,6 +190,7 @@ async def _spread_loop() -> None:
                 symbols=SYMBOLS if SYMBOLS else FALLBACK_SYMBOLS,
                 exchanges=EXCHANGES,
                 taker_fees=TAKER_FEES,
+                target_notional=DEFAULT_NOTIONAL,
             )
             ts = time.time()
             for row in rows:
@@ -122,26 +215,53 @@ async def _spread_loop() -> None:
 
 @app.on_event("startup")
 async def startup():
-    # 1) Автоматически найдём пересечение USDT-перпетуалов
     global SYMBOLS, CONNECTOR_SYMBOLS
+
+    await database.connect()
+    await database.initialize()
+    await persistence.start()
+    store.attach_persistence(persistence)
+
     try:
-        discovery = await discover_symbols_for_connectors(CONNECTORS)
-        if discovery.symbols_union:
-            SYMBOLS = discovery.symbols_union
-            CONNECTOR_SYMBOLS = discovery.per_connector
+        bootstrapper = Bootstrapper(
+            connectors=CONNECTORS,
+            store=store,
+            database=database,
+        )
+        result = await bootstrapper.run()
+        if result.symbols_union:
+            SYMBOLS = result.symbols_union
         else:
             SYMBOLS = FALLBACK_SYMBOLS
-            CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
+        if result.per_connector:
+            CONNECTOR_SYMBOLS = {ex: list(symbols) for ex, symbols in result.per_connector.items()}
+        else:
+            CONNECTOR_SYMBOLS = {spec.name: SYMBOLS[:] for spec in CONNECTORS}
+        for exchange, fee in result.taker_fees.items():
+            TAKER_FEES[exchange] = fee
     except Exception:
-        # Фоллбек: базовый набор
+        logger.exception("Bootstrap failed, using fallback symbol set")
         SYMBOLS = FALLBACK_SYMBOLS
         CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
-    # 2) Запустим ридеры бирж
+    # Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
     _tasks.append(asyncio.create_task(_spread_loop()))
+
+    if CONNECTOR_SYMBOLS:
+        poller_payload = {ex: tuple(symbols) for ex, symbols in CONNECTOR_SYMBOLS.items()}
+        _tasks.append(
+            asyncio.create_task(
+                poll_funding_loop(
+                    exchanges=poller_payload,
+                    interval=settings.funding_refresh_interval,
+                    store=store,
+                    persistence=persistence,
+                )
+            )
+        )
 
 
 @app.on_event("shutdown")
@@ -149,6 +269,8 @@ async def shutdown():
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    await persistence.stop()
+    await database.close()
 
 
 @app.get("/health")
@@ -165,6 +287,8 @@ def _stats_payload() -> dict:
         "exchanges": EXCHANGES,
         "ticker_updates": metrics.get("ticker_updates", 0),
         "order_book_updates": metrics.get("order_book_updates", 0),
+        "default_notional": DEFAULT_NOTIONAL,
+        "database_path": settings.database_path,
     }
 
 
@@ -192,8 +316,8 @@ async def pair_card(symbol: str):
 
 
 @app.get("/api/pair/{symbol}/overview")
-async def pair_overview(symbol: str):
-    rows = [row.as_dict() for row in _rows_for_symbol(symbol)]
+async def pair_overview(symbol: str, volume: float | None = Query(None, ge=0.0)):
+    rows = [row.as_dict() for row in _rows_for_symbol(symbol, volume)]
     return {"symbol": symbol.upper(), "rows": rows}
 
 
@@ -238,6 +362,17 @@ async def pair_spreads(
                     exit_value=row.exit_pct,
                     ts=now,
                 )
+        start_ts = int(time.time() - max(lookback_days, 0) * 86400)
+        try:
+            await _backfill_from_database(
+                symbol_upper,
+                long_key,
+                short_key,
+                tf_value,
+                start_ts,
+            )
+        except Exception:
+            logger.exception("Failed to load cached spread data", exc_info=True)
         try:
             entry_hist, exit_hist = await fetch_spread_history(
                 symbol=symbol_upper,
@@ -305,11 +440,13 @@ async def pair_realtime(
     symbol: str,
     long_exchange: str = Query(..., alias="long"),
     short_exchange: str = Query(..., alias="short"),
+    volume: float | None = Query(None, ge=0.0),
 ):
-    rows = _rows_for_symbol(symbol)
+    rows = _rows_for_symbol(symbol, volume)
     long_key = long_exchange.lower()
     short_key = short_exchange.lower()
-    ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+    notional = _resolve_notional(volume)
+    ts = LAST_ROWS_TS if (notional == DEFAULT_NOTIONAL and LAST_ROWS) else time.time()
     payload: dict[str, object] | None = None
     for row in rows:
         if row.long_ex.lower() == long_key and row.short_ex.lower() == short_key:
@@ -332,12 +469,20 @@ async def ws_spreads(ws: WebSocket):
     target_symbol = (ws.query_params.get("symbol") or "").upper()
     target_long = (ws.query_params.get("long") or "").lower()
     target_short = (ws.query_params.get("short") or "").lower()
+    volume_raw = ws.query_params.get("volume")
+    volume_value: float | None = None
+    if volume_raw is not None:
+        try:
+            volume_value = float(volume_raw)
+        except (TypeError, ValueError):
+            volume_value = None
     use_filter = bool(target_symbol and target_long and target_short)
     last_payload: str | None = None
     try:
         while True:
-            rows = _current_rows()
-            ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+            rows = _current_rows(volume_value)
+            notional = _resolve_notional(volume_value)
+            ts = LAST_ROWS_TS if (notional == DEFAULT_NOTIONAL and LAST_ROWS) else time.time()
             payload = []
             for r in rows:
                 if use_filter:

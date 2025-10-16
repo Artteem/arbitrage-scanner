@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Iterable, Mapping, Sequence
+from typing import Iterable, List, Mapping, Sequence
 from ..domain import ExchangeName, Symbol
 from ..store import OrderBookData, TickerStore
 
@@ -32,6 +32,12 @@ class Row:
     price_short_ask: float
     orderbook_long: OrderBookData | None = None
     orderbook_short: OrderBookData | None = None
+    notional: float | None = None
+    liquidity_warning: bool = False
+    entry_price_long_avg: float | None = None
+    entry_price_short_avg: float | None = None
+    exit_price_long_avg: float | None = None
+    exit_price_short_avg: float | None = None
 
     def as_dict(self) -> dict:
         # ВАЖНО: не ломаем фронт. Отдаём и ключ "commission" (как использовалось в UI),
@@ -61,6 +67,12 @@ class Row:
             "price_short_ask": self.price_short_ask,
             "orderbook_long": self.orderbook_long.to_dict() if self.orderbook_long else None,
             "orderbook_short": self.orderbook_short.to_dict() if self.orderbook_short else None,
+            "notional": self.notional,
+            "liquidity_warning": self.liquidity_warning,
+            "entry_price_long_avg": self.entry_price_long_avg or self.price_long_ask,
+            "entry_price_short_avg": self.entry_price_short_avg or self.price_short_bid,
+            "exit_price_long_avg": self.exit_price_long_avg or self.price_long_bid,
+            "exit_price_short_avg": self.exit_price_short_avg or self.price_short_ask,
         }
 
 def _entry(bid_short: float, ask_long: float) -> float:
@@ -80,11 +92,53 @@ def _commission_total_pct(
     fs = float(fees.get(short_ex, 0.001))
     return (2.0 * (fl + fs)) * 100.0
 
+
+def _avg_price_for_notional(
+    orderbook: OrderBookData | None,
+    notional: float,
+    *,
+    side: str,
+) -> float | None:
+    if orderbook is None or notional <= 0:
+        return None
+    levels = orderbook.asks if side == "buy" else orderbook.bids
+    if not levels:
+        return None
+    if side == "buy":
+        iterable = sorted(levels, key=lambda level: level[0])
+    else:
+        iterable = sorted(levels, key=lambda level: level[0], reverse=True)
+    remaining = float(notional)
+    total_qty = 0.0
+    total_notional = 0.0
+    for price, size in iterable:
+        if price <= 0 or size <= 0:
+            continue
+        level_notional = price * size
+        if level_notional >= remaining:
+            qty = remaining / price
+            total_qty += qty
+            total_notional += remaining
+            remaining = 0.0
+            break
+        total_qty += size
+        total_notional += level_notional
+        remaining -= level_notional
+        if remaining <= 0:
+            break
+    if remaining > 1e-9:
+        return None
+    if total_qty <= 0:
+        return None
+    return total_notional / total_qty
+
+
 def compute_rows(
     store: TickerStore,
     symbols: Iterable[Symbol],
     exchanges: Iterable[ExchangeName],
     taker_fees: Mapping[ExchangeName, float] = DEFAULT_TAKER_FEES,
+    target_notional: float | None = None,
 ) -> List[Row]:
     rows: List[Row] = []
 
@@ -152,8 +206,36 @@ def compute_rows(
                 fl = long_payload.get("funding")
                 fs = short_payload.get("funding")
 
-                entry = _entry(short_t.bid, long_t.ask)
-                exitv = _exit(long_t.bid, short_t.ask)
+                entry_long_price = long_t.ask
+                entry_short_price = short_t.bid
+                exit_long_price = long_t.bid
+                exit_short_price = short_t.ask
+                entry_long_avg = None
+                entry_short_avg = None
+                exit_long_avg = None
+                exit_short_avg = None
+                liquidity_warning = False
+
+                if target_notional and target_notional > 0:
+                    entry_long_avg = _avg_price_for_notional(long_ob, target_notional, side="buy")
+                    entry_short_avg = _avg_price_for_notional(short_ob, target_notional, side="sell")
+                    exit_long_avg = _avg_price_for_notional(long_ob, target_notional, side="sell")
+                    exit_short_avg = _avg_price_for_notional(short_ob, target_notional, side="buy")
+
+                    if entry_long_avg is not None and entry_short_avg is not None:
+                        entry_long_price = entry_long_avg
+                        entry_short_price = entry_short_avg
+                    else:
+                        liquidity_warning = True
+
+                    if exit_long_avg is not None and exit_short_avg is not None:
+                        exit_long_price = exit_long_avg
+                        exit_short_price = exit_short_avg
+                    else:
+                        liquidity_warning = True
+
+                entry = _entry(entry_short_price, entry_long_price)
+                exitv = _exit(exit_long_price, exit_short_price)
 
                 comm_total = _commission_total_pct(long_ex, short_ex, taker_fees)
 
@@ -170,12 +252,18 @@ def compute_rows(
                         funding_interval_short=(fs.interval if fs else ""),
                         funding_spread=((fs.rate if fs else 0.0) - (fl.rate if fl else 0.0)),
                         commission_pct_total=comm_total,
-                        price_long_ask=long_t.ask,
-                        price_short_bid=short_t.bid,
-                        price_long_bid=long_t.bid,
-                        price_short_ask=short_t.ask,
+                        price_long_ask=entry_long_price,
+                        price_short_bid=entry_short_price,
+                        price_long_bid=exit_long_price,
+                        price_short_ask=exit_short_price,
                         orderbook_long=long_ob,
                         orderbook_short=short_ob,
+                        notional=target_notional,
+                        liquidity_warning=liquidity_warning,
+                        entry_price_long_avg=entry_long_avg,
+                        entry_price_short_avg=entry_short_avg,
+                        exit_price_long_avg=exit_long_avg,
+                        exit_price_short_avg=exit_short_avg,
                     )
                 )
 

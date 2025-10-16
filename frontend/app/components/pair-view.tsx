@@ -550,7 +550,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     setSettingsLoaded(false);
   }, [initialSelection, settingsKey]);
 
-  const { data: overviewData } = usePairOverview(symbolUpper);
+  const { data: overviewData } = usePairOverview(symbolUpper, volume);
   const overviewRows = useMemo(
     () => overviewData?.rows ?? [],
     [overviewData?.rows],
@@ -752,7 +752,7 @@ export default function PairView({ symbol, initialLong, initialShort }: PairView
     metric: 'entry',
     days: LOOKBACK_DAYS,
   });
-  const { data: realtimeData } = usePairRealtime(selection);
+  const { data: realtimeData } = usePairRealtime(selection, volume);
   const { data: limitsData } = usePairLimits(selection);
 
   const overviewRow = useMemo(() => {

@@ -21,9 +21,16 @@ const fetcher = async <T>(url: string): Promise<T> => {
   return (await response.json()) as T;
 };
 
-export function usePairOverview(symbol: string | null) {
+export function usePairOverview(symbol: string | null, volume: string | number | null) {
   const baseUrl = getApiBaseUrl();
-  const key = symbol ? `${baseUrl}/api/pair/${symbol}/overview` : null;
+  const params = new URLSearchParams();
+  if (volume !== null && volume !== undefined && String(volume).trim() !== '') {
+    params.set('volume', String(volume));
+  }
+  const query = params.toString();
+  const key = symbol
+    ? `${baseUrl}/api/pair/${symbol}/overview${query ? `?${query}` : ''}`
+    : null;
   return useSWR<PairOverviewResponse>(key, fetcher, {
     refreshInterval: 15_000,
   });
@@ -71,11 +78,17 @@ const matchesSelection = (row: SpreadRow | null | undefined, selection: PairSele
   );
 };
 
-export function usePairRealtime(selection: PairSelection | null) {
+export function usePairRealtime(selection: PairSelection | null, volume: string | number | null) {
   const baseUrl = getApiBaseUrl();
-  const key = selection
-    ? `${baseUrl}/api/pair/${selection.symbol}/realtime?long=${selection.long_exchange}&short=${selection.short_exchange}`
-    : null;
+  const params = new URLSearchParams();
+  if (selection) {
+    params.set('long', selection.long_exchange);
+    params.set('short', selection.short_exchange);
+    if (volume !== null && volume !== undefined && String(volume).trim() !== '') {
+      params.set('volume', String(volume));
+    }
+  }
+  const key = selection ? `${baseUrl}/api/pair/${selection.symbol}/realtime?${params.toString()}` : null;
   const swr = useSWR<PairRealtimeResponse>(key, fetcher, {
     refreshInterval: 0,
     revalidateOnFocus: false,
@@ -119,6 +132,9 @@ export function usePairRealtime(selection: PairSelection | null) {
         long: currentSelection.long_exchange,
         short: currentSelection.short_exchange,
       });
+      if (volume !== null && volume !== undefined && String(volume).trim() !== '') {
+        params.set('volume', String(volume));
+      }
       const wsUrl = `${getWsBaseUrl()}/ws/spreads?${params.toString()}`;
       try {
         ws = new WebSocket(wsUrl);

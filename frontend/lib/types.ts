@@ -23,6 +23,12 @@ export interface SpreadRow {
   price_short_ask: number;
   orderbook_long?: unknown;
   orderbook_short?: unknown;
+  notional?: number | null;
+  liquidity_warning?: boolean;
+  entry_price_long_avg?: number;
+  entry_price_short_avg?: number;
+  exit_price_long_avg?: number;
+  exit_price_short_avg?: number;
   _ts?: number;
 }
 

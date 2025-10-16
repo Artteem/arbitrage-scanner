@@ -87,6 +87,37 @@ async def fetch_spread_history(
     return entry_candles, exit_candles
 
 
+async def fetch_price_history(
+    *,
+    exchange: ExchangeName,
+    symbol: Symbol,
+    timeframe_seconds: int,
+    lookback_seconds: int,
+    client: httpx.AsyncClient | None = None,
+) -> list[PriceCandle]:
+    timeframe = int(timeframe_seconds)
+    if timeframe not in _TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    end_ts = int(time.time())
+    start_ts = end_ts - max(int(lookback_seconds), 0)
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT)
+    try:
+        candles = await _fetch_exchange_candles(
+            client,
+            exchange,
+            symbol,
+            timeframe,
+            start_ts,
+            end_ts,
+        )
+    finally:
+        if own_client and client is not None:
+            await client.aclose()
+    return candles
+
+
 async def _fetch_exchange_candles(
     client: httpx.AsyncClient,
     exchange: ExchangeName,
