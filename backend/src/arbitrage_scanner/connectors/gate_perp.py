@@ -20,7 +20,7 @@ WS_SUB_BATCH = 80
 WS_ORDERBOOK_DEPTH = 30
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
-MIN_SYMBOL_THRESHOLD = 5
+MIN_SYMBOL_THRESHOLD = 1
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ async def _resolve_gate_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
             return filtered
         return sorted(discovered_normalized)
 
-    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+    if not requested:
         return list(FALLBACK_SYMBOLS)
 
     return requested

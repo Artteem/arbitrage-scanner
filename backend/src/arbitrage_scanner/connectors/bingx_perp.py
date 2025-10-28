@@ -25,7 +25,7 @@ WS_ENDPOINTS = (
 WS_SUB_CHUNK = 250
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
-MIN_SYMBOL_THRESHOLD = 5
+MIN_SYMBOL_THRESHOLD = 1
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 _SUBSCRIPTION_LOG_LIMIT = 20
 _WS_PAYLOAD_LOG_LIMIT = 20
@@ -74,7 +74,7 @@ async def _resolve_bingx_symbols(symbols: Sequence[Symbol]) -> tuple[list[Symbol
             return filtered, False
         return sorted(discovered_normalized), False
 
-    if not requested or len(requested) < MIN_SYMBOL_THRESHOLD:
+    if not requested:
         return list(FALLBACK_SYMBOLS), True
 
     return requested, False
