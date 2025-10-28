@@ -340,6 +340,8 @@ const exchangeUrl = (exchange: string, symbol: string) => {
       return `https://futures.mexc.com/exchange/${toMexcSymbol(symbol)}`;
     case 'bingx':
       return `https://bingx.com/en-us/futures/${toBingxSymbol(symbol)}`;
+    case 'gate':
+      return `https://www.gate.io/futures_trade/${toGateSymbol(symbol)}`;
     default:
       return '#';
   }
@@ -359,6 +361,13 @@ const toBingxSymbol = (symbol: string) => {
   if (!quote) return upper;
   const base = upper.slice(0, -quote.length);
   return `${base}-${quote}`;
+};
+
+const toGateSymbol = (symbol: string) => {
+  if (!symbol) return symbol;
+  const upper = symbol.toUpperCase();
+  if (upper.includes('_')) return upper;
+  return upper.endsWith('USDT') ? `${upper.slice(0, -4)}_USDT` : upper;
 };
 
 const getChartColors = (theme: 'dark' | 'light') => {
