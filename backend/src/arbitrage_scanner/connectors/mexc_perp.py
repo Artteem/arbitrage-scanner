@@ -19,6 +19,7 @@ WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
 MIN_SYMBOL_THRESHOLD = 1
+FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 MEXC_HEADERS = {
     "User-Agent": (
@@ -81,7 +82,10 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         )
         return requested
 
-    logger.warning("MEXC discovery unavailable; using fallback symbols", extra={"fallback": FALLBACK_SYMBOLS})
+    logger.warning(
+        "MEXC discovery unavailable; using fallback symbols",
+        extra={"fallback": FALLBACK_SYMBOLS},
+    )
     return list(FALLBACK_SYMBOLS)
 
 
