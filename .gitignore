@@ -1,1 +1,19 @@
-# placeholder to ensure repo root
+# Global ignores
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+
+# Python virtual envs
+.venv/
+venv/
+
+# Node/npm artefacts
+frontend/node_modules/
+frontend/.next/
+
+# Local environment files
+.env
+.env.*
+
+# macOS
+.DS_Store

@@ -2,9 +2,80 @@ from __future__ import annotations
 
 import os
 from functools import cached_property
-from typing import Dict
+from typing import Dict, Iterable, List, Set
 
 from pydantic import BaseModel, Field
+
+
+DEFAULT_ENABLED_EXCHANGES: tuple[str, ...] = (
+    "binance",
+    "bybit",
+    "mexc",
+    "bingx",
+    "gate",
+)
+
+
+def _normalise_exchange(value: str) -> str:
+    return value.strip().lower()
+
+
+def _parse_enabled_exchanges(raw: str | None) -> List[str]:
+    """Parse ``ENABLED_EXCHANGES`` env value preserving order.
+
+    The scanner historically required the environment variable to list every
+    connector explicitly.  When new exchanges were added the existing
+    configuration (often ``binance,bybit`` from ``.env.example``) silently
+    disabled the new connectors.  As a consequence the UI rendered spreads only
+    for Binance↔Bybit pairs.  To keep backwards compatibility we treat the env
+    value as *customisations* on top of the default exchange set: every default
+    exchange remains enabled unless it is explicitly excluded with a ``-name``
+    entry.
+    """
+
+    exclusions: Set[str] = set()
+    inclusions: List[str] = []
+
+    if raw:
+        for item in raw.split(","):
+            if not item:
+                continue
+            token = _normalise_exchange(item)
+            if not token:
+                continue
+            if token in {"all", "*"}:
+                # Explicit request to include defaults; nothing else to do.
+                continue
+            if token.startswith("-"):
+                excluded = token[1:].strip()
+                if excluded:
+                    exclusions.add(excluded)
+                continue
+            inclusions.append(token)
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+
+    def _add(values: Iterable[str]) -> None:
+        for value in values:
+            normalised = _normalise_exchange(value)
+            if not normalised or normalised in exclusions or normalised in seen:
+                continue
+            seen.add(normalised)
+            ordered.append(normalised)
+
+    _add(DEFAULT_ENABLED_EXCHANGES)
+    _add(inclusions)
+
+    return ordered
+
+
+def _build_enabled_exchanges() -> List[str]:
+    env_value = os.getenv("ENABLED_EXCHANGES")
+    enabled = _parse_enabled_exchanges(env_value)
+    if enabled:
+        return enabled
+    return list(DEFAULT_ENABLED_EXCHANGES)
 
 
 class DatabaseSettings(BaseModel):
@@ -21,11 +92,7 @@ class DatabaseSettings(BaseModel):
 
 class Settings(BaseModel):
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    enabled_exchanges: list[str] = [
-        ex.strip()
-        for ex in os.getenv("ENABLED_EXCHANGES", "binance,bybit,mexc,bingx,gate").split(",")
-        if ex.strip()
-    ]
+    enabled_exchanges: list[str] = Field(default_factory=_build_enabled_exchanges)
     http_timeout: int = int(os.getenv("HTTP_TIMEOUT", "10"))
     ws_connect_timeout: int = int(os.getenv("WS_CONNECT_TIMEOUT", "10"))
     app_secret_key: str | None = os.getenv("APP_SECRET_KEY")
