@@ -4,12 +4,13 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .credentials import ApiCreds
 from .discovery import discover_bybit_linear_usdt
 
 WS_ENDPOINT = "wss://stream.bybit.com/v5/public/linear?compress=false"
@@ -88,6 +89,11 @@ async def _run_bybit_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> Non
         except Exception:
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_RECONNECT_MAX)
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    del ws, creds
+    return None
 
 
 def _handle_tickers(store: TickerStore, payload) -> None:

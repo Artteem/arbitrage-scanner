@@ -1,5 +1,6 @@
 from __future__ import annotations
-import asyncio, json, logging, time
+import asyncio, json, logging, math, time
+from datetime import UTC, datetime, timedelta
 from typing import Iterable, Sequence
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
@@ -13,7 +14,12 @@ from .engine.spread_calc import DEFAULT_TAKER_FEES, Row, compute_rows
 from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
+from .connectors.status import get_auth_statuses, get_rest_limit_modes
 from .connectors.discovery import discover_symbols_for_connectors
+from .db.history import load_spread_candles_from_quotes
+from .db.live import RealtimeDatabaseSink
+from .db.session import get_session
+from .db.sync import DataSyncSummary, perform_initial_sync, periodic_history_sync
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
@@ -23,6 +29,9 @@ store = TickerStore()
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
+DATA_SYNC: DataSyncSummary | None = None
+LIVE_SINK: RealtimeDatabaseSink | None = None
+CONTRACT_LOOKUP: dict[tuple[ExchangeName, Symbol], int] = {}
 
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
@@ -47,6 +56,27 @@ TIMEFRAME_ALIASES: dict[str, int] = {
 }
 
 logger = logging.getLogger(__name__)
+
+ORDER_BOOK_POLL_INTERVAL = 0.5
+PAIR_POLL_INTERVAL = 0.5
+
+
+def _build_contract_lookup(summary: DataSyncSummary | None) -> dict[tuple[ExchangeName, Symbol], int]:
+    mapping: dict[tuple[ExchangeName, Symbol], int] = {}
+    if not summary:
+        return mapping
+    for exchange, contracts in summary.contracts.items():
+        for symbol, contract_id in contracts.items():
+            mapping[(exchange.lower(), symbol.upper())] = contract_id
+    return mapping
+
+
+async def _on_sync_summary(summary: DataSyncSummary) -> None:
+    global DATA_SYNC, CONTRACT_LOOKUP
+    DATA_SYNC = summary
+    CONTRACT_LOOKUP = _build_contract_lookup(summary)
+    if LIVE_SINK is not None:
+        LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
 
 
 def _parse_timeframe(value: str | int) -> int:
@@ -122,22 +152,54 @@ async def _spread_loop() -> None:
 
 @app.on_event("startup")
 async def startup():
-    # 1) Автоматически найдём пересечение USDT-перпетуалов
-    global SYMBOLS, CONNECTOR_SYMBOLS
+    # 1) Синхронизируем метаданные бирж и исторические данные
+    global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC, LIVE_SINK, CONTRACT_LOOKUP
+    metadata_summary: DataSyncSummary | None = None
     try:
-        discovery = await discover_symbols_for_connectors(CONNECTORS)
-        if discovery.symbols_union:
-            SYMBOLS = discovery.symbols_union
-            CONNECTOR_SYMBOLS = discovery.per_connector
-        else:
+        metadata_summary = await perform_initial_sync(CONNECTORS)
+        DATA_SYNC = metadata_summary
+    except Exception:  # noqa: BLE001 - логируем и продолжаем с фоллбеком
+        logger.exception("Initial database synchronization failed")
+        metadata_summary = None
+
+    if metadata_summary is not None:
+        await _on_sync_summary(metadata_summary)
+    else:
+        CONTRACT_LOOKUP = {}
+
+    if LIVE_SINK is None:
+        LIVE_SINK = RealtimeDatabaseSink(
+            max_order_book_levels=getattr(store, "_max_levels", 50),
+        )
+    LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
+    LIVE_SINK.start()
+    store.set_persistence(LIVE_SINK)
+
+    if metadata_summary and metadata_summary.symbols_union:
+        SYMBOLS = metadata_summary.symbols_union
+        CONNECTOR_SYMBOLS = {
+            spec.name: metadata_summary.per_exchange.get(spec.name, metadata_summary.symbols_union)
+            for spec in CONNECTORS
+        }
+    else:
+        try:
+            discovery = await discover_symbols_for_connectors(CONNECTORS)
+            if discovery.symbols_union:
+                SYMBOLS = discovery.symbols_union
+                CONNECTOR_SYMBOLS = discovery.per_connector
+            else:
+                SYMBOLS = FALLBACK_SYMBOLS
+                CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
+        except Exception:
             SYMBOLS = FALLBACK_SYMBOLS
             CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
-    except Exception:
-        # Фоллбек: базовый набор
-        SYMBOLS = FALLBACK_SYMBOLS
-        CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
-    # 2) Запустим ридеры бирж
+    # 2) Запустим периодическую синхронизацию истории
+    _tasks.append(
+        asyncio.create_task(periodic_history_sync(CONNECTORS, on_summary=_on_sync_summary))
+    )
+
+    # 3) Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
@@ -149,11 +211,22 @@ async def shutdown():
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    if LIVE_SINK is not None:
+        await LIVE_SINK.close()
+        store.set_persistence(None)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "env": settings.model_dump(), "symbols": SYMBOLS}
+    auth_status = await get_auth_statuses()
+    rest_modes = get_rest_limit_modes()
+    return {
+        "status": "ok",
+        "env": settings.model_dump(),
+        "symbols": SYMBOLS,
+        "auth_status": auth_status,
+        "rest_limit": rest_modes,
+    }
 
 
 def _stats_payload() -> dict:
@@ -165,6 +238,7 @@ def _stats_payload() -> dict:
         "exchanges": EXCHANGES,
         "ticker_updates": metrics.get("ticker_updates", 0),
         "order_book_updates": metrics.get("order_book_updates", 0),
+        "rest_limit": get_rest_limit_modes(),
     }
 
 
@@ -176,6 +250,19 @@ async def stats():
 @app.get("/api/stats")
 async def api_stats():
     return _stats_payload()
+
+
+def _serialize_pair_entry(entry: dict | None) -> dict | None:
+    if not entry:
+        return None
+    ticker = entry.get("ticker")
+    funding = entry.get("funding")
+    order_book = entry.get("order_book")
+    return {
+        "ticker": ticker.to_dict() if ticker else None,
+        "funding": funding.to_dict() if funding else None,
+        "order_book": order_book.to_dict() if order_book else None,
+    }
 
 
 @app.get("/ui")
@@ -213,69 +300,129 @@ async def pair_spreads(
     symbol_upper = symbol.upper()
     long_key = long_exchange.lower()
     short_key = short_exchange.lower()
-    candles = SPREAD_HISTORY.get_candles(
-        metric_key,
-        symbol=symbol_upper,
-        long_exchange=long_key,
-        short_exchange=short_key,
-        timeframe=tf_value,
-    )
-    need_backfill = not candles
-    if lookback_days:
-        cutoff_ts = int(time.time() - lookback_days * 86400)
-        if candles and candles[0].start_ts > cutoff_ts:
-            need_backfill = True
-    if need_backfill:
-        now = time.time()
-        rows = _rows_for_symbol(symbol)
-        if rows:
-            for row in rows:
-                SPREAD_HISTORY.add_point(
-                    symbol=row.symbol,
-                    long_exchange=row.long_ex,
-                    short_exchange=row.short_ex,
-                    entry_value=row.entry_pct,
-                    exit_value=row.exit_pct,
-                    ts=now,
-                )
+    now_dt = datetime.now(tz=UTC)
+    if lookback_days > 0:
+        lookback_seconds = int(lookback_days * 86400)
+    else:
+        lookback_seconds = tf_value * 10
+    lookback_seconds = max(lookback_seconds, tf_value)
+    start_dt = now_dt - timedelta(seconds=lookback_seconds)
+
+    entry_series: list = []
+    exit_series: list = []
+
+    long_contract_id = CONTRACT_LOOKUP.get((long_key, symbol_upper))
+    short_contract_id = CONTRACT_LOOKUP.get((short_key, symbol_upper))
+    if long_contract_id and short_contract_id:
         try:
-            entry_hist, exit_hist = await fetch_spread_history(
+            async with get_session() as session:
+                series = await load_spread_candles_from_quotes(
+                    session,
+                    long_contract_id=long_contract_id,
+                    short_contract_id=short_contract_id,
+                    timeframe_seconds=tf_value,
+                    start=start_dt,
+                    end=now_dt,
+                )
+            entry_series = list(series.entry)
+            exit_series = list(series.exit)
+        except Exception:
+            logger.exception("Failed to load spread candles from database", exc_info=True)
+            entry_series = []
+            exit_series = []
+
+    if not entry_series and not exit_series:
+        entry_series = list(
+            SPREAD_HISTORY.get_candles(
+                "entry",
                 symbol=symbol_upper,
                 long_exchange=long_key,
                 short_exchange=short_key,
-                timeframe_seconds=tf_value,
-                lookback_days=max(lookback_days, 1.0),
+                timeframe=tf_value,
             )
-            if entry_hist:
-                SPREAD_HISTORY.merge_external(
+        )
+        exit_series = list(
+            SPREAD_HISTORY.get_candles(
+                "exit",
+                symbol=symbol_upper,
+                long_exchange=long_key,
+                short_exchange=short_key,
+                timeframe=tf_value,
+            )
+        )
+
+        need_backfill = not entry_series or not exit_series
+        cutoff_ts = int(now_dt.timestamp()) - lookback_seconds
+        if entry_series and entry_series[0].start_ts > cutoff_ts:
+            need_backfill = True
+        if exit_series and exit_series[0].start_ts > cutoff_ts:
+            need_backfill = True
+
+        if need_backfill:
+            now_ts = now_dt.timestamp()
+            rows = _rows_for_symbol(symbol)
+            if rows:
+                for row in rows:
+                    SPREAD_HISTORY.add_point(
+                        symbol=row.symbol,
+                        long_exchange=row.long_ex,
+                        short_exchange=row.short_ex,
+                        entry_value=row.entry_pct,
+                        exit_value=row.exit_pct,
+                        ts=now_ts,
+                    )
+            try:
+                entry_hist, exit_hist = await fetch_spread_history(
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe_seconds=tf_value,
+                    lookback_days=max(lookback_days, 1.0),
+                )
+                if entry_hist:
+                    SPREAD_HISTORY.merge_external(
+                        "entry",
+                        symbol=symbol_upper,
+                        long_exchange=long_key,
+                        short_exchange=short_key,
+                        timeframe=tf_value,
+                        candles=entry_hist,
+                    )
+                if exit_hist:
+                    SPREAD_HISTORY.merge_external(
+                        "exit",
+                        symbol=symbol_upper,
+                        long_exchange=long_key,
+                        short_exchange=short_key,
+                        timeframe=tf_value,
+                        candles=exit_hist,
+                    )
+            except Exception:
+                logger.exception("Failed to backfill spread history", exc_info=True)
+            entry_series = list(
+                SPREAD_HISTORY.get_candles(
                     "entry",
                     symbol=symbol_upper,
                     long_exchange=long_key,
                     short_exchange=short_key,
                     timeframe=tf_value,
-                    candles=entry_hist,
                 )
-            if exit_hist:
-                SPREAD_HISTORY.merge_external(
+            )
+            exit_series = list(
+                SPREAD_HISTORY.get_candles(
                     "exit",
                     symbol=symbol_upper,
                     long_exchange=long_key,
                     short_exchange=short_key,
                     timeframe=tf_value,
-                    candles=exit_hist,
                 )
-        except Exception:
-            logger.exception("Failed to backfill spread history", exc_info=True)
-        candles = SPREAD_HISTORY.get_candles(
-            metric_key,
-            symbol=symbol_upper,
-            long_exchange=long_key,
-            short_exchange=short_key,
-            timeframe=tf_value,
-        )
-    if lookback_days:
-        cutoff_ts = int(time.time() - lookback_days * 86400)
-        candles = [c for c in candles if c.start_ts >= cutoff_ts]
+            )
+
+    cutoff_ts = int(now_dt.timestamp()) - lookback_seconds
+    entry_series = [c for c in entry_series if c.start_ts >= cutoff_ts]
+    exit_series = [c for c in exit_series if c.start_ts >= cutoff_ts]
+
+    candles = entry_series if metric_key == "entry" else exit_series
     return {
         "symbol": symbol_upper,
         "long": long_key,
@@ -305,7 +452,10 @@ async def pair_realtime(
     symbol: str,
     long_exchange: str = Query(..., alias="long"),
     short_exchange: str = Query(..., alias="short"),
+    volume: float | None = Query(None, ge=0.0),
 ):
+    if volume is not None and not math.isfinite(volume):
+        raise HTTPException(status_code=400, detail="volume must be finite")
     rows = _rows_for_symbol(symbol)
     long_key = long_exchange.lower()
     short_key = short_exchange.lower()
@@ -313,7 +463,7 @@ async def pair_realtime(
     payload: dict[str, object] | None = None
     for row in rows:
         if row.long_ex.lower() == long_key and row.short_ex.lower() == short_key:
-            payload = row.as_dict()
+            payload = row.as_dict(volume_usdt=volume)
             if payload is not None:
                 payload["_ts"] = ts
             break
@@ -321,6 +471,7 @@ async def pair_realtime(
         "symbol": symbol.upper(),
         "long_exchange": long_key,
         "short_exchange": short_key,
+        "volume": volume,
         "ts": ts,
         "row": payload,
     }
@@ -364,6 +515,129 @@ async def ws_spreads(ws: WebSocket):
     except WebSocketDisconnect:
         return
     except Exception:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/orderbook")
+async def ws_orderbook(ws: WebSocket):
+    await ws.accept()
+    symbol = (ws.query_params.get("symbol") or "").upper()
+    exchange = (ws.query_params.get("exchange") or "").lower()
+    if not symbol or not exchange:
+        await ws.close(code=4400, reason="symbol and exchange query params are required")
+        return
+
+    last_payload: str | None = None
+    try:
+        while True:
+            snapshot = store.get_order_book(exchange, symbol)
+            payload = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "order_book": snapshot.to_dict() if snapshot else None,
+            }
+            message = json.dumps(payload)
+            if message != last_payload:
+                await ws.send_text(message)
+                last_payload = message
+            await asyncio.sleep(ORDER_BOOK_POLL_INTERVAL)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        logger.exception("Order book websocket failed", exc_info=True)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/pair")
+async def ws_pair(ws: WebSocket):
+    await ws.accept()
+    symbol = (ws.query_params.get("symbol") or "").upper()
+    long_exchange = (ws.query_params.get("long") or "").lower()
+    short_exchange = (ws.query_params.get("short") or "").lower()
+    volume_param = ws.query_params.get("volume")
+    volume: float | None
+    if volume_param is None or volume_param == "":
+        volume = None
+    else:
+        try:
+            volume = float(volume_param)
+        except ValueError:
+            await ws.close(code=4400, reason="invalid volume")
+            return
+        if not math.isfinite(volume) or volume < 0:
+            await ws.close(code=4400, reason="volume must be non-negative")
+            return
+    if not symbol or not long_exchange or not short_exchange:
+        await ws.close(code=4400, reason="symbol, long and short query params are required")
+        return
+
+    last_payload: str | None = None
+    try:
+        while True:
+            rows = _rows_for_symbol(symbol)
+            ts = LAST_ROWS_TS if LAST_ROWS else time.time()
+            row_payload: dict | None = None
+            for row in rows:
+                if row.long_ex.lower() == long_exchange and row.short_ex.lower() == short_exchange:
+                    row_payload = row.as_dict(volume_usdt=volume)
+                    if row_payload is not None:
+                        row_payload["_ts"] = ts
+                    break
+
+            symbol_state = store.by_symbol(symbol)
+            long_state_raw = symbol_state.get(long_exchange)
+            short_state_raw = symbol_state.get(short_exchange)
+            long_state = _serialize_pair_entry(long_state_raw)
+            short_state = _serialize_pair_entry(short_state_raw)
+
+            funding_spread: float | None = None
+            long_funding = long_state_raw.get("funding") if long_state_raw else None
+            short_funding = short_state_raw.get("funding") if short_state_raw else None
+            if long_funding and short_funding:
+                try:
+                    funding_spread = float(long_funding.rate) - float(short_funding.rate)
+                except Exception:
+                    funding_spread = None
+
+            history_point: dict | None = None
+            if row_payload is not None:
+                entry_value = row_payload.get("entry_pct")
+                exit_value = row_payload.get("exit_pct")
+                if isinstance(entry_value, (float, int)) and isinstance(exit_value, (float, int)):
+                    history_point = {
+                        "ts": ts,
+                        "entry_pct": float(entry_value),
+                        "exit_pct": float(exit_value),
+                    }
+
+            payload = {
+                "symbol": symbol,
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "volume": volume,
+                "row": row_payload,
+                "long": long_state,
+                "short": short_state,
+                "funding_spread": funding_spread,
+                "history_point": history_point,
+                "ts": ts,
+            }
+
+            message = json.dumps(payload)
+            if message != last_payload:
+                await ws.send_text(message)
+                last_payload = message
+            await asyncio.sleep(PAIR_POLL_INTERVAL)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        logger.exception("Pair websocket failed", exc_info=True)
         try:
             await ws.close()
         except Exception:
