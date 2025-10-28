@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from urllib.parse import urlparse
 
 import httpx
 
+from ..settings import settings
 from .base import ConnectorContract, ConnectorFundingRate, ConnectorQuote
+from .credentials import get_credentials_provider
 from .normalization import normalize_gate_symbol
+from .signing import sign_request
 from ..domain import Symbol
 
 logger = logging.getLogger(__name__)
@@ -26,10 +30,43 @@ _HEADERS = {
     "Referer": "https://www.gate.io/",
 }
 _DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=10.0, read=20.0, write=20.0)
+_PROXIES = settings.httpx_proxies
+_PATH_CONTRACTS = urlparse(_GATE_CONTRACTS).path
+_PATH_CANDLES = urlparse(_GATE_CANDLES).path
+_PATH_FUNDING = urlparse(_GATE_FUNDING).path
 _FUNDING_INTERVAL = "8h"
 
 _CONTRACT_CACHE: Dict[Symbol, ConnectorContract] = {}
 _TAKER_FEES: Dict[Symbol, float] = {}
+
+
+async def _signed_get(
+    client: httpx.AsyncClient,
+    url: str,
+    path: str,
+    params: dict | None = None,
+):
+    provider = get_credentials_provider()
+    creds = provider.get("gate") if provider else None
+    if not creds:
+        if provider:
+            logger.debug("Gate credentials missing, using public REST endpoints")
+        return await client.get(url, params=params)
+
+    query_params = dict(params or {})
+    headers, query_string = sign_request("gate", "GET", path, query_params, None, creds)
+    request_headers = dict(client.headers)
+    request_headers.update(headers)
+    base_url = url.split("?")[0]
+    target_url = f"{base_url}?{query_string}" if query_string else base_url
+    response = await client.get(target_url, headers=request_headers)
+    if response.status_code in {401, 403}:
+        logger.warning(
+            "Gate authenticated request failed with %s, retrying without credentials",
+            response.status_code,
+        )
+        return await client.get(url, params=params)
+    return response
 
 
 def _cache_contracts(contracts: List[ConnectorContract], taker_fees: Dict[Symbol, float]) -> None:
@@ -53,8 +90,10 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 
 async def get_gate_contracts() -> List[ConnectorContract]:
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, headers=_HEADERS) as client:
-        response = await client.get(_GATE_CONTRACTS)
+    async with httpx.AsyncClient(
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, proxies=_PROXIES
+    ) as client:
+        response = await _signed_get(client, _GATE_CONTRACTS, _PATH_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
 
@@ -136,8 +175,10 @@ async def get_gate_historical_quotes(
     }
     quotes: List[ConnectorQuote] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, headers=_HEADERS) as client:
-        response = await client.get(_GATE_CANDLES, params=params)
+    async with httpx.AsyncClient(
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, proxies=_PROXIES
+    ) as client:
+        response = await _signed_get(client, _GATE_CANDLES, _PATH_CANDLES, params=params)
         response.raise_for_status()
         data = response.json()
     if not isinstance(data, list):
@@ -174,8 +215,10 @@ async def get_gate_funding_history(
     }
     funding: List[ConnectorFundingRate] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, headers=_HEADERS) as client:
-        response = await client.get(_GATE_FUNDING, params=params)
+    async with httpx.AsyncClient(
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, proxies=_PROXIES
+    ) as client:
+        response = await _signed_get(client, _GATE_FUNDING, _PATH_FUNDING, params=params)
         response.raise_for_status()
         data = response.json()
     if not isinstance(data, list):
