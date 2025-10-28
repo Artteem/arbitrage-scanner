@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from urllib.parse import urlparse
 
 import httpx
 
+from ..settings import settings
 from .base import ConnectorContract, ConnectorFundingRate, ConnectorQuote
+from .credentials import get_credentials_provider
 from .normalization import normalize_mexc_symbol
+from .signing import sign_request
 from ..domain import Symbol
 
 logger = logging.getLogger(__name__)
@@ -16,11 +20,43 @@ _MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 _MEXC_KLINE_TEMPLATE = "https://contract.mexc.com/api/v1/contract/kline/{symbol}"
 _MEXC_FUNDING = "https://contract.mexc.com/api/v1/contract/fundingRate"
 _DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=10.0, read=20.0, write=20.0)
+_PROXIES = settings.httpx_proxies
+_PATH_CONTRACTS = urlparse(_MEXC_CONTRACTS).path
+_PATH_FUNDING = urlparse(_MEXC_FUNDING).path
 _INTERVAL = "Min1"
 _FUNDING_INTERVAL = "8h"
 
 _CONTRACT_CACHE: Dict[Symbol, ConnectorContract] = {}
 _TAKER_FEES: Dict[Symbol, float] = {}
+
+
+async def _signed_get(
+    client: httpx.AsyncClient,
+    url: str,
+    path: str,
+    params: dict | None = None,
+):
+    provider = get_credentials_provider()
+    creds = provider.get("mexc") if provider else None
+    if not creds:
+        if provider:
+            logger.debug("MEXC credentials missing, using public REST endpoints")
+        return await client.get(url, params=params)
+
+    query_params = dict(params or {})
+    headers, query_string = sign_request("mexc", "GET", path, query_params, None, creds)
+    request_headers = dict(client.headers)
+    request_headers.update(headers)
+    base_url = url.split("?")[0]
+    target_url = f"{base_url}?{query_string}" if query_string else base_url
+    response = await client.get(target_url, headers=request_headers)
+    if response.status_code in {401, 403}:
+        logger.warning(
+            "MEXC authenticated request failed with %s, retrying without credentials",
+            response.status_code,
+        )
+        return await client.get(url, params=params)
+    return response
 
 
 def _cache_contracts(contracts: List[ConnectorContract], taker_fees: Dict[Symbol, float]) -> None:
@@ -44,8 +80,8 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 
 async def get_mexc_contracts() -> List[ConnectorContract]:
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-        response = await client.get(_MEXC_CONTRACTS)
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+        response = await _signed_get(client, _MEXC_CONTRACTS, _PATH_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
 
@@ -128,8 +164,9 @@ async def get_mexc_historical_quotes(
     }
     quotes: List[ConnectorQuote] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-        response = await client.get(_MEXC_KLINE_TEMPLATE.format(symbol=api_symbol), params=params)
+    url = _MEXC_KLINE_TEMPLATE.format(symbol=api_symbol)
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+        response = await _signed_get(client, url, urlparse(url).path, params=params)
         response.raise_for_status()
         payload = response.json()
     data = payload.get("data", []) if isinstance(payload, dict) else []
@@ -164,8 +201,8 @@ async def get_mexc_funding_history(
     }
     funding: List[ConnectorFundingRate] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-        response = await client.get(_MEXC_FUNDING, params=params)
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+        response = await _signed_get(client, _MEXC_FUNDING, _PATH_FUNDING, params=params)
         response.raise_for_status()
         payload = response.json()
     data = payload.get("data", []) if isinstance(payload, dict) else []

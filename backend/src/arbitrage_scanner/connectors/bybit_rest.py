@@ -3,11 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from urllib.parse import urlparse
 
 import httpx
 
+from ..settings import settings
 from .base import ConnectorContract, ConnectorFundingRate, ConnectorQuote
+from .credentials import get_credentials_provider
 from .normalization import normalize_bybit_symbol
+from .signing import sign_request
 from ..domain import Symbol
 
 logger = logging.getLogger(__name__)
@@ -16,12 +20,43 @@ _BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info"
 _BYBIT_KLINE = "https://api.bybit.com/v5/market/kline"
 _BYBIT_FUNDING = "https://api.bybit.com/v5/market/funding/history"
 _DEFAULT_TIMEOUT = httpx.Timeout(20.0, connect=10.0, read=20.0, write=20.0)
+_PROXIES = settings.httpx_proxies
+_PATH_INSTRUMENTS = urlparse(_BYBIT_INSTRUMENTS).path
+_PATH_KLINE = urlparse(_BYBIT_KLINE).path
+_PATH_FUNDING = urlparse(_BYBIT_FUNDING).path
 _CATEGORY = "linear"
 _DEFAULT_INTERVAL = "1"
 _FUNDING_INTERVAL = "8h"
 
 _CONTRACT_CACHE: Dict[Symbol, ConnectorContract] = {}
 _TAKER_FEES: Dict[Symbol, float] = {}
+
+
+async def _signed_get(
+    client: httpx.AsyncClient,
+    url: str,
+    path: str,
+    params: dict | None = None,
+):
+    provider = get_credentials_provider()
+    creds = provider.get("bybit") if provider else None
+    if not creds:
+        if provider:
+            logger.debug("Bybit credentials missing, using public REST endpoints")
+        return await client.get(url, params=params)
+
+    query_params = dict(params or {})
+    headers, _ = sign_request("bybit", "GET", path, query_params, None, creds)
+    request_headers = dict(client.headers)
+    request_headers.update(headers)
+    response = await client.get(url, params=params, headers=request_headers)
+    if response.status_code in {401, 403}:
+        logger.warning(
+            "Bybit authenticated request failed with %s, retrying without credentials",
+            response.status_code,
+        )
+        return await client.get(url, params=params)
+    return response
 
 
 def _cache_contracts(contracts: List[ConnectorContract], taker_fees: Dict[Symbol, float]) -> None:
@@ -43,8 +78,8 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 async def get_bybit_contracts() -> List[ConnectorContract]:
     params = {"category": _CATEGORY, "limit": 1000}
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-        response = await client.get(_BYBIT_INSTRUMENTS, params=params)
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+        response = await _signed_get(client, _BYBIT_INSTRUMENTS, _PATH_INSTRUMENTS, params=params)
         response.raise_for_status()
         payload = response.json()
 
@@ -136,11 +171,11 @@ async def get_bybit_historical_quotes(
     }
     quotes: List[ConnectorQuote] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
         cursor = params["start"]
         while cursor < params["end"]:
             params["start"] = cursor
-            response = await client.get(_BYBIT_KLINE, params=params)
+            response = await _signed_get(client, _BYBIT_KLINE, _PATH_KLINE, params=params)
             response.raise_for_status()
             payload = response.json()
             data = payload.get("result", {}).get("list", []) if isinstance(payload, dict) else []
@@ -188,11 +223,11 @@ async def get_bybit_funding_history(
     }
     funding: List[ConnectorFundingRate] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
         cursor = params["start"]
         while cursor < params["end"]:
             params["start"] = cursor
-            response = await client.get(_BYBIT_FUNDING, params=params)
+            response = await _signed_get(client, _BYBIT_FUNDING, _PATH_FUNDING, params=params)
             response.raise_for_status()
             payload = response.json()
             data = payload.get("result", {}).get("list", []) if isinstance(payload, dict) else []

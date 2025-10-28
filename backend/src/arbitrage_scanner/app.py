@@ -14,6 +14,7 @@ from .engine.spread_calc import DEFAULT_TAKER_FEES, Row, compute_rows
 from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
+from .connectors.status import get_auth_statuses, get_rest_limit_modes
 from .connectors.discovery import discover_symbols_for_connectors
 from .db.history import load_spread_candles_from_quotes
 from .db.live import RealtimeDatabaseSink
@@ -217,7 +218,15 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "env": settings.model_dump(), "symbols": SYMBOLS}
+    auth_status = await get_auth_statuses()
+    rest_modes = get_rest_limit_modes()
+    return {
+        "status": "ok",
+        "env": settings.model_dump(),
+        "symbols": SYMBOLS,
+        "auth_status": auth_status,
+        "rest_limit": rest_modes,
+    }
 
 
 def _stats_payload() -> dict:
@@ -229,6 +238,7 @@ def _stats_payload() -> dict:
         "exchanges": EXCHANGES,
         "ticker_updates": metrics.get("ticker_updates", 0),
         "order_book_updates": metrics.get("order_book_updates", 0),
+        "rest_limit": get_rest_limit_modes(),
     }
 
 

@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Dict, Iterable, Sequence
+from typing import Any, Dict, Iterable, Sequence
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .credentials import ApiCreds
 from .discovery import discover_binance_usdt_perp
 
 WS_BASE = "wss://fstream.binance.com/stream"
@@ -111,6 +112,11 @@ async def _run_binance_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> N
         except Exception:
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_RECONNECT_MAX)
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    del ws, creds
+    return None
 
 
 def _dispatch_stream(

@@ -6,13 +6,14 @@ import json
 import logging
 import time
 import zlib
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
+from .credentials import ApiCreds
 from .discovery import discover_bingx_usdt_perp
 
 logger = logging.getLogger(__name__)
@@ -898,3 +899,9 @@ def _extract_topic_symbol(data_type) -> str | None:
 
 
 
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    """Placeholder for future authenticated BingX channels."""
+    del ws, creds
+    return None

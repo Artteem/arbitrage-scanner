@@ -5,12 +5,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
@@ -600,3 +601,9 @@ class _MexcOrderBookState:
             side.clear()
             side.update(trimmed)
 
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    """Placeholder for future authenticated MEXC channels."""
+    del ws, creds
+    return None
