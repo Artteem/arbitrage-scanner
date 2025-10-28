@@ -6,12 +6,13 @@ import json
 import logging
 import time
 import zlib
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .credentials import ApiCreds
 from .discovery import GATE_HEADERS, discover_gate_usdt_perp
 
 WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
@@ -499,3 +500,9 @@ def _handle_orderbook(store: TickerStore, payload) -> None:
             last_price_ts=now if last_price > 0 else None,
         )
 
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    """Placeholder for future authenticated Gate channels."""
+    del ws, creds
+    return None

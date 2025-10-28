@@ -5,12 +5,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
+from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
@@ -38,26 +39,6 @@ def _normalize_common_symbol(symbol: Symbol) -> str:
 
 
 async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
-    try:
-        discovered = await discover_mexc_usdt_perp()
-    except Exception:
-        logger.exception("Failed to discover MEXC symbols")
-        return []
-
-    if not discovered:
-        logger.error("MEXC discovery returned no USDT perpetual symbols; connector disabled")
-        return []
-
-    discovered_normalized: dict[str, Symbol] = {}
-    for sym in discovered:
-        normalized = _normalize_common_symbol(sym)
-        if normalized and normalized not in discovered_normalized:
-            discovered_normalized[normalized] = normalized
-
-    if not discovered_normalized:
-        logger.error("MEXC discovery produced no usable symbols; connector disabled")
-        return []
-
     requested: list[Symbol] = []
     seen: set[str] = set()
     for symbol in symbols:
@@ -69,18 +50,39 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         seen.add(normalized)
         requested.append(normalized)
 
-    if not requested:
-        return sorted(discovered_normalized.keys())
+    try:
+        discovered = await discover_mexc_usdt_perp()
+    except Exception:
+        logger.exception("Failed to discover MEXC symbols; falling back to configured list")
+        discovered = set()
 
-    filtered = [symbol for symbol in requested if symbol in discovered_normalized]
-    if not filtered:
+    discovered_normalized: dict[str, Symbol] = {}
+    for sym in discovered:
+        normalized = _normalize_common_symbol(sym)
+        if normalized and normalized not in discovered_normalized:
+            discovered_normalized[normalized] = normalized
+
+    if discovered_normalized:
+        if not requested:
+            return sorted(discovered_normalized.keys())
+        filtered = [symbol for symbol in requested if symbol in discovered_normalized]
+        if filtered:
+            return filtered
         logger.warning(
-            "Requested symbols are unavailable on MEXC; nothing to subscribe",
+            "Requested symbols are unavailable on MEXC; using discovered symbols",
             extra={"requested": requested},
         )
-        return []
+        return sorted(discovered_normalized.keys())
 
-    return filtered
+    if requested:
+        logger.warning(
+            "MEXC discovery unavailable; using configured symbol list",
+            extra={"requested": requested},
+        )
+        return requested
+
+    logger.warning("MEXC discovery unavailable; using fallback symbols", extra={"fallback": FALLBACK_SYMBOLS})
+    return list(FALLBACK_SYMBOLS)
 
 
 def _as_float(value) -> float:
@@ -600,3 +602,9 @@ class _MexcOrderBookState:
             side.clear()
             side.update(trimmed)
 
+
+
+async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
+    """Placeholder for future authenticated MEXC channels."""
+    del ws, creds
+    return None

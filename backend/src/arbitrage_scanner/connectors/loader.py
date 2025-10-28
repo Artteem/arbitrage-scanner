@@ -3,10 +3,13 @@ from __future__ import annotations
 import importlib
 from typing import Iterable, List
 
+from ..settings import settings
 from .base import ConnectorSpec
+from .credentials import CredentialsProvider, set_credentials_provider
 
 
 def load_connectors(enabled: Iterable[str]) -> List[ConnectorSpec]:
+    set_credentials_provider(CredentialsProvider(settings))
     connectors: List[ConnectorSpec] = []
     for raw_name in enabled:
         name = raw_name.strip()
