@@ -171,6 +171,12 @@ class TickerStore:
             "order_book_updates": self._order_book_updates,
         }
 
+    def stats_by_exchange(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for (ex, _), _ticker in self._latest.items():
+            counts[ex] = counts.get(ex, 0) + 1
+        return counts
+
     def snapshot(self) -> Dict[str, dict]:
         out: Dict[str, dict] = {}
         for (ex, sym), t in self._latest.items():

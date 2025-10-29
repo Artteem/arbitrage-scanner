@@ -235,6 +235,7 @@ def _stats_payload() -> dict:
     return {
         "symbols_subscribed": SYMBOLS,
         "tickers_in_store": len(snap),
+        "tickers_per_exchange": store.stats_by_exchange(),
         "exchanges": EXCHANGES,
         "ticker_updates": metrics.get("ticker_updates", 0),
         "order_book_updates": metrics.get("order_book_updates", 0),
