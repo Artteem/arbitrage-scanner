@@ -213,6 +213,9 @@ async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
     async for ws in _reconnect_ws():
         try:
+            if not await _perform_initial_ping(ws):
+                continue
+
             await _send_subscriptions(ws, payload)
 
             async for raw in ws:
@@ -255,6 +258,7 @@ async def _reconnect_ws():
                 ping_timeout=20,
                 close_timeout=5,
                 extra_headers=GATE_HEADERS,
+                compression=None,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -332,6 +336,57 @@ def _decode_zlib(data: bytes) -> str:
     if len(data) < 2 or data[0] != 0x78:
         raise ValueError("not zlib")
     return zlib.decompress(data).decode("utf-8")
+
+
+async def _perform_initial_ping(ws) -> bool:
+    message = {
+        "time": int(time.time()),
+        "channel": "futures.ping",
+        "event": "ping",
+    }
+
+    try:
+        await ws.send(json.dumps(message))
+    except Exception:
+        return False
+
+    while True:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        except asyncio.TimeoutError:
+            return False
+        except Exception:
+            return False
+
+        payload = _decode_ws_message(raw)
+        if payload is None:
+            continue
+
+        event = str(payload.get("event") or "").lower()
+        channel = str(payload.get("channel") or "")
+
+        if event == "pong" or channel == "futures.ping":
+            return True
+
+        if event == "ping" or channel.endswith(".ping"):
+            reply = {
+                "time": int(time.time()),
+                "channel": channel or "futures.ping",
+                "event": "pong",
+            }
+            try:
+                await ws.send(json.dumps(reply))
+            except Exception:
+                return False
+            if event == "ping" and channel == "futures.ping":
+                continue
+            if event == "pong" or channel == "futures.ping":
+                return True
+
+        if event in {"subscribe", "unsubscribe"}:
+            continue
+
+        # Unexpected message before handshake; continue waiting.
 
 
 async def _handle_ping(ws, message: dict) -> bool:

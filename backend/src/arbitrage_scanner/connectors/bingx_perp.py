@@ -200,7 +200,11 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         tasks: list[asyncio.Task] = []
 
         if subscribe_all:
-            tasks.append(asyncio.create_task(_run_bingx_all_tickers(store, subscribe)))
+            tasks.append(
+                asyncio.create_task(
+                    _run_bingx_all_tickers(store, subscribe, filter_symbols=False)
+                )
+            )
 
         for chunk in chunks:
             tasks.append(asyncio.create_task(_run_bingx_ws(store, chunk)))
@@ -356,8 +360,10 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             continue
 
 
-async def _run_bingx_all_tickers(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    wanted_common = _collect_wanted_common(symbols)
+async def _run_bingx_all_tickers(
+    store: TickerStore, symbols: Sequence[Symbol], *, filter_symbols: bool = True
+) -> None:
+    wanted_common = _collect_wanted_common(symbols) if filter_symbols else set()
     ws_symbols = ["ALL"]
 
     async for ws in _reconnect_ws():
@@ -374,7 +380,8 @@ async def _run_bingx_all_tickers(store: TickerStore, symbols: Sequence[Symbol]) 
                     continue
 
                 now = time.time()
-                for common_symbol, payload in _iter_ws_payloads(msg, wanted_common or None):
+                symbol_filter = wanted_common if filter_symbols and wanted_common else None
+                for common_symbol, payload in _iter_ws_payloads(msg, symbol_filter):
                     if not payload:
                         continue
 
