@@ -14,6 +14,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import GATE_HEADERS, discover_gate_usdt_perp
+from .normalization import normalize_gate_symbol
 
 WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 WS_SUB_BATCH = 80
@@ -76,9 +77,7 @@ def _to_gate_symbol(symbol: Symbol) -> str:
 
 
 def _from_gate_symbol(symbol: str | None) -> Symbol | None:
-    if not symbol:
-        return None
-    return symbol.replace("-", "").replace("_", "")
+    return normalize_gate_symbol(symbol)
 
 
 def _as_float(value) -> float:
