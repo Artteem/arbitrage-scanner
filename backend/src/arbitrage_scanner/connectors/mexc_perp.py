@@ -164,8 +164,16 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 
 
 async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    wanted_exchange = [_to_mexc_symbol(sym) for sym in symbols if sym]
-    wanted_exchange = [sym for sym in wanted_exchange if sym]
+    symbol_pairs: list[tuple[str, str]] = []
+    for sym in symbols:
+        if not sym:
+            continue
+        native = _to_mexc_symbol(sym)
+        if not native:
+            continue
+        symbol_pairs.append((str(sym), native))
+
+    wanted_exchange = [native for _, native in symbol_pairs]
     if not wanted_exchange:
         return
 
@@ -178,7 +186,7 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
     async for ws in _reconnect_ws():
         try:
-            await _send_mexc_subscriptions(ws, wanted_exchange)
+            await _send_mexc_subscriptions(ws, symbol_pairs)
 
             async for raw in ws:
                 msg = _decode_ws_message(raw)
@@ -295,14 +303,29 @@ async def _reconnect_ws():
             delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
-async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
+async def _send_mexc_subscriptions(
+    ws, symbols: Sequence[tuple[str, str]]
+) -> None:
     if not symbols:
+        return
+
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for common, native in symbols:
+        if not native:
+            continue
+        if native in seen:
+            continue
+        seen.add(native)
+        unique.append((common, native))
+
+    if not unique:
         return
 
     base_id = int(time.time() * 1_000)
     payloads: list[dict] = []
 
-    ticker_symbols = list(dict.fromkeys(sym for sym in symbols if sym))
+    ticker_symbols = [native for _, native in unique]
     if ticker_symbols:
         payloads.append({"method": "sub.ticker", "params": ticker_symbols, "id": base_id})
         base_id += 1
@@ -317,6 +340,9 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
 
     if not payloads:
         return
+
+    for common, native in unique:
+        logger.info("MEXC subscribe ticker -> %s (native=%s)", common, native)
 
     for payload in payloads:
         try:

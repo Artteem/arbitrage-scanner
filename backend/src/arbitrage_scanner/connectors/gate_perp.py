@@ -206,9 +206,17 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
 
 async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    payload = [_to_gate_symbol(sym) for sym in symbols if sym]
-    payload = [sym for sym in payload if sym]
-    if not payload:
+    symbol_pairs: list[tuple[str, str]] = []
+    for sym in symbols:
+        if not sym:
+            continue
+        native = _to_gate_symbol(sym)
+        if not native:
+            continue
+        symbol_pairs.append((str(sym), native))
+
+    native_symbols = [native for _, native in symbol_pairs]
+    if not native_symbols:
         return
 
     async for ws in _reconnect_ws():
@@ -216,7 +224,7 @@ async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             if not await _perform_initial_ping(ws):
                 continue
 
-            await _send_subscriptions(ws, payload)
+            await _send_subscriptions(ws, symbol_pairs)
 
             async for raw in ws:
                 message = _decode_ws_message(raw)
@@ -269,24 +277,40 @@ async def _reconnect_ws():
             delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
-async def _send_subscriptions(ws, symbols: Sequence[str]) -> None:
+async def _send_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None:
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for common, native in symbols:
+        if not native:
+            continue
+        if native in seen:
+            continue
+        seen.add(native)
+        unique.append((common, native))
+
+    if not unique:
+        return
+
     now = int(time.time())
+    for common, native in unique:
+        logger.info("Gate subscribe ticker -> %s (native=%s)", common, native)
+
     for channel in ("futures.tickers", "futures.funding_rate"):
-        for symbol in symbols:
+        for _, native in unique:
             message = {
                 "time": now,
                 "channel": channel,
                 "event": "subscribe",
-                "payload": [symbol],
+                "payload": [native],
             }
             await ws.send(json.dumps(message))
 
-    for symbol in symbols:
+    for _, native in unique:
         message = {
             "time": now,
             "channel": "futures.order_book",
             "event": "subscribe",
-            "payload": [symbol, str(WS_ORDERBOOK_DEPTH), "0.1"],
+            "payload": [native, str(WS_ORDERBOOK_DEPTH), "0.1"],
         }
         await ws.send(json.dumps(message))
 
