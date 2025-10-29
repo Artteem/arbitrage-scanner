@@ -184,8 +184,17 @@ def _to_bingx_ws_symbol(symbol: Symbol) -> str:
     return sym
 
 
-def _from_bingx_symbol(symbol: str | None) -> Symbol | None:
-    return normalize_bingx_symbol(symbol)
+def _from_bingx_symbol(symbol: str | None) -> str | None:
+    """
+    Мягкая нормализация входящих имён инструментов из BingX.
+    Сначала пробуем штатный normalize_bingx_symbol, если он вернул None — делаем безопасный фолбэк.
+    """
+    s = normalize_bingx_symbol(symbol)
+    if s:
+        return s
+    if not symbol:
+        return None
+    return str(symbol).replace("-", "").replace("_", "").upper()
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
@@ -682,7 +691,7 @@ def _iter_ws_payloads(
             )
             continue
 
-        common_symbol = normalize_bingx_symbol(raw_symbol)
+        common_symbol = _from_bingx_symbol(raw_symbol)
         if not common_symbol:
             logger.debug("BingX WS drop %r: unable to normalize symbol", raw_symbol)
             continue

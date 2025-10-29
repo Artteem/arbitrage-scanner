@@ -77,7 +77,16 @@ def _to_gate_symbol(symbol: Symbol) -> str:
 
 
 def _from_gate_symbol(symbol: str | None) -> Symbol | None:
-    return normalize_gate_symbol(symbol)
+    """
+    Пытаемся привести контракт Gate к общему виду 'BTCUSDT'.
+    Если нормализатор по какой-то причине вернул None, используем безопасный фолбэк.
+    """
+    s = normalize_gate_symbol(symbol)
+    if s:
+        return s
+    if not symbol:
+        return None
+    return str(symbol).replace("_", "").replace("-", "").upper()
 
 
 def _as_float(value) -> float:
