@@ -190,6 +190,8 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
             async for raw in ws:
                 msg = _decode_ws_message(raw)
+                if int(time.time()) % 10 == 0:
+                    logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
                     continue
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, math, time
+import asyncio, json, logging, math, sys, time
 from datetime import UTC, datetime, timedelta
 from typing import Iterable, Sequence
 
@@ -158,6 +158,22 @@ async def _spread_loop() -> None:
 async def startup():
     # 1) Синхронизируем метаданные бирж и исторические данные
     global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC, LIVE_SINK, CONTRACT_LOOKUP
+    for name in (
+        "arbitrage_scanner.connectors.mexc_perp",
+        "arbitrage_scanner.connectors.gate_perp",
+        "arbitrage_scanner.connectors.bingx_perp",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        if not lg.handlers:
+            h = logging.StreamHandler(sys.stdout)
+            h.setLevel(logging.DEBUG)
+            h.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(name)s %(levelname)s: %(message)s"
+                )
+            )
+            lg.addHandler(h)
     metadata_summary: DataSyncSummary | None = None
     try:
         metadata_summary = await perform_initial_sync(CONNECTORS)

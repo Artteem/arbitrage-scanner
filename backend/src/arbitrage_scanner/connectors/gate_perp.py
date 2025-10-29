@@ -237,6 +237,8 @@ async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
 
             async for raw in ws:
                 message = _decode_ws_message(raw)
+                if int(time.time()) % 10 == 0:
+                    logger.debug("WS RX sample: %s", str(message)[:300])
                 if message is None:
                     continue
 
