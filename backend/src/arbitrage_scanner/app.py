@@ -16,6 +16,9 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.status import get_auth_statuses, get_rest_limit_modes
 from .connectors.discovery import discover_symbols_for_connectors
+from arbitrage_scanner.connectors.mexc_perp import run_mexc
+from arbitrage_scanner.connectors.gate_perp import run_gate
+from arbitrage_scanner.connectors.bingx_perp import run_bingx
 from .db.history import load_spread_candles_from_quotes
 from .db.live import RealtimeDatabaseSink
 from .db.session import get_session
@@ -42,6 +45,7 @@ for connector in CONNECTORS:
         TAKER_FEES[connector.name] = connector.taker_fee
 
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+FORCE_PERP = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 SPREAD_REFRESH_INTERVAL = 0.1
@@ -203,6 +207,9 @@ async def startup():
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
+    _tasks.append(asyncio.create_task(run_mexc(store, FORCE_PERP)))
+    _tasks.append(asyncio.create_task(run_gate(store, FORCE_PERP)))
+    _tasks.append(asyncio.create_task(run_bingx(store, FORCE_PERP)))
     _tasks.append(asyncio.create_task(_spread_loop()))
 
 
