@@ -60,18 +60,7 @@ logger = logging.getLogger(__name__)
 ORDER_BOOK_POLL_INTERVAL = 0.5
 PAIR_POLL_INTERVAL = 0.5
 
-
-def _stats_payload() -> dict:
-    snap = store.snapshot()
-    metrics = store.stats()
-    return {
-        "symbols_subscribed": SYMBOLS,
-        "tickers_in_store": len(snap),
-        "tickers_per_exchange": store.stats_by_exchange(),  # ← новое поле
-        "exchanges": EXCHANGES,
-        # ...
-    }
-    
+  
 def _build_contract_lookup(summary: DataSyncSummary | None) -> dict[tuple[ExchangeName, Symbol], int]:
     mapping: dict[tuple[ExchangeName, Symbol], int] = {}
     if not summary:
