@@ -232,15 +232,24 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not wanted_common:
         return
 
-    ws_symbols = sorted({_to_bingx_ws_symbol(sym) for sym in wanted_common if sym})
-    if not ws_symbols:
+    symbol_pairs: list[tuple[str, str]] = []
+    for sym in sorted(wanted_common):
+        if not sym:
+            continue
+        native = _to_bingx_ws_symbol(sym)
+        if not native:
+            continue
+        symbol_pairs.append((sym, native))
+
+    native_symbols = [native for _, native in symbol_pairs]
+    if not native_symbols:
         return
 
     async for ws in _reconnect_ws():
         try:
-            await _send_ws_subscriptions(ws, ws_symbols)
-            await _send_ws_depth_subscriptions(ws, ws_symbols)
-            await _send_ws_funding_subscriptions(ws, ws_symbols)
+            await _send_ws_subscriptions(ws, symbol_pairs)
+            await _send_ws_depth_subscriptions(ws, native_symbols)
+            await _send_ws_funding_subscriptions(ws, native_symbols)
 
             async for raw_msg in ws:
                 msg = _decode_ws_message(raw_msg)
@@ -364,7 +373,7 @@ async def _run_bingx_all_tickers(
     store: TickerStore, symbols: Sequence[Symbol], *, filter_symbols: bool = True
 ) -> None:
     wanted_common = _collect_wanted_common(symbols) if filter_symbols else set()
-    ws_symbols = ["ALL"]
+    ws_symbols: list[tuple[str, str]] = [("ALL", "ALL")]
 
     async for ws in _reconnect_ws():
         try:
@@ -461,16 +470,31 @@ async def _reconnect_ws():
             delay = min(delay * 2, WS_RECONNECT_MAX)
 
 
-async def _send_ws_subscriptions(ws, symbols: Sequence[str]) -> None:
+async def _send_ws_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None:
     if not symbols:
         return
 
     def _next_id() -> str:
         return str(int(time.time() * 1_000))
-    topics = []
-    for sym in symbols:
-        normalized = sym if sym.upper() == "ALL" else sym.replace("_", "-")
-        topics.append(f"swap/ticker:{normalized}")
+
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for common, native in symbols:
+        native_normalized = native if native.upper() == "ALL" else native.replace("_", "-")
+        if not native_normalized:
+            continue
+        if native_normalized in seen:
+            continue
+        seen.add(native_normalized)
+        unique.append((common, native_normalized))
+
+    if not unique:
+        return
+
+    for common, native in unique:
+        logger.info("BingX subscribe ticker -> %s (native=%s)", common, native)
+
+    topics = [f"swap/ticker:{native}" for _, native in unique]
 
     payload = {
         "id": _next_id(),
