@@ -1,7 +1,8 @@
 from __future__ import annotations
 import httpx
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Set
+from typing import Dict, Iterable, List, Sequence, Set
 
 from .base import ConnectorSpec
 from .bingx_utils import normalize_bingx_symbol
@@ -252,6 +253,48 @@ def _is_perpetual_contract(value) -> bool:
     return any(key in normalized for key in ("perp", "perpetual", "swap"))
 
 
+def _iter_bingx_contract_entries(payload) -> Iterable[dict]:
+    queue: deque = deque([payload])
+    while queue:
+        current = queue.popleft()
+        if isinstance(current, dict):
+            if _looks_like_bingx_contract(current):
+                yield current
+            for value in current.values():
+                if isinstance(value, (list, tuple, set)):
+                    queue.extend(value)
+                elif isinstance(value, dict):
+                    queue.append(value)
+        elif isinstance(current, (list, tuple, set)):
+            queue.extend(current)
+
+
+def _looks_like_bingx_contract(item: dict) -> bool:
+    symbol_keys: Sequence[str] = (
+        "symbol",
+        "tradingPair",
+        "instId",
+        "contractId",
+        "pair",
+        "name",
+        "symbolName",
+    )
+    quote_keys: Sequence[str] = (
+        "quoteAsset",
+        "quoteCurrency",
+        "quoteCoin",
+        "quote",
+        "quoteAssetName",
+        "settleAsset",
+        "settleCurrency",
+    )
+    if not any(item.get(key) for key in symbol_keys):
+        return False
+    if not any(item.get(key) for key in quote_keys):
+        return False
+    return True
+
+
 async def discover_bingx_usdt_perp() -> Set[str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -265,27 +308,19 @@ async def discover_bingx_usdt_perp() -> Set[str]:
         response.raise_for_status()
         payload = response.json()
 
-    items: Iterable = []
-    if isinstance(payload, dict):
-        for key in ("data", "result", "contracts", "items"):
-            val = payload.get(key)
-            if isinstance(val, list):
-                items = val
-                break
-            if isinstance(val, dict):
-                items = val.values()
-                break
-        else:
-            items = list(payload.values())
-    elif isinstance(payload, list):
-        items = payload
-
     out: Set[str] = set()
-    for item in items:
+    for item in _iter_bingx_contract_entries(payload):
         if not isinstance(item, dict):
             continue
 
-        quote_asset = item.get("quoteAsset")
+        quote_asset = (
+            item.get("quoteAsset")
+            or item.get("quoteCurrency")
+            or item.get("quoteCoin")
+            or item.get("quote")
+            or item.get("settleAsset")
+            or item.get("settleCurrency")
+        )
         if not _is_usdt_quote(quote_asset):
             continue
 
@@ -294,6 +329,8 @@ async def discover_bingx_usdt_perp() -> Set[str]:
             or item.get("tradingPair")
             or item.get("instId")
             or item.get("contractId")
+            or item.get("pair")
+            or item.get("name")
         )
         common = _bingx_symbol_to_common(str(raw_symbol) if raw_symbol else None)
         if not common:

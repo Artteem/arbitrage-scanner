@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import time
@@ -8,13 +9,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
+import zlib
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
-WS_ENDPOINT = "wss://contract.mexc.com/ws"
+WS_ENDPOINT = "wss://contract.mexc.com/edge?compress=false"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
@@ -282,6 +284,7 @@ async def _reconnect_ws():
                 ping_timeout=20,
                 close_timeout=5,
                 extra_headers=MEXC_HEADERS,
+                compression=None,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -315,29 +318,60 @@ async def _send_mexc_subscriptions(ws, symbols: Sequence[str]) -> None:
     if not payloads:
         return
 
-    message = json.dumps(payloads)
-    try:
-        await ws.send(message)
-    except Exception:
-        logger.exception("Failed to send batched MEXC subscriptions")
+    for payload in payloads:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
+
+
+def _decode_ws_bytes(data: bytes) -> str | None:
+    if not data:
+        return None
+
+    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
+        try:
+            text = decoder(data)
+        except Exception:
+            continue
+        if text:
+            return text
+    return None
+
+
+def _decode_utf8(data: bytes) -> str:
+    return data.decode("utf-8", errors="strict")
+
+
+def _decode_gzip(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
+        raise ValueError("not gzip")
+    return gzip.decompress(data).decode("utf-8")
+
+
+def _decode_zlib(data: bytes) -> str:
+    if len(data) < 2 or data[0] != 0x78:
+        raise ValueError("not zlib")
+    return zlib.decompress(data).decode("utf-8")
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
-    if isinstance(message, bytes):
-        try:
-            message = message.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-
-    if not isinstance(message, str):
+    if isinstance(message, str):
+        raw = message
+    elif isinstance(message, (bytes, bytearray)):
+        raw = _decode_ws_bytes(bytes(message))
+    else:
         return None
 
-    message = message.strip()
-    if not message:
+    if not raw:
+        return None
+
+    raw = raw.strip()
+    if not raw:
         return None
 
     try:
-        return json.loads(message)
+        return json.loads(raw)
     except Exception:
         return None
 
