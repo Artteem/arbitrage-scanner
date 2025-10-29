@@ -8,14 +8,6 @@ from .domain import ExchangeName, Symbol, Ticker
 if TYPE_CHECKING:
     from .db.live import RealtimeDatabaseSink
 
-
-class TickerStore:
-    # ...
-    def stats_by_exchange(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for (ex, _), _ticker in self._latest.items():
-            counts[ex] = counts.get(ex, 0) + 1
-        return counts
         
 @dataclass
 class OrderBookData:
