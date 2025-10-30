@@ -549,11 +549,12 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None
 
     _log_ws_subscriptions("ticker", topics)
 
-    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+    for topic in topics:
         payload = {
             "id": _next_id(),
             "reqType": "sub",
-            "dataType": list(batch),
+            "dataType": topic,
+            "data": None,
         }
         await _send_ws_payload(ws, payload)
         await asyncio.sleep(WS_SUB_DELAY)
@@ -572,11 +573,12 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
 
     _log_ws_subscriptions("depth", topics)
 
-    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+    for topic in topics:
         payload = {
             "id": _next_id(),
             "reqType": "sub",
-            "dataType": list(batch),
+            "dataType": topic,
+            "data": None,
         }
         await _send_ws_payload(ws, payload)
         await asyncio.sleep(WS_SUB_DELAY)
@@ -595,11 +597,12 @@ async def _send_ws_funding_subscriptions(ws, symbols: Sequence[str]) -> None:
 
     _log_ws_subscriptions("funding", topics)
 
-    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+    for topic in topics:
         payload = {
             "id": _next_id(),
             "reqType": "sub",
-            "dataType": list(batch),
+            "dataType": topic,
+            "data": None,
         }
         await _send_ws_payload(ws, payload)
         await asyncio.sleep(WS_SUB_DELAY)
