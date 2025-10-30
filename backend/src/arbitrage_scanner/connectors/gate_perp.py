@@ -18,8 +18,7 @@ from .normalization import normalize_gate_symbol
 
 WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 MAX_TOPICS_PER_CONN = 100
-MAX_TOPICS_PER_SUB_MSG = 30
-WS_ORDERBOOK_DEPTH = 20
+WS_ORDERBOOK_DEPTH = 100
 WS_SUB_DELAY = 0.1
 HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
@@ -183,11 +182,6 @@ def _extract_price(item: dict, keys: Iterable[str]) -> float:
     return 0.0
 
 
-def _chunk(symbols: Sequence[Symbol], size: int) -> Iterable[Sequence[Symbol]]:
-    for idx in range(0, len(symbols), size):
-        yield symbols[idx : idx + size]
-
-
 async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     subscribe = await _resolve_gate_symbols(symbols)
     if not subscribe:
@@ -260,8 +254,14 @@ async def _run_gate_ws(
                 if await _handle_ping(ws, message):
                     continue
 
-                if _is_ack(message):
+                if _is_gate_ack(message):
                     logger.info("Gate WS ack: %s", str(message)[:500])
+                    continue
+
+                if isinstance(message, dict) and (
+                    message.get("error") or message.get("code")
+                ):
+                    logger.error("Gate WS error: %s", str(message)[:500])
                     continue
 
                 channel = str(message.get("channel") or "")
@@ -275,7 +275,7 @@ async def _run_gate_ws(
                     _handle_tickers(store, data)
                 elif channel == "futures.funding_rate":
                     _handle_funding(store, data)
-                elif channel in {"futures.order_book", "futures.order_book_update"}:
+                elif channel == "futures.order_book":
                     _handle_orderbook(store, data)
         except asyncio.CancelledError:
             raise
@@ -322,31 +322,36 @@ async def _send_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None:
     if not unique:
         return
 
-    now = int(time.time())
-    native_only = [native for _, native in unique]
-
     for common, native in unique:
+        now = int(time.time())
         logger.info("Gate subscribe ticker -> %s (native=%s)", common, native)
-
-    for channel in ("futures.tickers", "futures.funding_rate"):
-        for batch in _chunk(native_only, MAX_TOPICS_PER_SUB_MSG):
-            payload = {
-                "time": now,
-                "channel": channel,
-                "event": "subscribe",
-                "payload": list(batch),
-            }
-            await _send_ws_payload(ws, payload)
-            await asyncio.sleep(WS_SUB_DELAY)
-
-    for native in native_only:
-        payload = {
+        ticker_payload = {
             "time": now,
-            "channel": "futures.order_book_update",
+            "channel": "futures.tickers",
             "event": "subscribe",
-            "payload": [native, "100ms", str(WS_ORDERBOOK_DEPTH)],
+            "payload": [native],
         }
-        await _send_ws_payload(ws, payload)
+        await _send_ws_payload(ws, ticker_payload)
+        await asyncio.sleep(WS_SUB_DELAY)
+
+        logger.info("Gate subscribe depth -> %s", native)
+        depth_payload = {
+            "time": now,
+            "channel": "futures.order_book",
+            "event": "subscribe",
+            "payload": [native, WS_ORDERBOOK_DEPTH],
+        }
+        await _send_ws_payload(ws, depth_payload)
+        await asyncio.sleep(WS_SUB_DELAY)
+
+        logger.info("Gate subscribe funding -> %s", native)
+        funding_payload = {
+            "time": now,
+            "channel": "futures.funding_rate",
+            "event": "subscribe",
+            "payload": [native],
+        }
+        await _send_ws_payload(ws, funding_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
 
@@ -400,6 +405,7 @@ def _decode_zlib(data: bytes) -> str:
 async def _send_ws_payload(ws, payload: dict) -> None:
     try:
         await ws.send(json.dumps(payload))
+        logger.info("Gate WS send -> %s", json.dumps(payload)[:200])
     except Exception:
         logger.exception("Gate subscription send failed", extra={"payload": payload})
 
@@ -481,14 +487,24 @@ async def _handle_ping(ws, message: dict) -> bool:
     return event == "pong"
 
 
-def _is_ack(message: dict) -> bool:
+def _is_gate_ack(message: dict) -> bool:
     if not isinstance(message, dict):
         return False
+
     event = str(message.get("event") or "").lower()
+    result = message.get("result")
+
     if event in {"subscribe", "unsubscribe"}:
+        if isinstance(result, str):
+            return result.lower() == "success"
+        if isinstance(result, dict):
+            return str(result.get("status") or "").lower() == "success"
+        if result is True:
+            return True
+
+    if event == "update" and message.get("success") is True:
         return True
-    if message.get("error") or message.get("code"):
-        return True
+
     return False
 
 
