@@ -195,6 +195,8 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                 if msg is None:
                     continue
 
+                raw_message = str(msg)
+
                 if _is_ping(msg):
                     await _reply_pong(ws, msg)
                     continue
@@ -205,7 +207,22 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                     if not isinstance(data, dict):
                         continue
                     sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common or sym_common not in wanted_common:
+                    logger.info(
+                        "WS PARSE exchange=%s native=%s -> common=%s",
+                        "mexc",
+                        sym_raw,
+                        sym_common,
+                    )
+                    if not sym_common:
+                        logger.warning(
+                            "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                            "mexc",
+                            sym_raw,
+                            raw_message[:500],
+                        )
+                        continue
+
+                    if sym_common not in wanted_common:
                         continue
 
                     bids_raw = data.get("bids") or data.get("b") or data.get("buy")
@@ -249,7 +266,22 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                         continue
 
                     sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common or sym_common not in wanted_common:
+                    logger.info(
+                        "WS PARSE exchange=%s native=%s -> common=%s",
+                        "mexc",
+                        sym_raw,
+                        sym_common,
+                    )
+                    if not sym_common:
+                        logger.warning(
+                            "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                            "mexc",
+                            sym_raw,
+                            raw_message[:500],
+                        )
+                        continue
+
+                    if sym_common not in wanted_common:
                         continue
 
                     if _looks_like_depth(payload):

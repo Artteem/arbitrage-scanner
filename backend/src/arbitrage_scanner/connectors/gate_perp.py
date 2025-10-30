@@ -476,7 +476,19 @@ def _handle_tickers(store: TickerStore, payload) -> None:
             continue
 
         symbol = _from_gate_symbol(str(contract))
+        logger.info(
+            "WS PARSE exchange=%s native=%s -> common=%s",
+            "gate",
+            contract,
+            symbol,
+        )
         if not symbol:
+            logger.warning(
+                "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                "gate",
+                contract,
+                str(item)[:500],
+            )
             continue
 
         bid = _extract_price(
@@ -539,7 +551,19 @@ def _handle_funding(store: TickerStore, payload) -> None:
         if not contract:
             continue
         symbol = _from_gate_symbol(str(contract))
+        logger.info(
+            "WS PARSE exchange=%s native=%s -> common=%s",
+            "gate",
+            contract,
+            symbol,
+        )
         if not symbol:
+            logger.warning(
+                "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                "gate",
+                contract,
+                str(item)[:500],
+            )
             continue
         rate_raw = item.get("rate") or item.get("funding_rate")
         if rate_raw is None:
@@ -560,7 +584,19 @@ def _handle_orderbook(store: TickerStore, payload) -> None:
         if not contract:
             continue
         symbol = _from_gate_symbol(str(contract))
+        logger.info(
+            "WS PARSE exchange=%s native=%s -> common=%s",
+            "gate",
+            contract,
+            symbol,
+        )
         if not symbol:
+            logger.warning(
+                "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                "gate",
+                contract,
+                str(item)[:500],
+            )
             continue
 
         bids_raw = item.get("bids") or item.get("bid") or item.get("buy")

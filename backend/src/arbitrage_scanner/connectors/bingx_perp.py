@@ -696,8 +696,19 @@ def _iter_ws_payloads(
             continue
 
         common_symbol = _from_bingx_symbol(raw_symbol)
+        logger.info(
+            "WS PARSE exchange=%s native=%s -> common=%s",
+            "bingx",
+            raw_symbol,
+            common_symbol,
+        )
         if not common_symbol:
-            logger.debug("BingX WS drop %r: unable to normalize symbol", raw_symbol)
+            logger.warning(
+                "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                "bingx",
+                raw_symbol,
+                str(message)[:500],
+            )
             continue
 
         normalized_common = str(common_symbol)
