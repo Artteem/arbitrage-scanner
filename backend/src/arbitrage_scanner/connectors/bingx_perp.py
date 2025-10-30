@@ -19,10 +19,13 @@ from .discovery import discover_bingx_usdt_perp
 logger = logging.getLogger(__name__)
 
 WS_ENDPOINTS = (
+    "wss://open-api-swap.bingx.com/standard/market?compress=false",
     "wss://open-api-ws.bingx.com/market?compress=false",
-    "wss://open-api-swap.bingx.com/swap-market?compress=false",
 )
-WS_SUB_CHUNK = 250
+MAX_TOPICS_PER_CONN = 100
+MAX_TOPICS_PER_SUB_MSG = 30
+WS_SUB_DELAY = 0.1
+HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 1
@@ -157,6 +160,11 @@ def _chunk_bingx_symbols(symbols: Sequence[Symbol], size: int) -> Iterable[Seque
         yield symbols[idx : idx + size]
 
 
+def _chunk_list(values: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for idx in range(0, len(values), size):
+        yield values[idx : idx + size]
+
+
 def _to_bingx_symbol(symbol: Symbol) -> str:
     sym = str(symbol).upper()
     if "-" in sym:
@@ -203,7 +211,9 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe and not subscribe_all:
         return
 
-    chunks = [tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, WS_SUB_CHUNK)]
+    chunks = [
+        tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, MAX_TOPICS_PER_CONN)
+    ]
 
     while True:
         tasks: list[asyncio.Task] = []
@@ -255,16 +265,26 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         return
 
     async for ws in _reconnect_ws():
+        heartbeat: asyncio.Task | None = None
         try:
             await _send_ws_subscriptions(ws, symbol_pairs)
             await _send_ws_depth_subscriptions(ws, native_symbols)
             await _send_ws_funding_subscriptions(ws, native_symbols)
 
+            heartbeat = asyncio.create_task(
+                _ws_heartbeat(ws, interval=HEARTBEAT_INTERVAL, name="bingx")
+            )
+
             async for raw_msg in ws:
+                _log_ws_raw_frame("bingx", raw_msg)
                 msg = _decode_ws_message(raw_msg)
                 if int(time.time()) % 10 == 0:
                     logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
+                    continue
+
+                if _is_bingx_ack(msg):
+                    logger.info("BingX WS ack: %s", str(msg)[:500])
                     continue
 
                 if _is_ws_ping(msg):
@@ -378,6 +398,10 @@ async def _run_bingx_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             raise
         except Exception:
             continue
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 async def _run_bingx_all_tickers(
@@ -387,14 +411,24 @@ async def _run_bingx_all_tickers(
     ws_symbols: list[tuple[str, str]] = [("ALL", "ALL")]
 
     async for ws in _reconnect_ws():
+        heartbeat: asyncio.Task | None = None
         try:
             await _send_ws_subscriptions(ws, ws_symbols)
 
+            heartbeat = asyncio.create_task(
+                _ws_heartbeat(ws, interval=HEARTBEAT_INTERVAL, name="bingx")
+            )
+
             async for raw_msg in ws:
+                _log_ws_raw_frame("bingx", raw_msg)
                 msg = _decode_ws_message(raw_msg)
                 if int(time.time()) % 10 == 0:
                     logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
+                    continue
+
+                if _is_bingx_ack(msg):
+                    logger.info("BingX WS ack: %s", str(msg)[:500])
                     continue
 
                 if _is_ws_ping(msg):
@@ -457,6 +491,10 @@ async def _run_bingx_all_tickers(
             raise
         except Exception:
             continue
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 async def _reconnect_ws():
@@ -468,10 +506,10 @@ async def _reconnect_ws():
         try:
             async with websockets.connect(
                 endpoint,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=None,
+                ping_timeout=None,
                 close_timeout=5,
-                compression=None,
+                compression="deflate",
                 extra_headers=BINGX_HEADERS,
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
@@ -509,18 +547,16 @@ async def _send_ws_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None
 
     topics = [f"swap/ticker:{native}" for _, native in unique]
 
-    payload = {
-        "id": _next_id(),
-        "reqType": "sub",
-        "dataType": topics,
-    }
-
     _log_ws_subscriptions("ticker", topics)
 
-    try:
-        await ws.send(json.dumps(payload))
-    except Exception:
-        return
+    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+        payload = {
+            "id": _next_id(),
+            "reqType": "sub",
+            "dataType": list(batch),
+        }
+        await _send_ws_payload(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
 
 
 async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
@@ -534,18 +570,16 @@ async def _send_ws_depth_subscriptions(ws, symbols: Sequence[str]) -> None:
     if not topics:
         return
 
-    payload = {
-        "id": _next_id(),
-        "reqType": "sub",
-        "dataType": topics,
-    }
-
     _log_ws_subscriptions("depth", topics)
 
-    try:
-        await ws.send(json.dumps(payload))
-    except Exception:
-        return
+    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+        payload = {
+            "id": _next_id(),
+            "reqType": "sub",
+            "dataType": list(batch),
+        }
+        await _send_ws_payload(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
 
 
 async def _send_ws_funding_subscriptions(ws, symbols: Sequence[str]) -> None:
@@ -559,18 +593,16 @@ async def _send_ws_funding_subscriptions(ws, symbols: Sequence[str]) -> None:
     if not topics:
         return
 
-    payload = {
-        "id": _next_id(),
-        "reqType": "sub",
-        "dataType": topics,
-    }
-
     _log_ws_subscriptions("funding", topics)
 
-    try:
-        await ws.send(json.dumps(payload))
-    except Exception:
-        return
+    for batch in _chunk_list(topics, MAX_TOPICS_PER_SUB_MSG):
+        payload = {
+            "id": _next_id(),
+            "reqType": "sub",
+            "dataType": list(batch),
+        }
+        await _send_ws_payload(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
@@ -631,6 +663,24 @@ def _is_ws_ping(message: dict) -> bool:
     return False
 
 
+def _is_bingx_ack(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if "data" in message and message.get("data") not in (None, []):
+        return False
+    code = message.get("code")
+    if code is not None and str(code) in {"0", "200", "300000"}:
+        return True
+    action = str(message.get("action") or "").lower()
+    if action in {"sub", "subscribe", "unsub", "unsubscribe"}:
+        return True
+    if message.get("success") is True:
+        return True
+    if message.get("msg") and message.get("reqType"):
+        return True
+    return False
+
+
 async def _reply_ws_ping(ws, message: dict) -> None:
     try:
         if "ping" in message:
@@ -639,6 +689,13 @@ async def _reply_ws_ping(ws, message: dict) -> None:
             await ws.send(json.dumps({"id": message.get("id", "pong"), "action": "pong"}))
     except Exception:
         pass
+
+
+async def _send_ws_payload(ws, payload: dict) -> None:
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        logger.exception("BingX subscription send failed", extra={"payload": payload})
 
 
 def _iter_ws_payloads(
@@ -927,7 +984,12 @@ def _extract_topic_symbol(data_type) -> str | None:
             if symbol:
                 return symbol
         return None
-
+    if isinstance(data_type, dict):
+        return _extract_topic_symbol(
+            data_type.get("symbol")
+            or data_type.get("instId")
+            or data_type.get("pair")
+        )
     if isinstance(data_type, str) and data_type:
         segments: list[str] = []
         if ":" in data_type:
@@ -950,7 +1012,59 @@ def _extract_topic_symbol(data_type) -> str | None:
             candidate = candidate.replace("_", "-")
             if "-" in candidate:
                 return candidate.upper()
+        return data_type
     return None
+
+
+def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
+    if isinstance(message, (bytes, bytearray)):
+        buf = bytes(message[:512])
+        hex_preview = buf.hex()
+        try:
+            text_preview = buf.decode("utf-8")
+        except Exception:
+            text_preview = ""
+        if text_preview:
+            logger.debug(
+                "%s WS RX raw (first 512b): text=%s hex=%s",
+                exchange.upper(),
+                text_preview,
+                hex_preview,
+            )
+        else:
+            logger.debug(
+                "%s WS RX raw (first 512b hex): %s",
+                exchange.upper(),
+                hex_preview,
+            )
+    else:
+        logger.debug(
+            "%s WS RX raw (first 512b): %s",
+            exchange.upper(),
+            str(message)[:512],
+        )
+
+
+async def _ws_heartbeat(ws, *, interval: float, name: str) -> None:
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if ws.closed:
+                raise ConnectionError(f"{name} websocket closed during heartbeat")
+            try:
+                pong = await ws.ping()
+                await asyncio.wait_for(pong, timeout=interval)
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(f"{name} websocket heartbeat timeout") from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("%s heartbeat failed", name)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        raise
 
 
 

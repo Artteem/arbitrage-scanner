@@ -17,8 +17,11 @@ from .discovery import GATE_HEADERS, discover_gate_usdt_perp
 from .normalization import normalize_gate_symbol
 
 WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
-WS_SUB_BATCH = 80
-WS_ORDERBOOK_DEPTH = 30
+MAX_TOPICS_PER_CONN = 100
+MAX_TOPICS_PER_SUB_MSG = 30
+WS_ORDERBOOK_DEPTH = 20
+WS_SUB_DELAY = 0.1
+HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 1
@@ -190,7 +193,20 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     if not subscribe:
         return
 
-    chunks = [tuple(chunk) for chunk in _chunk(subscribe, WS_SUB_BATCH)]
+    symbol_pairs: list[tuple[str, str]] = []
+    for sym in subscribe:
+        native = _to_gate_symbol(sym)
+        if not native:
+            continue
+        symbol_pairs.append((sym, native))
+
+    if not symbol_pairs:
+        return
+
+    chunks = [
+        tuple(symbol_pairs[idx : idx + MAX_TOPICS_PER_CONN])
+        for idx in range(0, len(symbol_pairs), MAX_TOPICS_PER_CONN)
+    ]
     if not chunks:
         return
 
@@ -214,28 +230,27 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    symbol_pairs: list[tuple[str, str]] = []
-    for sym in symbols:
-        if not sym:
-            continue
-        native = _to_gate_symbol(sym)
-        if not native:
-            continue
-        symbol_pairs.append((str(sym), native))
-
+async def _run_gate_ws(
+    store: TickerStore, symbol_pairs: Sequence[tuple[str, str]]
+) -> None:
     native_symbols = [native for _, native in symbol_pairs]
     if not native_symbols:
         return
 
     async for ws in _reconnect_ws():
+        heartbeat: asyncio.Task | None = None
         try:
             if not await _perform_initial_ping(ws):
                 continue
 
             await _send_subscriptions(ws, symbol_pairs)
 
+            heartbeat = asyncio.create_task(
+                _ws_heartbeat(ws, interval=HEARTBEAT_INTERVAL, name="gate")
+            )
+
             async for raw in ws:
+                _log_ws_raw_frame("gate", raw)
                 message = _decode_ws_message(raw)
                 if int(time.time()) % 10 == 0:
                     logger.debug("WS RX sample: %s", str(message)[:300])
@@ -246,6 +261,7 @@ async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                     continue
 
                 if _is_ack(message):
+                    logger.info("Gate WS ack: %s", str(message)[:500])
                     continue
 
                 channel = str(message.get("channel") or "")
@@ -259,12 +275,16 @@ async def _run_gate_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                     _handle_tickers(store, data)
                 elif channel == "futures.funding_rate":
                     _handle_funding(store, data)
-                elif channel == "futures.order_book":
+                elif channel in {"futures.order_book", "futures.order_book_update"}:
                     _handle_orderbook(store, data)
         except asyncio.CancelledError:
             raise
         except Exception:
             await asyncio.sleep(WS_RECONNECT_INITIAL)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 async def _reconnect_ws():
@@ -273,11 +293,11 @@ async def _reconnect_ws():
         try:
             async with websockets.connect(
                 WS_ENDPOINT,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=None,
+                ping_timeout=None,
                 close_timeout=5,
                 extra_headers=GATE_HEADERS,
-                compression=None,
+                compression="deflate",
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -303,27 +323,31 @@ async def _send_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None:
         return
 
     now = int(time.time())
+    native_only = [native for _, native in unique]
+
     for common, native in unique:
         logger.info("Gate subscribe ticker -> %s (native=%s)", common, native)
 
     for channel in ("futures.tickers", "futures.funding_rate"):
-        for _, native in unique:
-            message = {
+        for batch in _chunk(native_only, MAX_TOPICS_PER_SUB_MSG):
+            payload = {
                 "time": now,
                 "channel": channel,
                 "event": "subscribe",
-                "payload": [native],
+                "payload": list(batch),
             }
-            await ws.send(json.dumps(message))
+            await _send_ws_payload(ws, payload)
+            await asyncio.sleep(WS_SUB_DELAY)
 
-    for _, native in unique:
-        message = {
+    for native in native_only:
+        payload = {
             "time": now,
-            "channel": "futures.order_book",
+            "channel": "futures.order_book_update",
             "event": "subscribe",
-            "payload": [native, str(WS_ORDERBOOK_DEPTH), "0.1"],
+            "payload": [native, "100ms", str(WS_ORDERBOOK_DEPTH)],
         }
-        await ws.send(json.dumps(message))
+        await _send_ws_payload(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:
@@ -373,6 +397,13 @@ def _decode_zlib(data: bytes) -> str:
     return zlib.decompress(data).decode("utf-8")
 
 
+async def _send_ws_payload(ws, payload: dict) -> None:
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        logger.exception("Gate subscription send failed", extra={"payload": payload})
+
+
 async def _perform_initial_ping(ws) -> bool:
     message = {
         "time": int(time.time()),
@@ -393,6 +424,7 @@ async def _perform_initial_ping(ws) -> bool:
         except Exception:
             return False
 
+        _log_ws_raw_frame("gate", raw)
         payload = _decode_ws_message(raw)
         if payload is None:
             continue
@@ -458,6 +490,57 @@ def _is_ack(message: dict) -> bool:
     if message.get("error") or message.get("code"):
         return True
     return False
+
+
+def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
+    if isinstance(message, (bytes, bytearray)):
+        buf = bytes(message[:512])
+        hex_preview = buf.hex()
+        try:
+            text_preview = buf.decode("utf-8")
+        except Exception:
+            text_preview = ""
+        if text_preview:
+            logger.debug(
+                "%s WS RX raw (first 512b): text=%s hex=%s",
+                exchange.upper(),
+                text_preview,
+                hex_preview,
+            )
+        else:
+            logger.debug(
+                "%s WS RX raw (first 512b hex): %s",
+                exchange.upper(),
+                hex_preview,
+            )
+    else:
+        logger.debug(
+            "%s WS RX raw (first 512b): %s",
+            exchange.upper(),
+            str(message)[:512],
+        )
+
+
+async def _ws_heartbeat(ws, *, interval: float, name: str) -> None:
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if ws.closed:
+                raise ConnectionError(f"{name} websocket closed during heartbeat")
+            try:
+                pong = await ws.ping()
+                await asyncio.wait_for(pong, timeout=interval)
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(f"{name} websocket heartbeat timeout") from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("%s heartbeat failed", name)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        raise
 
 
 def _handle_tickers(store: TickerStore, payload) -> None:
