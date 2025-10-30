@@ -16,10 +16,14 @@ from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
-WS_ENDPOINT = "wss://contract.mexc.com/edge?compress=false"
+WS_ENDPOINT = "wss://contract.mexc.com/edge"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 WS_DEPTH_LEVELS = 50
+MAX_TOPICS_PER_CONN = 100
+MAX_TOPICS_PER_SUB_MSG = 30
+WS_SUB_DELAY = 0.1
+HEARTBEAT_INTERVAL = 20.0
 MIN_SYMBOL_THRESHOLD = 1
 FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
@@ -98,6 +102,11 @@ def _as_float(value) -> float:
         return 0.0
 
 
+def _chunked(sequence: Sequence, size: int) -> Iterable[Sequence]:
+    for idx in range(0, len(sequence), size):
+        yield sequence[idx : idx + size]
+
+
 def _to_mexc_symbol(symbol: Symbol) -> str:
     sym = str(symbol)
     if "_" in sym:
@@ -146,51 +155,77 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
         logger.warning("No symbols resolved for MEXC connector; skipping startup")
         return
 
+    symbol_pairs: list[tuple[str, str]] = []
+    for sym in subscribe:
+        native = _to_mexc_symbol(sym)
+        if not native:
+            continue
+        symbol_pairs.append((sym, native))
+
+    if not symbol_pairs:
+        logger.warning("MEXC connector resolved symbols but produced no native pairs")
+        return
+
+    chunks = [
+        tuple(symbol_pairs[idx : idx + MAX_TOPICS_PER_CONN])
+        for idx in range(0, len(symbol_pairs), MAX_TOPICS_PER_CONN)
+    ]
+
+    if not chunks:
+        return
+
     while True:
-        task = asyncio.create_task(_run_mexc_ws(store, tuple(subscribe)))
+        tasks = [asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks]
 
         try:
-            await task
+            await asyncio.gather(*tasks)
             return
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("MEXC websocket worker crashed; restarting")
+            logger.exception("MEXC websocket worker crashed; restarting all connections")
             await asyncio.sleep(WS_RECONNECT_INITIAL)
         finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    symbol_pairs: list[tuple[str, str]] = []
-    for sym in symbols:
-        if not sym:
-            continue
-        native = _to_mexc_symbol(sym)
-        if not native:
-            continue
-        symbol_pairs.append((str(sym), native))
-
+async def _run_mexc_ws(
+    store: TickerStore, symbol_pairs: Sequence[tuple[str, str]]
+) -> None:
     wanted_exchange = [native for _, native in symbol_pairs]
     if not wanted_exchange:
         return
 
-    wanted_common = {_from_mexc_symbol(sym) for sym in wanted_exchange if sym}
-    wanted_common = {sym for sym in wanted_common if sym}
+    wanted_common = {common for common, _ in symbol_pairs if common}
     if not wanted_common:
         return
 
     books: Dict[str, _MexcOrderBookState] = {}
 
     async for ws in _reconnect_ws():
+        heartbeat: asyncio.Task | None = None
         try:
             await _send_mexc_subscriptions(ws, symbol_pairs)
 
+            heartbeat = asyncio.create_task(
+                _ws_heartbeat(ws, interval=HEARTBEAT_INTERVAL, name="mexc")
+            )
+
             async for raw in ws:
+                _log_ws_raw_frame("mexc", raw)
                 msg = _decode_ws_message(raw)
+                if int(time.time()) % 10 == 0:
+                    logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
+                    continue
+
+                raw_message = str(msg)
+
+                if _is_ack_message(msg):
+                    logger.info("MEXC WS ack: %s", raw_message[:500])
                     continue
 
                 if _is_ping(msg):
@@ -203,7 +238,22 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                     if not isinstance(data, dict):
                         continue
                     sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common or sym_common not in wanted_common:
+                    logger.info(
+                        "WS PARSE exchange=%s native=%s -> common=%s",
+                        "mexc",
+                        sym_raw,
+                        sym_common,
+                    )
+                    if not sym_common:
+                        logger.warning(
+                            "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                            "mexc",
+                            sym_raw,
+                            raw_message[:500],
+                        )
+                        continue
+
+                    if sym_common not in wanted_common:
                         continue
 
                     bids_raw = data.get("bids") or data.get("b") or data.get("buy")
@@ -247,7 +297,22 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                         continue
 
                     sym_common = _from_mexc_symbol(sym_raw)
-                    if not sym_common or sym_common not in wanted_common:
+                    logger.info(
+                        "WS PARSE exchange=%s native=%s -> common=%s",
+                        "mexc",
+                        sym_raw,
+                        sym_common,
+                    )
+                    if not sym_common:
+                        logger.warning(
+                            "WS DROP reason=normalize_none exchange=%s native=%s payload=%s",
+                            "mexc",
+                            sym_raw,
+                            raw_message[:500],
+                        )
+                        continue
+
+                    if sym_common not in wanted_common:
                         continue
 
                     if _looks_like_depth(payload):
@@ -280,6 +345,10 @@ async def _run_mexc_ws(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             raise
         except Exception:
             await asyncio.sleep(2.0)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 async def _reconnect_ws():
@@ -288,11 +357,11 @@ async def _reconnect_ws():
         try:
             async with websockets.connect(
                 WS_ENDPOINT,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=None,
+                ping_timeout=None,
                 close_timeout=5,
                 extra_headers=MEXC_HEADERS,
-                compression=None,
+                compression="deflate",
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
@@ -323,32 +392,39 @@ async def _send_mexc_subscriptions(
         return
 
     base_id = int(time.time() * 1_000)
-    payloads: list[dict] = []
 
     ticker_symbols = [native for _, native in unique]
-    if ticker_symbols:
-        payloads.append({"method": "sub.ticker", "params": ticker_symbols, "id": base_id})
-        base_id += 1
-
-    depth_params = [[sym, WS_DEPTH_LEVELS] for sym in ticker_symbols]
-    if depth_params:
-        payloads.append({"method": "sub.depth", "params": depth_params, "id": base_id})
-        base_id += 1
-
-    if ticker_symbols:
-        payloads.append({"method": "sub.funding_rate", "params": ticker_symbols, "id": base_id})
-
-    if not payloads:
+    if not ticker_symbols:
         return
 
     for common, native in unique:
         logger.info("MEXC subscribe ticker -> %s (native=%s)", common, native)
 
-    for payload in payloads:
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception:
-            logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
+    for chunk in _chunked(ticker_symbols, MAX_TOPICS_PER_SUB_MSG):
+        payload = {"method": "sub.ticker", "params": list(chunk), "id": base_id}
+        base_id += 1
+        await _send_json_with_retry(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
+
+    depth_params = [[sym, WS_DEPTH_LEVELS] for sym in ticker_symbols]
+    for chunk in _chunked(depth_params, MAX_TOPICS_PER_SUB_MSG):
+        payload = {"method": "sub.depth", "params": list(chunk), "id": base_id}
+        base_id += 1
+        await _send_json_with_retry(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
+
+    for chunk in _chunked(ticker_symbols, MAX_TOPICS_PER_SUB_MSG):
+        payload = {"method": "sub.funding_rate", "params": list(chunk), "id": base_id}
+        base_id += 1
+        await _send_json_with_retry(ws, payload)
+        await asyncio.sleep(WS_SUB_DELAY)
+
+
+async def _send_json_with_retry(ws, payload: dict) -> None:
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception:
+        logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
 
 
 def _decode_ws_bytes(data: bytes) -> str | None:
@@ -379,6 +455,73 @@ def _decode_zlib(data: bytes) -> str:
     if len(data) < 2 or data[0] != 0x78:
         raise ValueError("not zlib")
     return zlib.decompress(data).decode("utf-8")
+
+
+def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
+    if isinstance(message, (bytes, bytearray)):
+        buf = bytes(message[:512])
+        hex_preview = buf.hex()
+        try:
+            text_preview = buf.decode("utf-8")
+        except Exception:
+            text_preview = ""
+        if text_preview:
+            logger.debug(
+                "%s WS RX raw (first 512b): text=%s hex=%s",
+                exchange.upper(),
+                text_preview,
+                hex_preview,
+            )
+        else:
+            logger.debug(
+                "%s WS RX raw (first 512b hex): %s",
+                exchange.upper(),
+                hex_preview,
+            )
+    else:
+        logger.debug(
+            "%s WS RX raw (first 512b): %s",
+            exchange.upper(),
+            str(message)[:512],
+        )
+
+
+def _is_ack_message(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("id") is None:
+        return False
+    if message.get("success") is True:
+        return True
+    if message.get("code") is not None and message.get("channel") is None:
+        return True
+    if message.get("result") is not None and not message.get("channel"):
+        return True
+    if message.get("error"):
+        return True
+    return False
+
+
+async def _ws_heartbeat(ws, *, interval: float, name: str) -> None:
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if ws.closed:
+                raise ConnectionError(f"{name} websocket closed during heartbeat")
+            try:
+                pong = await ws.ping()
+                await asyncio.wait_for(pong, timeout=interval)
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(f"{name} websocket heartbeat timeout") from exc
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("%s heartbeat failed", name)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        raise
 
 
 def _decode_ws_message(message: str | bytes) -> dict | None:

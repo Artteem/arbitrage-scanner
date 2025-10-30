@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, logging, math, time
+import asyncio, json, logging, math, sys, time
 from datetime import UTC, datetime, timedelta
 from typing import Iterable, Sequence
 
@@ -16,6 +16,9 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.status import get_auth_statuses, get_rest_limit_modes
 from .connectors.discovery import discover_symbols_for_connectors
+from arbitrage_scanner.connectors.mexc_perp import run_mexc
+from arbitrage_scanner.connectors.gate_perp import run_gate
+from arbitrage_scanner.connectors.bingx_perp import run_bingx
 from .db.history import load_spread_candles_from_quotes
 from .db.live import RealtimeDatabaseSink
 from .db.session import get_session
@@ -42,6 +45,7 @@ for connector in CONNECTORS:
         TAKER_FEES[connector.name] = connector.taker_fee
 
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+FORCE_PERP = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 SPREAD_REFRESH_INTERVAL = 0.1
@@ -154,6 +158,22 @@ async def _spread_loop() -> None:
 async def startup():
     # 1) Синхронизируем метаданные бирж и исторические данные
     global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC, LIVE_SINK, CONTRACT_LOOKUP
+    for name in (
+        "arbitrage_scanner.connectors.mexc_perp",
+        "arbitrage_scanner.connectors.gate_perp",
+        "arbitrage_scanner.connectors.bingx_perp",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        if not lg.handlers:
+            h = logging.StreamHandler(sys.stdout)
+            h.setLevel(logging.DEBUG)
+            h.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(name)s %(levelname)s: %(message)s"
+                )
+            )
+            lg.addHandler(h)
     metadata_summary: DataSyncSummary | None = None
     try:
         metadata_summary = await perform_initial_sync(CONNECTORS)
@@ -203,6 +223,9 @@ async def startup():
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
+    _tasks.append(asyncio.create_task(run_mexc(store, FORCE_PERP)))
+    _tasks.append(asyncio.create_task(run_gate(store, FORCE_PERP)))
+    _tasks.append(asyncio.create_task(run_bingx(store, FORCE_PERP)))
     _tasks.append(asyncio.create_task(_spread_loop()))
 
 

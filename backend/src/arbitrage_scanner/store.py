@@ -1,9 +1,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, Iterable, List, Tuple
+import logging
 import time
 
 from .domain import ExchangeName, Symbol, Ticker
+
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .db.live import RealtimeDatabaseSink
@@ -87,8 +91,25 @@ class TickerStore:
     def upsert_ticker(self, t: Ticker) -> None:
         exchange = _normalize_exchange(t.exchange)
         symbol = _normalize_symbol(t.symbol)
+
+        if not exchange or not symbol:
+            log.warning(
+                "STORE DROP reason=bad_keys exchange=%s symbol=%s raw=%r",
+                getattr(t, "exchange", None),
+                getattr(t, "symbol", None),
+                t,
+            )
+            return
+
         if exchange != t.exchange or symbol != t.symbol:
             t = t.copy(update={"exchange": exchange, "symbol": symbol})
+
+        log.info(
+            "STORE UPSERT ok exchange=%s symbol_common=%s mid=%s",
+            t.exchange,
+            t.symbol,
+            getattr(t, "mid", None),
+        )
 
         self._latest[(exchange, symbol)] = t
         self._ticker_updates += 1
