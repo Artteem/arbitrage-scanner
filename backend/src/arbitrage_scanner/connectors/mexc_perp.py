@@ -16,12 +16,10 @@ from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
-WS_ENDPOINT = "wss://contract.mexc.com/edge"
+WS_ENDPOINT = "wss://contract.mexc.com/ws"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
-WS_DEPTH_LEVELS = 50
 MAX_TOPICS_PER_CONN = 100
-MAX_TOPICS_PER_SUB_MSG = 30
 WS_SUB_DELAY = 0.1
 HEARTBEAT_INTERVAL = 20.0
 MIN_SYMBOL_THRESHOLD = 1
@@ -102,13 +100,8 @@ def _as_float(value) -> float:
         return 0.0
 
 
-def _chunked(sequence: Sequence, size: int) -> Iterable[Sequence]:
-    for idx in range(0, len(sequence), size):
-        yield sequence[idx : idx + size]
-
-
-def _to_mexc_symbol(symbol: Symbol) -> str:
-    sym = str(symbol)
+def _to_mexc_contract(symbol: Symbol) -> str:
+    sym = str(symbol).replace('-', '').replace(' ', '')
     if "_" in sym:
         return sym
     if sym.endswith("USDT"):
@@ -157,7 +150,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 
     symbol_pairs: list[tuple[str, str]] = []
     for sym in subscribe:
-        native = _to_mexc_symbol(sym)
+        native = _to_mexc_contract(sym)
         if not native:
             continue
         symbol_pairs.append((sym, native))
@@ -224,8 +217,12 @@ async def _run_mexc_ws(
 
                 raw_message = str(msg)
 
-                if _is_ack_message(msg):
+                if _is_mexc_ack(msg):
                     logger.info("MEXC WS ack: %s", raw_message[:500])
+                    continue
+
+                if isinstance(msg, dict) and msg.get("channel") == "rs.error":
+                    logger.error("MEXC WS error: %s", raw_message[:500])
                     continue
 
                 if _is_ping(msg):
@@ -391,38 +388,27 @@ async def _send_mexc_subscriptions(
     if not unique:
         return
 
-    base_id = int(time.time() * 1_000)
-
-    ticker_symbols = [native for _, native in unique]
-    if not ticker_symbols:
-        return
-
     for common, native in unique:
         logger.info("MEXC subscribe ticker -> %s (native=%s)", common, native)
-
-    for chunk in _chunked(ticker_symbols, MAX_TOPICS_PER_SUB_MSG):
-        payload = {"method": "sub.ticker", "params": list(chunk), "id": base_id}
-        base_id += 1
-        await _send_json_with_retry(ws, payload)
+        ticker_payload = {"op": "sub.ticker", "symbol": native}
+        await _send_json_with_retry(ws, ticker_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
-    depth_params = [[sym, WS_DEPTH_LEVELS] for sym in ticker_symbols]
-    for chunk in _chunked(depth_params, MAX_TOPICS_PER_SUB_MSG):
-        payload = {"method": "sub.depth", "params": list(chunk), "id": base_id}
-        base_id += 1
-        await _send_json_with_retry(ws, payload)
+        logger.info("MEXC subscribe depth -> %s", native)
+        depth_payload = {"op": "sub.depth", "symbol": native, "type": "step0"}
+        await _send_json_with_retry(ws, depth_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
-    for chunk in _chunked(ticker_symbols, MAX_TOPICS_PER_SUB_MSG):
-        payload = {"method": "sub.funding_rate", "params": list(chunk), "id": base_id}
-        base_id += 1
-        await _send_json_with_retry(ws, payload)
+        logger.info("MEXC subscribe funding -> %s", native)
+        funding_payload = {"op": "sub.funding_rate", "symbol": native}
+        await _send_json_with_retry(ws, funding_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
 
 async def _send_json_with_retry(ws, payload: dict) -> None:
     try:
         await ws.send(json.dumps(payload))
+        logger.info("MEXC WS send -> %s", json.dumps(payload)[:200])
     except Exception:
         logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
 
@@ -486,19 +472,26 @@ def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
         )
 
 
-def _is_ack_message(message: dict) -> bool:
+def _is_mexc_ack(message: dict) -> bool:
     if not isinstance(message, dict):
         return False
-    if message.get("id") is None:
-        return False
-    if message.get("success") is True:
+
+    channel = message.get("channel")
+    if isinstance(channel, str) and channel in {
+        "rs.sub",
+        "rs.unsub",
+        "rs.ping",
+        "rs.pong",
+        "rs.query",
+    }:
         return True
-    if message.get("code") is not None and message.get("channel") is None:
+
+    if message.get("op") in {"sub", "unsub"} and message.get("success") is True:
         return True
-    if message.get("result") is not None and not message.get("channel"):
+
+    if message.get("success") is True and not message.get("data"):
         return True
-    if message.get("error"):
-        return True
+
     return False
 
 

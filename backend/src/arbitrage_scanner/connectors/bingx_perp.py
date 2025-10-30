@@ -16,6 +16,7 @@ from .discovery import discover_bingx_usdt_perp
 logger = logging.getLogger(__name__)
 
 WS_ENDPOINTS = (
+    "wss://open-api.bingx.com/market",
     "wss://open-api-swap.bingx.com/standard/market?compress=false",
     "wss://open-api-ws.bingx.com/market?compress=false",
 )
@@ -42,6 +43,16 @@ BINGX_HEADERS = {
     "Referer": "https://bingx.com/",
     "Accept": "application/json, text/plain, */*",
 }
+
+
+def _is_bingx_ack(msg: dict) -> bool:
+    """Return True if the message is an acknowledgement frame."""
+    return (
+        isinstance(msg, dict)
+        and msg.get("code") == 0
+        and "data" not in msg
+        and "dataType" not in msg
+    )
 
 
 async def _resolve_bingx_symbols(symbols: Sequence[Symbol]) -> tuple[list[Symbol], bool]:
@@ -297,7 +308,6 @@ class _BingxWsClient:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._rx_task: asyncio.Task | None = None
         self._hb_task: asyncio.Task | None = None
-        self._endpoint_idx = 0
         self._last_rx_ts = 0.0
         self._active_subs: Dict[str, Dict[str, Any]] = {}
         self.ws_url = WS_ENDPOINTS[0]
@@ -345,23 +355,32 @@ class _BingxWsClient:
             backoff = min(backoff * 2, 30.0)
 
     async def _open_ws(self) -> None:
-        endpoint = WS_ENDPOINTS[self._endpoint_idx % len(WS_ENDPOINTS)]
-        self._endpoint_idx += 1
-        self.ws_url = endpoint
-        self.log.info('Connecting to BingX WS endpoint %s', endpoint)
-        self._ws = await websockets.connect(
-            endpoint,
-            ping_interval=None,
-            ping_timeout=None,
-            max_size=32 * 1024 * 1024,
-            compression=None,
-            close_timeout=3,
-            read_limit=2**20,
-            max_queue=1024,
-            extra_headers=BINGX_HEADERS,
-        )
-        self._rx_task = asyncio.create_task(self._ws_reader())
-        self._hb_task = asyncio.create_task(self._ws_heartbeat())
+        last_error: Exception | None = None
+        for endpoint in WS_ENDPOINTS:
+            try:
+                self.ws_url = endpoint
+                self.log.info('Connecting to BingX WS endpoint %s', endpoint)
+                self._ws = await websockets.connect(
+                    endpoint,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    max_size=32 * 1024 * 1024,
+                    compression=None,
+                    close_timeout=3,
+                    read_limit=2**20,
+                    max_queue=1024,
+                    extra_headers=BINGX_HEADERS,
+                )
+                self._rx_task = asyncio.create_task(self._ws_reader())
+                self._hb_task = asyncio.create_task(self._ws_heartbeat())
+                return
+            except Exception as exc:
+                last_error = exc
+                self.log.warning(
+                    'Failed to connect to BingX endpoint %s: %s', endpoint, repr(exc)
+                )
+        if last_error:
+            raise last_error
 
     async def _close_ws(self) -> None:
         tasks = [task for task in (self._rx_task, self._hb_task) if task is not None]
@@ -400,11 +419,14 @@ class _BingxWsClient:
         if not self._ws:
             return
 
-        for key, template in self._active_subs.items():
-            payload = dict(template)
-            payload['id'] = self._next_id()
+        for key, payload in self._active_subs.items():
             try:
                 await self._ws.send(json.dumps(payload))
+                self.log.info(
+                    'BingX WS subscribe send %s -> %s',
+                    key,
+                    json.dumps(payload)[:200],
+                )
                 await asyncio.sleep(0.01)
             except Exception as exc:
                 self.log.error('Resubscribe failed for %s: %s', key, exc)
@@ -495,70 +517,63 @@ class _BingxWsClient:
     def _prepare_subscriptions(self) -> None:
         if self._ticker_pairs:
             seen: set[str] = set()
-            unique: list[tuple[str, str]] = []
             for common, native in self._ticker_pairs:
                 if not native:
                     continue
-                normalized = native if native.upper() == 'ALL' else native.replace('_', '-')
+                if str(native).upper() == 'ALL':
+                    continue
+                normalized = native.replace('_', '-')
                 if normalized in seen:
                     continue
                 seen.add(normalized)
-                unique.append((common, normalized))
-
-            if unique:
-                topics = [f"swap/ticker:{native}" for _, native in unique]
-                _log_ws_subscriptions('ticker', topics)
-                for common, native in unique:
-                    key = f'ticker:{common}' if common else f'ticker:{native}'
-                    payload = {
-                        'reqType': 'sub',
-                        'dataType': f'swap/ticker:{native}',
-                        'data': None,
-                    }
-                    self._remember_sub(key, payload)
-                    self.log.info(
-                        'BingX subscribe ticker -> %s (native=%s)',
-                        common,
-                        native,
-                    )
+                payload = {
+                    'operation': 'subscribe',
+                    'channel': 'swap/ticker',
+                    'symbol': normalized,
+                }
+                _log_ws_subscriptions('ticker', [normalized])
+                self.log.info('BingX subscribe ticker -> %s (native=%s)', common, normalized)
+                key = f'ticker:{common or normalized}'
+                self._remember_sub(key, payload)
 
         if self._depth_symbols:
-            depth_topics = []
+            seen_depth: set[str] = set()
             for sym in self._depth_symbols:
                 if not sym or sym.upper() == 'ALL':
                     continue
-                depth_topics.append(f"swap/depth5:{sym.replace('_', '-')}")
-            if depth_topics:
-                _log_ws_subscriptions('depth', depth_topics)
-                for topic in depth_topics:
-                    payload = {
-                        'reqType': 'sub',
-                        'dataType': topic,
-                        'data': None,
-                    }
-                    self._remember_sub(f'depth:{topic}', payload)
+                topic = sym.replace('_', '-')
+                if topic in seen_depth:
+                    continue
+                seen_depth.add(topic)
+                payload = {
+                    'operation': 'subscribe',
+                    'channel': 'swap/depth5',
+                    'symbol': topic,
+                }
+                _log_ws_subscriptions('depth', [topic])
+                self.log.info('BingX subscribe depth -> %s', topic)
+                self._remember_sub(f'depth:{topic}', payload)
 
         if self._funding_symbols:
-            funding_topics = []
+            seen_funding: set[str] = set()
             for sym in self._funding_symbols:
                 if not sym or sym.upper() == 'ALL':
                     continue
-                funding_topics.append(f"swap/fundingRate:{sym.replace('_', '-')}")
-            if funding_topics:
-                _log_ws_subscriptions('funding', funding_topics)
-                for topic in funding_topics:
-                    payload = {
-                        'reqType': 'sub',
-                        'dataType': topic,
-                        'data': None,
-                    }
-                    self._remember_sub(f'funding:{topic}', payload)
+                topic = sym.replace('_', '-')
+                if topic in seen_funding:
+                    continue
+                seen_funding.add(topic)
+                payload = {
+                    'operation': 'subscribe',
+                    'channel': 'swap/fundingRate',
+                    'symbol': topic,
+                }
+                _log_ws_subscriptions('funding', [topic])
+                self.log.info('BingX subscribe funding -> %s', topic)
+                self._remember_sub(f'funding:{topic}', payload)
 
     def _remember_sub(self, key: str, payload: Dict[str, Any]) -> None:
         self._active_subs[key] = payload
-
-    def _next_id(self) -> str:
-        return str(int(time.time() * 1_000))
 
     def _log_raw_frame(self, raw: Any) -> None:
         if isinstance(raw, (bytes, bytearray)):
@@ -616,6 +631,14 @@ class _BingxWsClient:
 
         if _is_bingx_ack(message):
             self.log.info('BingX WS ack: %s', str(message)[:500])
+            return
+
+        code = message.get('code') if isinstance(message.get('code'), (int, float)) else None
+        if code and code != 0:
+            channel = message.get('dataType') or message.get('channel')
+            self.log.error(
+                'BingX WS error (channel=%s): %s', channel, str(message)[:500]
+            )
             return
 
         data_type = str(message.get('dataType') or '').lower()
@@ -892,6 +915,40 @@ def _extract_last_price(container: dict) -> float | None:
         if price > 0:
             return price
     return None
+
+
+def _decode_ws_message(message: str | bytes | bytearray) -> dict | None:
+    text: str | None
+    if isinstance(message, str):
+        text = message
+    elif isinstance(message, (bytes, bytearray)):
+        text = _decode_ws_text(bytes(message))
+    else:
+        return None
+
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _decode_ws_text(data: bytes) -> str | None:
+    if not data:
+        return None
+
+    if len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B:
+        try:
+            return gzip.decompress(data).decode('utf-8')
+        except Exception:
+            return None
+
+    try:
+        return data.decode('utf-8')
+    except Exception:
+        return None
 
 
 def _parse_funding_interval(payload: dict) -> str:
