@@ -21,7 +21,7 @@ WS_ENDPOINTS = (
     "wss://open-api-swap.bingx.com/swap-market",
 )
 MAX_TOPICS_PER_CONN = 100
-MAX_TOPICS_PER_SUB_MSG = 50 # BingX ограничивает кол-во dataType в одном запросе
+MAX_TOPICS_PER_SUB_MSG = 10 # BingX ограничивает кол-во dataType в одном запросе
 WS_SUB_DELAY = 0.1
 HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
