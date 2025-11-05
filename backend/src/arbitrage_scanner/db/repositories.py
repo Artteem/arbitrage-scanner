@@ -104,7 +104,7 @@ async def upsert_contracts(
             "normalized_name": contract.normalized_name,
             "base_asset": contract.base_asset,
             "quote_asset": contract.quote_asset,
-            "type": contract.contract_type,
+            "type": contract.contract_type.value,
             "is_active": contract.is_active,
             "contract_size": contract.contract_size,
             "tick_size": contract.tick_size,
