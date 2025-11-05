@@ -542,7 +542,7 @@ class _BingxWsClient:
                     "reqType": "sub",
                     "dataType": topic
                 }
-                self.log.info('BingX adding ticker sub -> %s (native=%s)', common, topic)
+                self.log.debug('BingX adding ticker sub -> %s (native=%s)', common, topic)
                 self._remember_sub(f'ticker:{normalized}', payload)
 
         # 2. Depth (Стаканы)
@@ -560,7 +560,7 @@ class _BingxWsClient:
                     "reqType": "sub",
                     "dataType": topic
                 }
-                self.log.info('BingX adding depth sub -> %s', topic)
+                self.log.debug('BingX adding depth sub -> %s', topic)
                 self._remember_sub(f'depth:{topic_symbol}', payload)
 
         # 3. Funding (Фандинг)
@@ -578,7 +578,7 @@ class _BingxWsClient:
                     "reqType": "sub",
                     "dataType": topic
                 }
-                self.log.info('BingX adding funding sub -> %s', topic)
+                self.log.debug('BingX adding funding sub -> %s', topic)
                 self._remember_sub(f'funding:{topic_symbol}', payload)
 
 
