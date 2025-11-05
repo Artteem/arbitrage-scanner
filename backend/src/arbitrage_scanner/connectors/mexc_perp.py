@@ -389,17 +389,17 @@ async def _send_mexc_subscriptions(
         return
 
     for common, native in unique:
-        logger.info("MEXC subscribe ticker -> %s (native=%s)", common, native)
+        logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
         ticker_payload = {"op": "sub.ticker", "symbol": native}
         await _send_json_with_retry(ws, ticker_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
-        logger.info("MEXC subscribe depth -> %s", native)
+        logger.debug("MEXC subscribe depth -> %s", native)
         depth_payload = {"op": "sub.depth", "symbol": native, "type": "step0"}
         await _send_json_with_retry(ws, depth_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
-        logger.info("MEXC subscribe funding -> %s", native)
+        logger.debug("MEXC subscribe funding -> %s", native)
         funding_payload = {"op": "sub.funding_rate", "symbol": native}
         await _send_json_with_retry(ws, funding_payload)
         await asyncio.sleep(WS_SUB_DELAY)
@@ -408,7 +408,7 @@ async def _send_mexc_subscriptions(
 async def _send_json_with_retry(ws, payload: dict) -> None:
     try:
         await ws.send(json.dumps(payload))
-        logger.info("MEXC WS send -> %s", json.dumps(payload)[:200])
+        logger.debug("MEXC WS send -> %s", json.dumps(payload)[:200])
     except Exception:
         logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
 

@@ -104,14 +104,14 @@ def _log_ws_subscriptions(kind: str, topics: Sequence[str]) -> None:
     preview = list(topics[:_SUBSCRIPTION_LOG_LIMIT])
     extra = len(topics) - len(preview)
     if extra > 0:
-        logger.info(
+        logger.debug(
             "BingX WS %s subscriptions: %s (+%d more)",
             kind,
             preview,
             extra,
         )
     else:
-        logger.info("BingX WS %s subscriptions: %s", kind, preview)
+        logger.debug("BingX WS %s subscriptions: %s", kind, preview)
 
 
 def _log_ws_payload_received(symbol: Symbol) -> None:
@@ -119,7 +119,7 @@ def _log_ws_payload_received(symbol: Symbol) -> None:
     if _WS_PAYLOAD_LOG_COUNT >= _WS_PAYLOAD_LOG_LIMIT:
         return
     _WS_PAYLOAD_LOG_COUNT += 1
-    logger.info("BingX WS payload received for %s", symbol)
+    logger.debug("BingX WS payload received for %s", symbol)
 
 
 def _log_first_ticker(symbol: Symbol, bid: float, ask: float) -> None:
@@ -129,7 +129,7 @@ def _log_first_ticker(symbol: Symbol, bid: float, ask: float) -> None:
     if target in _LOG_ONCE_TICKERS:
         return
     _LOG_ONCE_TICKERS.add(target)
-    logger.info("BingX first ticker for %s: bid=%s ask=%s", target, bid, ask)
+    logger.debug("BingX first ticker for %s: bid=%s ask=%s", target, bid, ask)
 
 
 def _extract_price(item: dict, keys: Iterable[str]) -> float:
