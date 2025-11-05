@@ -845,7 +845,7 @@ def _iter_ws_payloads(
             continue
 
         common_symbol = _from_bingx_symbol(raw_symbol)
-        logger.info(
+        logger.debug(
             "WS PARSE exchange=%s native=%s -> common=%s",
             "bingx",
             raw_symbol,
