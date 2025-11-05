@@ -51,8 +51,8 @@ async def _signed_get(
     if not creds:
         if provider:
             logger.debug("Gate credentials missing, using public REST endpoints")
-        # ИСПРАВЛЕНИЕ: Добавлен proxies
-        return await client.get(url, params=params, proxies=_PROXIES)
+        # ИСПРАВЛЕНИЕ: убран proxies из .get()
+        return await client.get(url, params=params)
 
     query_params = dict(params or {})
     headers, query_string = sign_request("gate", "GET", path, query_params, None, creds)
@@ -60,15 +60,15 @@ async def _signed_get(
     request_headers.update(headers)
     base_url = url.split("?")[0]
     target_url = f"{base_url}?{query_string}" if query_string else base_url
-    # ИСПРАВЛЕНИЕ: Добавлен proxies
-    response = await client.get(target_url, headers=request_headers, proxies=_PROXIES)
+    # ИСПРАВЛЕНИЕ: убран proxies из .get()
+    response = await client.get(target_url, headers=request_headers)
     if response.status_code in {401, 403}:
         logger.warning(
             "Gate authenticated request failed with %s, retrying without credentials",
             response.status_code,
         )
-        # ИСПРАВЛЕНИЕ: Добавлен proxies
-        return await client.get(url, params=params, proxies=_PROXIES)
+        # ИСПРАВЛЕНИЕ: убран proxies из .get()
+        return await client.get(url, params=params)
     return response
 
 
@@ -93,10 +93,12 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 
 async def get_gate_contracts() -> List[ConnectorContract]:
-    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
-    async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS
-    ) as client:
+    # ИСПРАВЛЕНИЕ: Конструктор httpx.AsyncClient теперь условный
+    client_params = {"timeout": _DEFAULT_TIMEOUT, "headers": _HEADERS}
+    if _PROXIES:
+        client_params["proxies"] = _PROXIES
+
+    async with httpx.AsyncClient(**client_params) as client:
         response = await _signed_get(client, _GATE_CONTRACTS, _PATH_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
@@ -179,10 +181,12 @@ async def get_gate_historical_quotes(
     }
     quotes: List[ConnectorQuote] = []
 
-    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
-    async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS
-    ) as client:
+    # ИСПРАВЛЕНИЕ: Конструктор httpx.AsyncClient теперь условный
+    client_params = {"timeout": _DEFAULT_TIMEOUT, "headers": _HEADERS}
+    if _PROXIES:
+        client_params["proxies"] = _PROXIES
+
+    async with httpx.AsyncClient(**client_params) as client:
         response = await _signed_get(client, _GATE_CANDLES, _PATH_CANDLES, params=params)
         response.raise_for_status()
         data = response.json()
@@ -220,10 +224,12 @@ async def get_gate_funding_history(
     }
     funding: List[ConnectorFundingRate] = []
 
-    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
-    async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS
-    ) as client:
+    # ИСПРАВЛЕНИЕ: Конструктор httpx.AsyncClient теперь условный
+    client_params = {"timeout": _DEFAULT_TIMEOUT, "headers": _HEADERS}
+    if _PROXIES:
+        client_params["proxies"] = _PROXIES
+
+    async with httpx.AsyncClient(**client_params) as client:
         response = await _signed_get(client, _GATE_FUNDING, _PATH_FUNDING, params=params)
         response.raise_for_status()
         data = response.json()
