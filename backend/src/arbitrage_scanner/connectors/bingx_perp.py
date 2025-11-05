@@ -1,3 +1,4 @@
+# [НАЧАЛО ФАЙЛА: backend/src/arbitrage_scanner/connectors/bingx_perp.py]
 from __future__ import annotations
 
 import asyncio, json, gzip, io, time, random
@@ -15,13 +16,12 @@ from .discovery import discover_bingx_usdt_perp
 
 logger = logging.getLogger(__name__)
 
+# ИСПРАВЛЕНИЕ 1: Использовать ЕДИНСТВЕННЫЙ правильный WS endpoint для Perpetual Swap
 WS_ENDPOINTS = (
-    "wss://open-api.bingx.com/market",
-    "wss://open-api-swap.bingx.com/standard/market?compress=false",
-    "wss://open-api-ws.bingx.com/market?compress=false",
+    "wss://open-api-swap.bingx.com/swap-market",
 )
 MAX_TOPICS_PER_CONN = 100
-MAX_TOPICS_PER_SUB_MSG = 30
+MAX_TOPICS_PER_SUB_MSG = 50 # BingX ограничивает кол-во dataType в одном запросе
 WS_SUB_DELAY = 0.1
 HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
@@ -47,6 +47,11 @@ BINGX_HEADERS = {
 
 def _is_bingx_ack(msg: dict) -> bool:
     """Return True if the message is an acknowledgement frame."""
+    if not isinstance(msg, dict):
+        return False
+    # Успешный ответ на подписку
+    if "reqType" in msg and msg.get("code") == 0 and "id" in msg:
+        return True
     return (
         isinstance(msg, dict)
         and msg.get("code") == 0
@@ -192,6 +197,7 @@ def _to_bingx_symbol(symbol: Symbol) -> str:
 
 
 def _to_bingx_ws_symbol(symbol: Symbol) -> str:
+    # ИСПРАВЛЕНИЕ: приводим к формату BTC-USDT
     sym = _normalize_common_symbol(symbol)
     for quote in ("USDT", "USDC", "USD", "BUSD", "FDUSD"):
         if sym.endswith(quote):
@@ -215,10 +221,9 @@ def _from_bingx_symbol(symbol: str | None) -> str | None:
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    # 1. Получаем список символов, ИГНОРИРУЯ флаг subscribe_all
-    subscribe, _ = await _resolve_bingx_symbols(symbols) # [CI: 79]
+    # ИСПРАВЛЕНИЕ: Убираем логику 'subscribe_all', она была некорректной
+    subscribe, _ = await _resolve_bingx_symbols(symbols)
 
-    # 2. Проверяем, что список символов не пуст
     if not subscribe:
         logger.warning("No symbols resolved for BingX connector; skipping startup")
         return
@@ -227,15 +232,12 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, MAX_TOPICS_PER_CONN)
     ]
 
-    # 3. Блок 'if subscribe_all:' ПОЛНОСТЬЮ УДАЛЕН.
-    #    Оставили только цикл по 'chunks'.
-
     while True:
         tasks: list[asyncio.Task] = []
         clients: list[_BingxWsClient] = []
 
         try:
-            # 4. Цикл for chunk in chunks: теперь единственный, кто создает клиенты
+            # Блок 'if subscribe_all:' УДАЛЕН
             for chunk in chunks:
                 wanted_common = _collect_wanted_common(chunk)
                 if not wanted_common:
@@ -423,9 +425,10 @@ class _BingxWsClient:
                     key,
                     json.dumps(payload)[:200],
                 )
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(WS_SUB_DELAY) # Добавляем задержку между подписками
             except Exception as exc:
                 self.log.error('Resubscribe failed for %s: %s', key, exc)
+                raise # Если подписка не удалась, нужно переподключиться
 
     async def _ws_reader(self) -> None:
         assert self._ws is not None
@@ -436,18 +439,26 @@ class _BingxWsClient:
                 txt = self._maybe_gunzip(raw)
                 self._last_rx_ts = time.time()
 
+                # ИСПРАВЛЕНИЕ 3: Обработка Ping/Pong
+                if txt == 'Ping':
+                    await self._ws.send('Pong')
+                    self.log.debug("BingX WS Pong sent")
+                    continue
+
                 msg = None
                 if txt:
                     try:
                         msg = json.loads(txt)
                     except Exception:
-                        self.log.debug('BingX WS TXT: %s', txt[:200])
+                        if txt != 'Pong': # Не логируем наши собственные ответы
+                            self.log.debug('BingX WS TXT: %s', txt[:200])
 
                 sample_source = msg if msg is not None else txt
                 if sample_source is not None and int(time.time()) % 10 == 0:
                     self.log.debug('WS RX sample: %s', str(sample_source)[:300])
 
                 if isinstance(msg, dict):
+                    # Старая (документация v1) обработка ping/pong, оставляем на всякий случай
                     if 'ping' in msg:
                         pong = {'pong': msg.get('ping')}
                         await self._ws.send(json.dumps(pong))
@@ -478,95 +489,90 @@ class _BingxWsClient:
             raise
 
     async def _ws_heartbeat(self) -> None:
-        WS_PING_EVERY = 20
-        APP_PING_EVERY = 40
-        last_app_ping = 0.0
-
+        # Убираем отправку ping'ов от клиента, т.к. сервер
+        # сам присылает "Ping", а мы на него отвечаем "Pong"
         try:
             while self._running:
-                if not self._ws:
-                    await asyncio.sleep(WS_PING_EVERY)
-                    continue
-                try:
-                    pong_waiter = await self._ws.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=10)
-                except Exception as exc:
-                    self.log.error('bingx heartbeat failed: %s', repr(exc))
-                    raise
-
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if not self._ws or self._ws.closed:
+                    raise ConnectionError("BingX websocket closed")
                 now = time.time()
-                if now - last_app_ping > APP_PING_EVERY:
-                    try:
-                        await self._ws.send(
-                            json.dumps({'event': 'ping', 'ts': int(now * 1000)})
-                        )
-                        last_app_ping = now
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(WS_PING_EVERY)
+                if (now - self._last_rx_ts) > (HEARTBEAT_INTERVAL * 2.5):
+                    self.log.warning("BingX WS timeout: no message received in %s sec", int(now - self._last_rx_ts))
+                    raise ConnectionError("BingX WS timeout")
         except asyncio.CancelledError:
             raise
         except Exception:
             raise
 
     def _prepare_subscriptions(self) -> None:
+        # ИСПРАВЛЕНИЕ 2: Используем новый формат подписки reqType/dataType
+        
+        # 1. Tickers
+        ticker_topics = []
         if self._ticker_pairs:
             seen: set[str] = set()
             for common, native in self._ticker_pairs:
-                if not native:
-                    continue
-                if str(native).upper() == 'ALL':
-                    continue
-                normalized = native.replace('_', '-')
-                if normalized in seen:
-                    continue
+                if not native: continue
+                if str(native).upper() == 'ALL': continue
+                normalized = native.replace('_', '-') # Документация использует BTC-USDT
+                if normalized in seen: continue
                 seen.add(normalized)
-                payload = {
-                    'operation': 'subscribe',
-                    'channel': 'swap/ticker',
-                    'symbol': normalized,
-                }
-                _log_ws_subscriptions('ticker', [normalized])
-                self.log.info('BingX subscribe ticker -> %s (native=%s)', common, normalized)
-                key = f'ticker:{common or normalized}'
-                self._remember_sub(key, payload)
+                ticker_topics.append(f"{normalized}@ticker")
+                self.log.info('BingX adding ticker sub -> %s (native=%s)', common, normalized)
+        
+        for i, chunk in enumerate(_chunk_list(ticker_topics, MAX_TOPICS_PER_SUB_MSG)):
+            payload = {
+                "id": f"sub_tickers_{i}_{int(time.time())}",
+                "reqType": "sub",
+                "dataType": list(chunk)
+            }
+            _log_ws_subscriptions('ticker', chunk)
+            key = f'tickers:{i}'
+            self._remember_sub(key, payload)
 
+        # 2. Depth (Стаканы)
+        depth_topics = []
         if self._depth_symbols:
             seen_depth: set[str] = set()
             for sym in self._depth_symbols:
-                if not sym or sym.upper() == 'ALL':
-                    continue
+                if not sym or sym.upper() == 'ALL': continue
                 topic = sym.replace('_', '-')
-                if topic in seen_depth:
-                    continue
+                if topic in seen_depth: continue
                 seen_depth.add(topic)
-                payload = {
-                    'operation': 'subscribe',
-                    'channel': 'swap/depth5',
-                    'symbol': topic,
-                }
-                _log_ws_subscriptions('depth', [topic])
-                self.log.info('BingX subscribe depth -> %s', topic)
-                self._remember_sub(f'depth:{topic}', payload)
+                depth_topics.append(f"{topic}@depth5") # Используем depth5, как в старом коде
+                self.log.info('BingX adding depth sub -> %s', topic)
 
+        for i, chunk in enumerate(_chunk_list(depth_topics, MAX_TOPICS_PER_SUB_MSG)):
+            payload = {
+                "id": f"sub_depth_{i}_{int(time.time())}",
+                "reqType": "sub",
+                "dataType": list(chunk)
+            }
+            _log_ws_subscriptions('depth', chunk)
+            self._remember_sub(f'depth:{i}', payload)
+
+        # 3. Funding (Фандинг)
+        funding_topics = []
         if self._funding_symbols:
             seen_funding: set[str] = set()
             for sym in self._funding_symbols:
-                if not sym or sym.upper() == 'ALL':
-                    continue
+                if not sym or sym.upper() == 'ALL': continue
                 topic = sym.replace('_', '-')
-                if topic in seen_funding:
-                    continue
+                if topic in seen_funding: continue
                 seen_funding.add(topic)
-                payload = {
-                    'operation': 'subscribe',
-                    'channel': 'swap/fundingRate',
-                    'symbol': topic,
-                }
-                _log_ws_subscriptions('funding', [topic])
-                self.log.info('BingX subscribe funding -> %s', topic)
-                self._remember_sub(f'funding:{topic}', payload)
+                funding_topics.append(f"{topic}@fundingRate")
+                self.log.info('BingX adding funding sub -> %s', topic)
+
+        for i, chunk in enumerate(_chunk_list(funding_topics, MAX_TOPICS_PER_SUB_MSG)):
+            payload = {
+                "id": f"sub_funding_{i}_{int(time.time())}",
+                "reqType": "sub",
+                "dataType": list(chunk)
+            }
+            _log_ws_subscriptions('funding', chunk)
+            self._remember_sub(f'funding:{i}', payload)
+
 
     def _remember_sub(self, key: str, payload: Dict[str, Any]) -> None:
         self._active_subs[key] = payload
@@ -618,7 +624,7 @@ class _BingxWsClient:
             try:
                 parsed = json.loads(message)
             except Exception:
-                self.log.debug('BingX WS TXT: %s', message[:200])
+                # self.log.debug('BingX WS TXT: %s', message[:200])
                 return
             self._handle_bingx_message(parsed)
             return
@@ -643,12 +649,17 @@ class _BingxWsClient:
         for common_symbol, payload in _iter_ws_payloads(message, self._wanted_common):
             if not payload:
                 continue
-
-            if 'fundingrate' in data_type:
+            
+            # В v2 'dataType' содержит и тип, и символ (напр., "btc-usdt@ticker")
+            # 'data' содержит сам payload
+            is_funding = 'fundingrate' in data_type
+            is_depth = 'depth' in data_type
+            
+            if is_funding:
                 rate = _extract_price(
                     payload,
                     (
-                        'fundingRate',
+                        'fundingRate', # 'f' в доках, но оставим старые ключи
                         'funding_rate',
                         'rate',
                         'value',
@@ -660,9 +671,9 @@ class _BingxWsClient:
                 )
                 continue
 
-            if 'depth' in data_type or (
+            if is_depth or (
                 isinstance(payload, dict)
-                and (payload.get('bids') or payload.get('asks'))
+                and (payload.get('bids') or payload.get('asks') or payload.get('b') or payload.get('a'))
             ):
                 bids, asks, last_price = _extract_depth_payload(payload)
                 if not bids and not asks and last_price is None:
@@ -677,9 +688,11 @@ class _BingxWsClient:
                 )
                 continue
 
+            # ИСПРАВЛЕНИЕ 4: Добавляем 'b' (bid) и 'a' (ask) из документации
             bid = _extract_price(
                 payload,
                 (
+                    'b', # <--- ИЗ ДОКУМЕНТАЦИИ V2 (Best Bid)
                     'bestBid',
                     'bestBidPrice',
                     'bid',
@@ -689,13 +702,13 @@ class _BingxWsClient:
                     'bp',
                     'bidPx',
                     'bestBidPx',
-                    'b',
                     'buyPrice',
                 ),
             )
             ask = _extract_price(
                 payload,
                 (
+                    'a', # <--- ИЗ ДОКУМЕНТАЦИИ V2 (Best Ask)
                     'bestAsk',
                     'bestAskPrice',
                     'ask',
@@ -705,7 +718,6 @@ class _BingxWsClient:
                     'ap',
                     'askPx',
                     'bestAskPx',
-                    'a',
                     'sellPrice',
                 ),
             )
@@ -723,10 +735,12 @@ class _BingxWsClient:
                 )
             )
             _log_first_ticker(common_symbol, bid, ask)
-
+            
+            # ИСПРАВЛЕНИЕ 4: 'c' (Close/LastPrice)
             last_price = _extract_price(
                 payload,
                 (
+                    'c', # <--- ИЗ ДОКУМЕНТАЦИИ V2 (Last Price)
                     'lastPrice',
                     'last',
                     'close',
@@ -765,6 +779,16 @@ def _iter_ws_payloads(
             if cand is not None:
                 payload = cand
                 break
+    
+    # В v2 'data' это и есть payload, 'dataType' содержит символ
+    if payload is None:
+        payload = message.get("data")
+
+    # Если 'data' нет, но есть 'dataType', то 'message' - это сам payload
+    if payload is None and "dataType" in message:
+        payload = message
+
+
     default_symbol: str | None = None
 
     arg = message.get("arg")
@@ -780,6 +804,8 @@ def _iter_ws_payloads(
         default_symbol = topic_symbol
 
     accepted: list[tuple[str, dict]] = []
+    
+    # 'payload' может быть списком в некоторых ответах, но в V2 (ticker/depth) это обычно dict
     for raw_symbol, payload_item in _iter_payload_items(payload, default_symbol):
         if not isinstance(payload_item, dict):
             logger.debug(
@@ -788,6 +814,10 @@ def _iter_ws_payloads(
                 type(payload_item).__name__,
             )
             continue
+        
+        # В v2 'data' это и есть payload, а 'dataType' (уже в default_symbol) несёт символ
+        if not raw_symbol:
+            raw_symbol = _extract_symbol(payload_item, None, default_symbol)
 
         if not raw_symbol:
             logger.debug(
@@ -842,10 +872,12 @@ def _extract_depth_payload(payload: dict) -> Tuple[List[Tuple[float, float]], Li
     for container in containers:
         if not isinstance(container, dict):
             continue
-
+        
+        # ИСПРАВЛЕНИЕ 4: Добавляем 'b' (bids) и 'a' (asks) из v2
         bids_candidate = _collect_depth_levels(
             container,
             (
+                "b", # <--- ИЗ ДОКУМЕНТАЦИИ V2 (Bids)
                 "bids",
                 "bid",
                 "buy",
@@ -859,6 +891,7 @@ def _extract_depth_payload(payload: dict) -> Tuple[List[Tuple[float, float]], Li
         asks_candidate = _collect_depth_levels(
             container,
             (
+                "a", # <--- ИЗ ДОКУМЕНТАЦИИ V2 (Asks)
                 "asks",
                 "ask",
                 "sell",
@@ -893,6 +926,7 @@ def _collect_depth_levels(container: dict, keys: Sequence[str]) -> List[Tuple[fl
 
 def _extract_last_price(container: dict) -> float | None:
     for key in (
+        "c", # <--- ИЗ ДОКУМЕНТАЦИИ V2
         "lastPrice",
         "last_price",
         "last",
@@ -949,152 +983,4 @@ def _decode_ws_text(data: bytes) -> str | None:
 
 def _parse_funding_interval(payload: dict) -> str:
     interval = payload.get("interval") or payload.get("fundingInterval")
-    if isinstance(interval, (int, float)) and interval > 0:
-        return f"{interval}h"
-    if isinstance(interval, str) and interval:
-        return interval
-    return "8h"
-
-
-def _iter_levels(source) -> Iterable[Tuple[float, float]]:
-    if isinstance(source, dict):
-        source = source.get("levels") or source.get("data") or source.get("list") or []
-    if not isinstance(source, (list, tuple)):
-        return []
-    result: List[Tuple[float, float]] = []
-    for entry in source:
-        price, size = _parse_level(entry)
-        if price is None or size is None:
-            continue
-        result.append((price, size))
-    return result
-
-
-def _parse_level(level) -> Tuple[float | None, float | None]:
-    price = size = None
-    if isinstance(level, dict):
-        for key in ("price", "p", "px", "bp", "ap"):
-            val = level.get(key)
-            if val is None:
-                continue
-            try:
-                price = float(val)
-                break
-            except Exception:
-                continue
-        for key in ("size", "qty", "q", "v", "volume"):
-            val = level.get(key)
-            if val is None:
-                continue
-            try:
-                size = float(val)
-                break
-            except Exception:
-                continue
-    elif isinstance(level, (list, tuple)) and len(level) >= 2:
-        try:
-            price = float(level[0])
-        except Exception:
-            price = None
-        try:
-            size = float(level[1])
-        except Exception:
-            size = None
-    if price is None or price <= 0:
-        return None, None
-    if size is None:
-        return price, 0.0
-    if size < 0:
-        size = 0.0
-    return price, size
-
-
-def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[str, dict]]:
-    if payload is None:
-        return []
-
-    items: list[tuple[str, dict]] = []
-
-    if isinstance(payload, dict):
-        dict_values = list(payload.values())
-        if dict_values and all(isinstance(v, dict) for v in dict_values):
-            for key, value in payload.items():
-                if not isinstance(value, dict):
-                    continue
-                symbol = _extract_symbol(value, key, default_symbol)
-                if symbol:
-                    items.append((symbol, value))
-        else:
-            symbol = _extract_symbol(payload, None, default_symbol)
-            if symbol:
-                items.append((symbol, payload))
-        return items
-
-    if not isinstance(payload, list):
-        return []
-
-    for value in payload:
-        if not isinstance(value, dict):
-            continue
-        symbol = _extract_symbol(value, None, default_symbol)
-        if symbol:
-            items.append((symbol, value))
-
-    return items
-
-
-def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str | None) -> str | None:
-    for key in ("symbol", "instId", "s", "market", "pair"):
-        val = payload.get(key)
-        if isinstance(val, str) and val:
-            return val
-
-    if fallback_key:
-        return fallback_key
-
-    return default_symbol
-
-
-def _extract_topic_symbol(data_type) -> str | None:
-    if isinstance(data_type, (list, tuple, set)):
-        for item in data_type:
-            symbol = _extract_topic_symbol(item)
-            if symbol:
-                return symbol
-        return None
-    if isinstance(data_type, dict):
-        return _extract_topic_symbol(
-            data_type.get("symbol")
-            or data_type.get("instId")
-            or data_type.get("pair")
-        )
-    if isinstance(data_type, str) and data_type:
-        segments: list[str] = []
-        if ":" in data_type:
-            segments.extend(part for part in data_type.split(":") if part)
-        if not segments:
-            segments = [data_type]
-
-        for segment in segments:
-            candidate = segment.strip()
-            if not candidate:
-                continue
-            if "/" in candidate:
-                candidate = candidate.split("/", maxsplit=1)[-1]
-            if candidate.lower().startswith("swap/ticker") and ":" in candidate:
-                candidate = candidate.split(":", maxsplit=1)[-1]
-            if candidate.lower().startswith("ticker."):
-                candidate = candidate.split(".", maxsplit=1)[-1]
-            if "." in candidate and "-" in candidate.split(".")[-1]:
-                candidate = candidate.split(".")[-1]
-            candidate = candidate.replace("_", "-")
-            if "-" in candidate:
-                return candidate.upper()
-        return data_type
-    return None
-
-
-async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
-    """Placeholder for future authenticated BingX channels."""
-    del ws, creds
-    return None
+    if isinstance(interval, (int, float
