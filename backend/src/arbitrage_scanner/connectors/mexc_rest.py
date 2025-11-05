@@ -41,7 +41,8 @@ async def _signed_get(
     if not creds:
         if provider:
             logger.debug("MEXC credentials missing, using public REST endpoints")
-        return await client.get(url, params=params)
+        # ИСПРАВЛЕНИЕ: Добавлен proxies
+        return await client.get(url, params=params, proxies=_PROXIES)
 
     query_params = dict(params or {})
     headers, query_string = sign_request("mexc", "GET", path, query_params, None, creds)
@@ -49,13 +50,15 @@ async def _signed_get(
     request_headers.update(headers)
     base_url = url.split("?")[0]
     target_url = f"{base_url}?{query_string}" if query_string else base_url
-    response = await client.get(target_url, headers=request_headers)
+    # ИСПРАВЛЕНИЕ: Добавлен proxies
+    response = await client.get(target_url, headers=request_headers, proxies=_PROXIES)
     if response.status_code in {401, 403}:
         logger.warning(
             "MEXC authenticated request failed with %s, retrying without credentials",
             response.status_code,
         )
-        return await client.get(url, params=params)
+        # ИСПРАВЛЕНИЕ: Добавлен proxies
+        return await client.get(url, params=params, proxies=_PROXIES)
     return response
 
 
@@ -80,7 +83,8 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 
 async def get_mexc_contracts() -> List[ConnectorContract]:
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
         response = await _signed_get(client, _MEXC_CONTRACTS, _PATH_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
@@ -165,7 +169,8 @@ async def get_mexc_historical_quotes(
     quotes: List[ConnectorQuote] = []
 
     url = _MEXC_KLINE_TEMPLATE.format(symbol=api_symbol)
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
         response = await _signed_get(client, url, urlparse(url).path, params=params)
         response.raise_for_status()
         payload = response.json()
@@ -201,7 +206,8 @@ async def get_mexc_funding_history(
     }
     funding: List[ConnectorFundingRate] = []
 
-    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, proxies=_PROXIES) as client:
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
+    async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
         response = await _signed_get(client, _MEXC_FUNDING, _PATH_FUNDING, params=params)
         response.raise_for_status()
         payload = response.json()

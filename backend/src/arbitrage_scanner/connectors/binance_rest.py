@@ -54,7 +54,8 @@ async def _signed_get(
     if not creds:
         if provider:
             logger.debug("Binance credentials missing, using public REST endpoints")
-        return await client.get(url, params=params)
+        # ИСПРАВЛЕНИЕ: Добавлен proxies
+        return await client.get(url, params=params, proxies=_PROXIES)
 
     query_params = dict(params or {})
     headers, query_string = sign_request("binance", "GET", path, query_params, None, creds)
@@ -62,13 +63,15 @@ async def _signed_get(
     request_headers.update(headers)
     base_url = url.split("?")[0]
     target_url = f"{base_url}?{query_string}" if query_string else base_url
-    response = await client.get(target_url, headers=request_headers)
+    # ИСПРАВЛЕНИЕ: Добавлен proxies
+    response = await client.get(target_url, headers=request_headers, proxies=_PROXIES)
     if response.status_code in {401, 403}:
         logger.warning(
             "Binance authenticated request failed with %s, retrying without credentials",
             response.status_code,
         )
-        return await client.get(url, params=params)
+        # ИСПРАВЛЕНИЕ: Добавлен proxies
+        return await client.get(url, params=params, proxies=_PROXIES)
     return response
 
 
@@ -98,8 +101,9 @@ def _resolve_api_symbol(symbol: Symbol) -> str:
 
 
 async def get_binance_contracts() -> List[ConnectorContract]:
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
     async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True, proxies=_PROXIES
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True
     ) as client:
         response = await _signed_get(client, _BINANCE_EXCHANGE_INFO, _PATH_EXCHANGE_INFO)
         response.raise_for_status()
@@ -147,8 +151,9 @@ async def get_binance_contracts() -> List[ConnectorContract]:
 async def get_binance_taker_fee(symbol: Symbol) -> float | None:
     api_symbol = _resolve_api_symbol(symbol)
     params = {"symbol": api_symbol}
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
     async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True, proxies=_PROXIES
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True
     ) as client:
         response = await _signed_get(client, _BINANCE_COMMISSION_RATE, _PATH_COMMISSION_RATE, params=params)
         if response.status_code == 404:
@@ -182,8 +187,9 @@ async def get_binance_historical_quotes(
     step_ms = max(int(interval.total_seconds() * 1000), 60_000)
     quotes: List[ConnectorQuote] = []
 
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
     async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True, proxies=_PROXIES
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True
     ) as client:
         cursor = start_ms
         while cursor < end_ms:
@@ -237,8 +243,9 @@ async def get_binance_funding_history(
     end_ms = int(end.timestamp() * 1000)
     funding: List[ConnectorFundingRate] = []
 
+    # ИСПРАВЛЕНИЕ: убран proxies из конструктора
     async with httpx.AsyncClient(
-        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True, proxies=_PROXIES
+        timeout=_DEFAULT_TIMEOUT, headers=_HEADERS, http2=True
     ) as client:
         cursor = start_ms
         while cursor < end_ms:
