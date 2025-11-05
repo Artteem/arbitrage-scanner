@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio, json, gzip, io, time, random
 import logging
+import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
@@ -147,9 +148,16 @@ def _extract_price(item: dict, keys: Iterable[str]) -> float:
 def _normalize_common_symbol(symbol: Symbol) -> str:
     normalized = normalize_bingx_symbol(symbol)
     if normalized:
+        # Дополнительная проверка на ASCII
+        if not re.fullmatch(r'[A-Z0-9]+', normalized):
+            return ""
         return normalized
     sym = str(symbol).upper()
-    return sym.replace("-", "").replace("_", "")
+    sym = sym.replace("-", "").replace("_", "")
+    # Дополнительная проверка на ASCII
+    if not re.fullmatch(r'[A-Z0-9]+', sym):
+        return ""
+    return sym
 
 
 def _collect_wanted_common(symbols: Sequence[Symbol]) -> set[str]:
@@ -195,14 +203,24 @@ def _to_bingx_symbol(symbol: Symbol) -> str:
     return sym
 
 
-def _to_bingx_ws_symbol(symbol: Symbol) -> str:
+def _to_bingx_ws_symbol(symbol: Symbol) -> str | None: # <--- Изменено: возвращает str | None
     # ИСПРАВЛЕНИЕ: приводим к формату BTC-USDT
     sym = _normalize_common_symbol(symbol)
+
+    # ПРОВЕРКА: Если символ "мусорный" (как 币安人生USDT), _normalize_common_symbol вернет ""
+    if not sym:
+        logger.warning("BingX WS skipping invalid non-ASCII symbol: %s", symbol)
+        return None # <--- НЕ подписываемся
+
     for quote in ("USDT", "USDC", "USD", "BUSD", "FDUSD"):
         if sym.endswith(quote):
             base = sym[: -len(quote)]
+            if not base: # Защита от символа вида "USDT"
+                return None
             return f"{base}-{quote}"
-    return sym
+
+    logger.warning("BingX WS could not format symbol to WS standard: %s", symbol)
+    return None # <--- Не подписываемся, если не смогли распознать
 
 
 def _from_bingx_symbol(symbol: str | None) -> str | None:
@@ -234,24 +252,26 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     while True:
         tasks: list[asyncio.Task] = []
         clients: list[_BingxWsClient] = []
-
+    
         try:
-            # Блок 'if subscribe_all:' УДАЛЕН
             for chunk in chunks:
                 wanted_common = _collect_wanted_common(chunk)
                 if not wanted_common:
                     continue
-
+    
                 symbol_pairs: list[tuple[str, str]] = []
                 for sym in sorted(wanted_common):
                     native = _to_bingx_ws_symbol(sym)
-                    if not native:
+    
+                    # ИСПРАВЛЕНИЕ: Проверяем, что _to_bingx_ws_symbol вернул валидный символ
+                    if not native: 
                         continue
+    
                     symbol_pairs.append((sym, native))
-
+    
                 if not symbol_pairs:
                     continue
-
+    
                 native_symbols = [
                     native for _, native in symbol_pairs if native.upper() != 'ALL'
                 ]
