@@ -2,11 +2,12 @@ from __future__ import annotations
 import httpx
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Set
+from typing import Any, Dict, Iterable, List, Sequence, Set
 
 from .base import ConnectorSpec
 from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
+from ..settings import settings  # <--- ДОБАВЛЕНО
 
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_PREMIUM_INDEX = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -40,6 +41,24 @@ GATE_HEADERS = {
     "Origin": "https://www.gate.io",
     "Referer": "https://www.gate.io/",
 }
+
+# ИСПРАВЛЕНИЕ: Добавляем _PROXIES и helper
+_PROXIES = settings.httpx_proxies
+
+def _get_client_params(
+    timeout: float = 20.0,
+    headers: dict | None = None,
+    http2: bool = False,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"timeout": timeout}
+    if headers:
+        params["headers"] = headers
+    if http2:
+        params["http2"] = http2
+    if _PROXIES:
+        params["proxies"] = _PROXIES
+    return params
+
 
 def _extract_binance_perpetuals(payload: dict) -> Set[str]:
     out: Set[str] = set()
@@ -82,11 +101,10 @@ async def _discover_binance_from_premium_index(client: httpx.AsyncClient) -> Set
 async def discover_binance_usdt_perp() -> Set[str]:
     primary: Set[str] = set()
     primary_error: Exception | None = None
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=10.0),
-        headers=BINANCE_HEADERS,
-        http2=True,
-    ) as client:
+    
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=20.0, headers=BINANCE_HEADERS, http2=True)
+    async with httpx.AsyncClient(**client_params) as client:
         try:
             response = await client.get(BINANCE_EXCHANGE_INFO)
             response.raise_for_status()
@@ -116,7 +134,9 @@ async def discover_binance_usdt_perp() -> Set[str]:
         return set()
 
 async def discover_bybit_linear_usdt() -> Set[str]:
-    async with httpx.AsyncClient(timeout=20) as client:
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=20.0)
+    async with httpx.AsyncClient(**client_params) as client:
         r = await client.get(BYBIT_INSTRUMENTS)
         r.raise_for_status()
         data = r.json()
@@ -146,7 +166,9 @@ def _is_perpetual(kind: str) -> bool:
     return "perpetual" in k or "swap" in k
 
 async def discover_mexc_usdt_perp() -> Set[str]:
-    async with httpx.AsyncClient(timeout=20) as client:
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=20.0)
+    async with httpx.AsyncClient(**client_params) as client:
         r = await client.get(MEXC_CONTRACTS)
         r.raise_for_status()
         data = r.json()
@@ -200,7 +222,9 @@ def _gate_is_active_contract(item: dict) -> bool:
 
 
 async def discover_gate_usdt_perp() -> Set[str]:
-    async with httpx.AsyncClient(timeout=20, headers=GATE_HEADERS) as client:
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=20.0, headers=GATE_HEADERS)
+    async with httpx.AsyncClient(**client_params) as client:
         response = await client.get(GATE_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
@@ -302,8 +326,10 @@ async def discover_bingx_usdt_perp() -> Set[str]:
         "Referer": "https://bingx.com/",
         "Origin": "https://bingx.com",
     }
-
-    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+    
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=20.0, headers=headers)
+    async with httpx.AsyncClient(**client_params) as client:
         response = await client.get(BINGX_CONTRACTS)
         response.raise_for_status()
         payload = response.json()
