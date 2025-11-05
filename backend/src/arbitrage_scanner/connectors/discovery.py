@@ -12,8 +12,6 @@ from ..settings import settings  # <--- ДОБАВЛЕНО
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_PREMIUM_INDEX = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BINANCE_HEADERS = {
-    # Binance начала более агрессивно отсеивать запросы без заголовка User-Agent,
-    # поэтому явно укажем типичный браузерный агент, чтобы не получать 403.
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -50,7 +48,7 @@ def _get_client_params(
     headers: dict | None = None,
     http2: bool = False,
 ) -> dict[str, Any]:
-    params: dict[str, Any] = {"timeout": timeout}
+    params: dict[str, Any] = {"timeout": httpx.Timeout(timeout)} # Используем httpx.Timeout
     if headers:
         params["headers"] = headers
     if http2:
@@ -101,7 +99,7 @@ async def _discover_binance_from_premium_index(client: httpx.AsyncClient) -> Set
 async def discover_binance_usdt_perp() -> Set[str]:
     primary: Set[str] = set()
     primary_error: Exception | None = None
-    
+
     # ИСПРАВЛЕНИЕ: Используем _get_client_params
     client_params = _get_client_params(timeout=20.0, headers=BINANCE_HEADERS, http2=True)
     async with httpx.AsyncClient(**client_params) as client:
@@ -326,7 +324,7 @@ async def discover_bingx_usdt_perp() -> Set[str]:
         "Referer": "https://bingx.com/",
         "Origin": "https://bingx.com",
     }
-    
+
     # ИСПРАВЛЕНИЕ: Используем _get_client_params
     client_params = _get_client_params(timeout=20.0, headers=headers)
     async with httpx.AsyncClient(**client_params) as client:
