@@ -12,6 +12,7 @@ from ..connectors.discovery import (
     BYBIT_INSTRUMENTS,
     MEXC_CONTRACTS,
 )
+from ..settings import settings # <--- ДОБАВЛЕНО
 
 _CACHE_TTL = 600.0  # seconds
 _LIMIT_CACHE: Dict[tuple[str, str], tuple[float, Optional[dict[str, Any]]]] = {}
@@ -25,6 +26,23 @@ _BYBIT_LOCK = asyncio.Lock()
 
 _MEXC_CACHE: list[dict[str, Any]] | None = None
 _MEXC_LOCK = asyncio.Lock()
+
+# ИСПРАВЛЕНИЕ: Добавляем _PROXIES и helper
+_PROXIES = settings.httpx_proxies
+
+def _get_client_params(
+    timeout: float = 15.0,
+    headers: dict | None = None,
+    http2: bool = False,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"timeout": timeout}
+    if headers:
+        params["headers"] = headers
+    if http2:
+        params["http2"] = http2
+    if _PROXIES:
+        params["proxies"] = _PROXIES
+    return params
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -94,11 +112,10 @@ async def _fetch_binance_limits(symbol: str) -> Optional[dict[str, Any]]:
 
 async def _request_binance_exchange_info(symbol: str | None = None) -> list[dict[str, Any]]:
     params = {"symbol": symbol} if symbol else None
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(15.0, connect=10.0),
-        headers=BINANCE_HEADERS,
-        http2=True,
-    ) as client:
+    
+    # ИСПРАВЛЕНИЕ: Используем _get_client_params
+    client_params = _get_client_params(timeout=15.0, headers=BINANCE_HEADERS, http2=True)
+    async with httpx.AsyncClient(**client_params) as client:
         resp = await client.get(BINANCE_EXCHANGE_INFO, params=params)
         resp.raise_for_status()
         payload = resp.json()
@@ -160,7 +177,9 @@ async def _fetch_bybit_limits(symbol: str) -> Optional[dict[str, Any]]:
     async with _BYBIT_LOCK:
         global _BYBIT_CACHE
         if _BYBIT_CACHE is None or not _BYBIT_CACHE:
-            async with httpx.AsyncClient(timeout=15) as client:
+            # ИСПРАВЛЕНИЕ: Используем _get_client_params
+            client_params = _get_client_params(timeout=15.0)
+            async with httpx.AsyncClient(**client_params) as client:
                 resp = await client.get(BYBIT_INSTRUMENTS)
                 resp.raise_for_status()
                 payload = resp.json()
@@ -191,7 +210,9 @@ async def _fetch_mexc_limits(symbol: str) -> Optional[dict[str, Any]]:
     async with _MEXC_LOCK:
         global _MEXC_CACHE
         if _MEXC_CACHE is None or not _MEXC_CACHE:
-            async with httpx.AsyncClient(timeout=15) as client:
+            # ИСПРАВЛЕНИЕ: Используем _get_client_params
+            client_params = _get_client_params(timeout=15.0)
+            async with httpx.AsyncClient(**client_params) as client:
                 resp = await client.get(MEXC_CONTRACTS)
                 resp.raise_for_status()
                 payload = resp.json()
