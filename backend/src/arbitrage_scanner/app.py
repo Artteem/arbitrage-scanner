@@ -164,10 +164,10 @@ async def startup():
         "arbitrage_scanner.connectors.bingx_perp",
     ):
         lg = logging.getLogger(name)
-        lg.setLevel(logging.DEBUG)
+        lg.setLevel(logging.INFO)
         if not lg.handlers:
             h = logging.StreamHandler(sys.stdout)
-            h.setLevel(logging.DEBUG)
+            h.setLevel(logging.INFO)
             h.setFormatter(
                 logging.Formatter(
                     "%(asctime)s %(name)s %(levelname)s: %(message)s"
