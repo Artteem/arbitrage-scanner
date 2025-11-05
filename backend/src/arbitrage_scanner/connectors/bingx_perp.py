@@ -586,18 +586,14 @@ class _BingxWsClient:
         self._active_subs[key] = payload
 
     def _log_raw_frame(self, raw: Any) -> None:
+        if not self.log.isEnabledFor(logging.DEBUG):
+            return
+
         if isinstance(raw, (bytes, bytearray)):
-            buf = bytes(raw[:512])
-            try:
-                text_preview = buf.decode('utf-8', 'replace')
-            except Exception:
-                text_preview = ''
-            if text_preview.strip():
-                self.log.debug('WS RX raw (first 512b): %s', text_preview)
-            else:
-                self.log.debug('WS RX raw (first 512b hex): %s', buf.hex())
-        else:
-            self.log.debug('WS RX raw (first 512b): %s', str(raw)[:512])
+            self.log.debug('WS RX raw frame (%d bytes)', len(raw))
+            return
+
+        self.log.debug('WS RX raw frame: %s', str(raw)[:512])
 
     def _maybe_gunzip(self, payload: Any) -> str:
         if isinstance(payload, (bytes, bytearray)):

@@ -444,32 +444,22 @@ def _decode_zlib(data: bytes) -> str:
 
 
 def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
     if isinstance(message, (bytes, bytearray)):
-        buf = bytes(message[:512])
-        hex_preview = buf.hex()
-        try:
-            text_preview = buf.decode("utf-8")
-        except Exception:
-            text_preview = ""
-        if text_preview:
-            logger.debug(
-                "%s WS RX raw (first 512b): text=%s hex=%s",
-                exchange.upper(),
-                text_preview,
-                hex_preview,
-            )
-        else:
-            logger.debug(
-                "%s WS RX raw (first 512b hex): %s",
-                exchange.upper(),
-                hex_preview,
-            )
-    else:
         logger.debug(
-            "%s WS RX raw (first 512b): %s",
+            "%s WS RX raw frame (%d bytes)",
             exchange.upper(),
-            str(message)[:512],
+            len(message),
         )
+        return
+
+    logger.debug(
+        "%s WS RX raw frame: %s",
+        exchange.upper(),
+        str(message)[:512],
+    )
 
 
 def _is_mexc_ack(message: dict) -> bool:
