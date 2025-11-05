@@ -215,31 +215,27 @@ def _from_bingx_symbol(symbol: str | None) -> str | None:
 
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
-    subscribe, subscribe_all = await _resolve_bingx_symbols(symbols)
+    # 1. Получаем список символов, ИГНОРИРУЯ флаг subscribe_all
+    subscribe, _ = await _resolve_bingx_symbols(symbols) # [CI: 79]
 
-    if not subscribe and not subscribe_all:
+    # 2. Проверяем, что список символов не пуст
+    if not subscribe:
+        logger.warning("No symbols resolved for BingX connector; skipping startup")
         return
 
     chunks = [
         tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, MAX_TOPICS_PER_CONN)
     ]
 
+    # 3. Блок 'if subscribe_all:' ПОЛНОСТЬЮ УДАЛЕН.
+    #    Оставили только цикл по 'chunks'.
+
     while True:
         tasks: list[asyncio.Task] = []
         clients: list[_BingxWsClient] = []
 
         try:
-            if subscribe_all:
-                client_all = _BingxWsClient(
-                    store,
-                    ticker_pairs=[('ALL', 'ALL')],
-                    depth_symbols=[],
-                    funding_symbols=[],
-                    filter_symbols=None,
-                )
-                clients.append(client_all)
-                tasks.append(asyncio.create_task(client_all.run()))
-
+            # 4. Цикл for chunk in chunks: теперь единственный, кто создает клиенты
             for chunk in chunks:
                 wanted_common = _collect_wanted_common(chunk)
                 if not wanted_common:
