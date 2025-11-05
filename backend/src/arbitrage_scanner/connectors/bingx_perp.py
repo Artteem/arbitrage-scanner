@@ -21,8 +21,8 @@ WS_ENDPOINTS = (
     "wss://open-api-swap.bingx.com/swap-market",
 )
 MAX_TOPICS_PER_CONN = 100
-MAX_TOPICS_PER_SUB_MSG = 10 # BingX ограничивает кол-во dataType в одном запросе
-WS_SUB_DELAY = 0.1
+# MAX_TOPICS_PER_SUB_MSG = 10 # <-- УДАЛЕНО: BingX не поддерживает пакеты
+WS_SUB_DELAY = 0.05 # <-- УМЕНЬШЕНО: Ускоряем подписку
 HEARTBEAT_INTERVAL = 20.0
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
@@ -167,6 +167,8 @@ def _collect_wanted_common(symbols: Sequence[Symbol]) -> set[str]:
             continue
         normalized = normalize_bingx_symbol(symbol)
         if normalized:
+            if not re.fullmatch(r'[A-Z0-9]+', normalized):
+                continue
             wanted.add(str(normalized))
             continue
         fallback = _normalize_common_symbol(str(symbol))
@@ -186,24 +188,19 @@ def _chunk_list(values: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
 
 
 def _to_bingx_symbol(symbol: Symbol) -> str:
-    sym = str(symbol).upper()
-    if "-" in sym:
-        sym = sym.replace("-", "_")
+    sym = str(symbol).upper().replace("-", "_")
     if "_" in sym:
         return sym
     if sym.endswith("USDT"):
-        base = sym[:-4]
-        return f"{base}_USDT"
+        return f"{sym[:-4]}_USDT"
     if sym.endswith("USDC"):
-        base = sym[:-4]
-        return f"{base}_USDC"
+        return f"{sym[:-4]}_USDC"
     if sym.endswith("USD"):
-        base = sym[:-3]
-        return f"{base}_USD"
+        return f"{sym[:-3]}_USD"
     return sym
 
 
-def _to_bingx_ws_symbol(symbol: Symbol) -> str | None: # <--- Изменено: возвращает str | None
+def _to_bingx_ws_symbol(symbol: Symbol) -> str | None:
     # ИСПРАВЛЕНИЕ: приводим к формату BTC-USDT
     sym = _normalize_common_symbol(symbol)
 
@@ -218,7 +215,7 @@ def _to_bingx_ws_symbol(symbol: Symbol) -> str | None: # <--- Изменено: 
             if not base: # Защита от символа вида "USDT"
                 return None
             return f"{base}-{quote}"
-
+    
     logger.warning("BingX WS could not format symbol to WS standard: %s", symbol)
     return None # <--- Не подписываемся, если не смогли распознать
 
@@ -252,26 +249,27 @@ async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     while True:
         tasks: list[asyncio.Task] = []
         clients: list[_BingxWsClient] = []
-    
+
         try:
+            # Блок 'if subscribe_all:' УДАЛЕН
             for chunk in chunks:
                 wanted_common = _collect_wanted_common(chunk)
                 if not wanted_common:
                     continue
-    
+
                 symbol_pairs: list[tuple[str, str]] = []
                 for sym in sorted(wanted_common):
                     native = _to_bingx_ws_symbol(sym)
-    
+                    
                     # ИСПРАВЛЕНИЕ: Проверяем, что _to_bingx_ws_symbol вернул валидный символ
                     if not native: 
                         continue
-    
+                    
                     symbol_pairs.append((sym, native))
-    
+
                 if not symbol_pairs:
                     continue
-    
+
                 native_symbols = [
                     native for _, native in symbol_pairs if native.upper() != 'ALL'
                 ]
@@ -525,10 +523,9 @@ class _BingxWsClient:
             raise
 
     def _prepare_subscriptions(self) -> None:
-        # ИСПРАВЛЕНИЕ 2: Используем новый формат подписки reqType/dataType
+        # ИСПРАВЛЕНИЕ 2: Используем новый формат (БЕЗ ПАКЕТОВ)
         
         # 1. Tickers
-        ticker_topics = []
         if self._ticker_pairs:
             seen: set[str] = set()
             for common, native in self._ticker_pairs:
@@ -537,60 +534,51 @@ class _BingxWsClient:
                 normalized = native.replace('_', '-') # Документация использует BTC-USDT
                 if normalized in seen: continue
                 seen.add(normalized)
-                ticker_topics.append(f"{normalized}@ticker")
-                self.log.info('BingX adding ticker sub -> %s (native=%s)', common, normalized)
-        
-        for i, chunk in enumerate(_chunk_list(ticker_topics, MAX_TOPICS_PER_SUB_MSG)):
-            payload = {
-                "id": f"sub_tickers_{i}_{int(time.time())}",
-                "reqType": "sub",
-                "dataType": list(chunk)
-            }
-            _log_ws_subscriptions('ticker', chunk)
-            key = f'tickers:{i}'
-            self._remember_sub(key, payload)
+                
+                topic = f"{normalized}@ticker"
+                payload = {
+                    "id": f"sub_ticker_{normalized}_{int(time.time())}",
+                    "reqType": "sub",
+                    "dataType": topic
+                }
+                self.log.info('BingX adding ticker sub -> %s (native=%s)', common, topic)
+                self._remember_sub(f'ticker:{normalized}', payload)
 
         # 2. Depth (Стаканы)
-        depth_topics = []
         if self._depth_symbols:
             seen_depth: set[str] = set()
             for sym in self._depth_symbols:
                 if not sym or sym.upper() == 'ALL': continue
-                topic = sym.replace('_', '-')
-                if topic in seen_depth: continue
-                seen_depth.add(topic)
-                depth_topics.append(f"{topic}@depth5") # Используем depth5, как в старом коде
-                self.log.info('BingX adding depth sub -> %s', topic)
+                topic_symbol = sym.replace('_', '-')
+                if topic_symbol in seen_depth: continue
+                seen_depth.add(topic_symbol)
 
-        for i, chunk in enumerate(_chunk_list(depth_topics, MAX_TOPICS_PER_SUB_MSG)):
-            payload = {
-                "id": f"sub_depth_{i}_{int(time.time())}",
-                "reqType": "sub",
-                "dataType": list(chunk)
-            }
-            _log_ws_subscriptions('depth', chunk)
-            self._remember_sub(f'depth:{i}', payload)
+                topic = f"{topic_symbol}@depth5"
+                payload = {
+                    "id": f"sub_depth_{topic_symbol}_{int(time.time())}",
+                    "reqType": "sub",
+                    "dataType": topic
+                }
+                self.log.info('BingX adding depth sub -> %s', topic)
+                self._remember_sub(f'depth:{topic_symbol}', payload)
 
         # 3. Funding (Фандинг)
-        funding_topics = []
         if self._funding_symbols:
             seen_funding: set[str] = set()
             for sym in self._funding_symbols:
                 if not sym or sym.upper() == 'ALL': continue
-                topic = sym.replace('_', '-')
-                if topic in seen_funding: continue
-                seen_funding.add(topic)
-                funding_topics.append(f"{topic}@fundingRate")
+                topic_symbol = sym.replace('_', '-')
+                if topic_symbol in seen_funding: continue
+                seen_funding.add(topic_symbol)
+                
+                topic = f"{topic_symbol}@fundingRate"
+                payload = {
+                    "id": f"sub_funding_{topic_symbol}_{int(time.time())}",
+                    "reqType": "sub",
+                    "dataType": topic
+                }
                 self.log.info('BingX adding funding sub -> %s', topic)
-
-        for i, chunk in enumerate(_chunk_list(funding_topics, MAX_TOPICS_PER_SUB_MSG)):
-            payload = {
-                "id": f"sub_funding_{i}_{int(time.time())}",
-                "reqType": "sub",
-                "dataType": list(chunk)
-            }
-            _log_ws_subscriptions('funding', chunk)
-            self._remember_sub(f'funding:{i}', payload)
+                self._remember_sub(f'funding:{topic_symbol}', payload)
 
 
     def _remember_sub(self, key: str, payload: Dict[str, Any]) -> None:
