@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio, json, gzip, io, time, random
+import zlib
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -601,20 +602,30 @@ class _BingxWsClient:
     def _maybe_gunzip(self, payload: Any) -> str:
         if isinstance(payload, (bytes, bytearray)):
             b = bytes(payload)
-            if len(b) >= 2 and b[0] == 0x1F and b[1] == 0x8B:
+            if len(b) < 2:
+                return ""
+    
+            # Попытка GZIP
+            if b[0] == 0x1F and b[1] == 0x8B:
                 try:
                     with gzip.GzipFile(fileobj=io.BytesIO(b)) as gz:
                         return gz.read().decode('utf-8', 'replace')
                 except Exception:
-                    try:
-                        return b.decode('utf-8', 'replace')
-                    except Exception:
-                        return ''
-            else:
-                try:
-                    return b.decode('utf-8', 'replace')
-                except Exception:
-                    return ''
+                    pass # Ошибка GZIP, попробуем zlib или текст
+    
+            # Попытка ZLIB (для BingX)
+            try:
+                # 15 - базовое окно, 32 - автоопределение (zlib ИЛИ gzip)
+                return zlib.decompress(b, 15 + 32).decode('utf-8', 'replace')
+            except Exception:
+                pass # Ошибка ZLIB, попробуем текст
+    
+            # Попытка как обычный текст
+            try:
+                return b.decode('utf-8', 'replace')
+            except Exception:
+                return '' # Не удалось расшифровать
+    
         if isinstance(payload, str):
             return payload
         try:
