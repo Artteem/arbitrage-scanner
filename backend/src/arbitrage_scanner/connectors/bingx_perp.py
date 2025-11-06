@@ -49,7 +49,7 @@ BINGX_HEADERS = {
 _BINGX_WS_SYMBOL_CACHE: dict[str, str] | None = None
 _BINGX_WS_SYMBOL_CACHE_TS = 0.0
 _BINGX_WS_SYMBOL_CACHE_TTL = 15 * 60
-BINGX_CONTRACTS_URL = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
+BINGX_CONTRACTS_URL = "https://open-api.bingx.com/openApi/swap/v2/market/getAllContracts"
 
 
 def _is_bingx_ack(msg: dict) -> bool:
@@ -302,17 +302,21 @@ def _from_bingx_symbol(symbol: str | None) -> str | None:
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     # ИСПРАВЛЕНИЕ: Убираем логику 'subscribe_all', она была некорректной
+    try:
+        symbol_map = await _load_bingx_ws_symbol_map()
+    except Exception:
+        logger.exception("Failed to load BingX symbol map; aborting startup")
+        return
+
+    if not symbol_map:
+        logger.warning("BingX REST returned empty contract list; aborting startup")
+        return
+
     subscribe, _ = await _resolve_bingx_symbols(symbols)
 
     if not subscribe:
         logger.warning("No symbols resolved for BingX connector; skipping startup")
         return
-
-    try:
-        symbol_map = await _load_bingx_ws_symbol_map()
-    except Exception:
-        logger.exception("Failed to load BingX symbol map; falling back to local formatting")
-        symbol_map = {}
 
     chunks = [
         tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, MAX_TOPICS_PER_CONN)
