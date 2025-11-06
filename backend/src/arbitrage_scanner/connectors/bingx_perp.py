@@ -400,6 +400,8 @@ class _BingxWsClient:
         self._hb_task: asyncio.Task | None = None
         self._last_rx_ts = 0.0
         self._active_subs: Dict[str, Dict[str, Any]] = {}
+        self._active_sub_ids: Dict[str, str] = {}
+        self._disabled_topics: set[str] = set()
         self.ws_url = WS_ENDPOINTS[0]
 
         if filter_symbols:
@@ -638,7 +640,54 @@ class _BingxWsClient:
                 self._remember_sub(f'depth:{topic_symbol}', payload)
 
     def _remember_sub(self, key: str, payload: Dict[str, Any]) -> None:
-        self._active_subs[key] = payload
+        stored = dict(payload)
+        sub_id = stored.get("id")
+        if isinstance(sub_id, str) and sub_id:
+            self._active_sub_ids[sub_id] = key
+        self._active_subs[key] = stored
+
+    def _drop_subscription(self, *, sub_id: str | None, channel: str | None, code: int, message: dict) -> None:
+        lookup_id = sub_id or ""
+        key = None
+        if lookup_id and lookup_id in self._active_sub_ids:
+            key = self._active_sub_ids.pop(lookup_id)
+        if key is None and lookup_id:
+            for candidate_key, payload in list(self._active_subs.items()):
+                if str(payload.get("id")) == lookup_id:
+                    key = candidate_key
+                    break
+        if key is None and channel:
+            channel_lower = str(channel).lower()
+            for candidate_key, payload in list(self._active_subs.items()):
+                data_type = str(payload.get("dataType") or "").lower()
+                if data_type and data_type == channel_lower:
+                    key = candidate_key
+                    break
+        if key is None:
+            return
+
+        payload = self._active_subs.pop(key, None)
+        topic = None
+        if isinstance(payload, dict):
+            topic = payload.get("dataType") or key
+        else:
+            topic = key
+
+        if lookup_id:
+            self._active_sub_ids.pop(lookup_id, None)
+
+        if topic:
+            self._disabled_topics.add(str(topic))
+
+        msg_text = message.get("msg") if isinstance(message.get("msg"), str) else ""
+        extra = f" msg={msg_text}" if msg_text else ""
+        self.log.warning(
+            "BingX WS dropping subscription %s (code=%s, id=%s)%s",
+            topic,
+            code,
+            lookup_id or "?",
+            extra,
+        )
 
     def _log_raw_frame(self, raw: Any) -> None:
         if not self.log.isEnabledFor(logging.DEBUG):
@@ -707,6 +756,17 @@ class _BingxWsClient:
         code = message.get('code') if isinstance(message.get('code'), (int, float)) else None
         if code and code != 0:
             channel = message.get('dataType') or message.get('channel')
+            if code == 80015 or (
+                isinstance(message.get('msg'), str)
+                and 'not supported in websocket' in message['msg'].lower()
+            ):
+                sub_id = message.get('id') if isinstance(message.get('id'), str) else None
+                self._drop_subscription(
+                    sub_id=sub_id,
+                    channel=channel,
+                    code=int(code),
+                    message=message,
+                )
             self.log.error(
                 'BingX WS error (channel=%s): %s', channel, str(message)[:500]
             )
