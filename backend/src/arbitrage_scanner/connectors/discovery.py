@@ -26,7 +26,7 @@ BINANCE_HEADERS = {
 }
 _BINANCE_EXPECTED_MIN = 50
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
+BINGX_CONTRACTS = "https://open-api.bingx.com/openApi/swap/v2/market/getAllContracts"
 MEXC_CONTRACTS = "https://contract.mexc.com/api/v1/contract/detail"
 GATE_CONTRACTS = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
 GATE_HEADERS = {
