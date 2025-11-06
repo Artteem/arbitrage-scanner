@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio, json, gzip, io, time, random
+import asyncio, json, gzip, io, time, random, os
 import zlib
 import logging
 import re
@@ -15,6 +15,7 @@ from ..store import TickerStore
 from .bingx_utils import normalize_bingx_symbol
 from .credentials import ApiCreds
 from .discovery import discover_bingx_usdt_perp
+from ..settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,14 @@ class _BingxWsClient:
             try:
                 self.ws_url = endpoint
                 self.log.info('Connecting to BingX WS endpoint %s', endpoint)
+                http_proxy = settings.ws_proxy_url or settings.http_proxy
+                if http_proxy:
+                    os.environ["HTTP_PROXY"] = http_proxy
+                    os.environ["http_proxy"] = http_proxy
+                https_proxy = settings.ws_proxy_url or settings.https_proxy
+                if https_proxy:
+                    os.environ["HTTPS_PROXY"] = https_proxy
+                    os.environ["https_proxy"] = https_proxy
                 self._ws = await websockets.connect(
                     endpoint,
                     ping_interval=None,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, Dict, Iterable, Sequence
 
@@ -11,6 +12,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_binance_usdt_perp
+from ..settings import settings
 
 WS_BASE = "wss://fstream.binance.com/stream"
 # Binance ограничивает количество потоков (streams) до 200 на одно подключение.
@@ -79,6 +81,16 @@ async def _run_binance_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> N
     stream_map = _build_stream_map(symbols)
     stream_path = "/".join(stream_map.keys())
     endpoint = f"{WS_BASE}?streams={stream_path}"
+
+    http_proxy = settings.ws_proxy_url or settings.http_proxy
+    if http_proxy:
+        os.environ["HTTP_PROXY"] = http_proxy
+        os.environ["http_proxy"] = http_proxy
+
+    https_proxy = settings.ws_proxy_url or settings.https_proxy
+    if https_proxy:
+        os.environ["HTTPS_PROXY"] = https_proxy
+        os.environ["https_proxy"] = https_proxy
 
     delay = WS_RECONNECT_INITIAL
     while True:

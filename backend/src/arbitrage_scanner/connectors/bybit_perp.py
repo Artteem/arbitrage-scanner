@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -12,6 +13,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_bybit_linear_usdt
+from ..settings import settings
 
 WS_ENDPOINT = "wss://stream.bybit.com/v5/public/linear?compress=false"
 WS_SUB_BATCH = 250
@@ -59,6 +61,16 @@ async def _run_bybit_chunk(store: TickerStore, symbols: Sequence[Symbol]) -> Non
     topics = [f"tickers.{sym}" for sym in symbols]
     topics.extend(f"orderbook.50.{sym}" for sym in symbols)
     books: Dict[str, _OrderBookState] = {}
+
+    http_proxy = settings.ws_proxy_url or settings.http_proxy
+    if http_proxy:
+        os.environ["HTTP_PROXY"] = http_proxy
+        os.environ["http_proxy"] = http_proxy
+
+    https_proxy = settings.ws_proxy_url or settings.https_proxy
+    if https_proxy:
+        os.environ["HTTPS_PROXY"] = https_proxy
+        os.environ["https_proxy"] = https_proxy
 
     delay = WS_RECONNECT_INITIAL
     while True:

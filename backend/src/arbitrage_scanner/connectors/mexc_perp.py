@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -15,6 +16,7 @@ from ..domain import Symbol, Ticker
 from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
+from ..settings import settings
 
 WS_ENDPOINT = "wss://contract.mexc.com/ws"
 WS_RECONNECT_INITIAL = 1.0
@@ -195,6 +197,16 @@ async def _run_mexc_ws(
     wanted_common = {common for common, _ in symbol_pairs if common}
     if not wanted_common:
         return
+
+    http_proxy = settings.ws_proxy_url or settings.http_proxy
+    if http_proxy:
+        os.environ["HTTP_PROXY"] = http_proxy
+        os.environ["http_proxy"] = http_proxy
+
+    https_proxy = settings.ws_proxy_url or settings.https_proxy
+    if https_proxy:
+        os.environ["HTTPS_PROXY"] = https_proxy
+        os.environ["https_proxy"] = https_proxy
 
     books: Dict[str, _MexcOrderBookState] = {}
 

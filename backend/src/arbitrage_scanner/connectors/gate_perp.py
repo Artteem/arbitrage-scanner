@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import time
 import zlib
 from typing import Any, Iterable, List, Sequence, Tuple
@@ -15,6 +16,7 @@ from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import GATE_HEADERS, discover_gate_usdt_perp
 from .normalization import normalize_gate_symbol
+from ..settings import settings
 
 WS_ENDPOINT = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 MAX_TOPICS_PER_CONN = 100
@@ -230,6 +232,16 @@ async def _run_gate_ws(
     native_symbols = [native for _, native in symbol_pairs]
     if not native_symbols:
         return
+
+    http_proxy = settings.ws_proxy_url or settings.http_proxy
+    if http_proxy:
+        os.environ["HTTP_PROXY"] = http_proxy
+        os.environ["http_proxy"] = http_proxy
+
+    https_proxy = settings.ws_proxy_url or settings.https_proxy
+    if https_proxy:
+        os.environ["HTTPS_PROXY"] = https_proxy
+        os.environ["https_proxy"] = https_proxy
 
     async for ws in _reconnect_ws():
         heartbeat: asyncio.Task | None = None
