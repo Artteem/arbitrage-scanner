@@ -19,10 +19,6 @@ from .connectors.discovery import discover_symbols_for_connectors
 from arbitrage_scanner.connectors.mexc_perp import run_mexc
 from arbitrage_scanner.connectors.gate_perp import run_gate
 from arbitrage_scanner.connectors.bingx_perp import run_bingx
-from .db.history import load_spread_candles_from_quotes
-from .db.live import RealtimeDatabaseSink
-from .db.session import get_session
-from .db.sync import DataSyncSummary, perform_initial_sync, periodic_history_sync
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
@@ -32,9 +28,6 @@ store = TickerStore()
 _tasks: list[asyncio.Task] = []
 SYMBOLS: list[Symbol] = []   # наполним на старте
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
-DATA_SYNC: DataSyncSummary | None = None
-LIVE_SINK: RealtimeDatabaseSink | None = None
-CONTRACT_LOOKUP: dict[tuple[ExchangeName, Symbol], int] = {}
 
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
@@ -65,24 +58,6 @@ ORDER_BOOK_POLL_INTERVAL = 0.5
 PAIR_POLL_INTERVAL = 0.5
 
   
-def _build_contract_lookup(summary: DataSyncSummary | None) -> dict[tuple[ExchangeName, Symbol], int]:
-    mapping: dict[tuple[ExchangeName, Symbol], int] = {}
-    if not summary:
-        return mapping
-    for exchange, contracts in summary.contracts.items():
-        for symbol, contract_id in contracts.items():
-            mapping[(exchange.lower(), symbol.upper())] = contract_id
-    return mapping
-
-
-async def _on_sync_summary(summary: DataSyncSummary) -> None:
-    global DATA_SYNC, CONTRACT_LOOKUP
-    DATA_SYNC = summary
-    CONTRACT_LOOKUP = _build_contract_lookup(summary)
-    if LIVE_SINK is not None:
-        LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
-
-
 def _parse_timeframe(value: str | int) -> int:
     if isinstance(value, int):
         candidate = value
@@ -157,7 +132,7 @@ async def _spread_loop() -> None:
 @app.on_event("startup")
 async def startup():
     # 1) Синхронизируем метаданные бирж и исторические данные
-    global SYMBOLS, CONNECTOR_SYMBOLS, DATA_SYNC, LIVE_SINK, CONTRACT_LOOKUP
+    global SYMBOLS, CONNECTOR_SYMBOLS
     for name in (
         "arbitrage_scanner.connectors.mexc_perp",
         "arbitrage_scanner.connectors.gate_perp",
@@ -174,56 +149,24 @@ async def startup():
                 )
             )
             lg.addHandler(h)
-    metadata_summary: DataSyncSummary | None = None
     try:
-        metadata_summary = await perform_initial_sync(CONNECTORS)
-        DATA_SYNC = metadata_summary
-    except Exception:  # noqa: BLE001 - логируем и продолжаем с фоллбеком
-        logger.exception("Initial database synchronization failed")
-        metadata_summary = None
-
-    if metadata_summary is not None:
-        await _on_sync_summary(metadata_summary)
-    else:
-        CONTRACT_LOOKUP = {}
-
-    if LIVE_SINK is None:
-        LIVE_SINK = RealtimeDatabaseSink(
-            max_order_book_levels=getattr(store, "_max_levels", 50),
-        )
-    LIVE_SINK.set_contract_mapping(CONTRACT_LOOKUP)
-    LIVE_SINK.start()
-    store.set_persistence(LIVE_SINK)
-
-    if metadata_summary and metadata_summary.symbols_union:
-        SYMBOLS = metadata_summary.symbols_union
-        CONNECTOR_SYMBOLS = {
-            spec.name: metadata_summary.per_exchange.get(spec.name, metadata_summary.symbols_union)
-            for spec in CONNECTORS
-        }
-    else:
-        try:
-            discovery = await discover_symbols_for_connectors(CONNECTORS)
-            if discovery.symbols_union:
-                SYMBOLS = discovery.symbols_union
-                CONNECTOR_SYMBOLS = discovery.per_connector
-            else:
-                SYMBOLS = FALLBACK_SYMBOLS
-                CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
-        except Exception:
+        discovery = await discover_symbols_for_connectors(CONNECTORS)
+        if discovery.symbols_union:
+            SYMBOLS = discovery.symbols_union
+            CONNECTOR_SYMBOLS = discovery.per_connector
+        else:
             SYMBOLS = FALLBACK_SYMBOLS
             CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
+    except Exception:
+        SYMBOLS = FALLBACK_SYMBOLS
+        CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
     # 2) Запустим периодическую синхронизацию истории
-    _tasks.append(
-        asyncio.create_task(periodic_history_sync(CONNECTORS, on_summary=_on_sync_summary))
-    )
-
     # 3) Запустим ридеры бирж
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
-        _tasks.append(asyncio.create_task(_spread_loop()))
+    _tasks.append(asyncio.create_task(_spread_loop()))
 
 
 @app.on_event("shutdown")
@@ -231,9 +174,6 @@ async def shutdown():
     for t in _tasks:
         t.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
-    if LIVE_SINK is not None:
-        await LIVE_SINK.close()
-        store.set_persistence(None)
 
 
 @app.get("/health")
@@ -332,27 +272,73 @@ async def pair_spreads(
     entry_series: list = []
     exit_series: list = []
 
-    long_contract_id = CONTRACT_LOOKUP.get((long_key, symbol_upper))
-    short_contract_id = CONTRACT_LOOKUP.get((short_key, symbol_upper))
-    if long_contract_id and short_contract_id:
-        try:
-            async with get_session() as session:
-                series = await load_spread_candles_from_quotes(
-                    session,
-                    long_contract_id=long_contract_id,
-                    short_contract_id=short_contract_id,
-                    timeframe_seconds=tf_value,
-                    start=start_dt,
-                    end=now_dt,
-                )
-            entry_series = list(series.entry)
-            exit_series = list(series.exit)
-        except Exception:
-            logger.exception("Failed to load spread candles from database", exc_info=True)
-            entry_series = []
-            exit_series = []
+    entry_series = list(
+        SPREAD_HISTORY.get_candles(
+            "entry",
+            symbol=symbol_upper,
+            long_exchange=long_key,
+            short_exchange=short_key,
+            timeframe=tf_value,
+        )
+    )
+    exit_series = list(
+        SPREAD_HISTORY.get_candles(
+            "exit",
+            symbol=symbol_upper,
+            long_exchange=long_key,
+            short_exchange=short_key,
+            timeframe=tf_value,
+        )
+    )
 
-    if not entry_series and not exit_series:
+    need_backfill = not entry_series or not exit_series
+    cutoff_ts = int(now_dt.timestamp()) - lookback_seconds
+    if entry_series and entry_series[0].start_ts > cutoff_ts:
+        need_backfill = True
+    if exit_series and exit_series[0].start_ts > cutoff_ts:
+        need_backfill = True
+
+    if need_backfill:
+        now_ts = now_dt.timestamp()
+        rows = _rows_for_symbol(symbol)
+        if rows:
+            for row in rows:
+                SPREAD_HISTORY.add_point(
+                    symbol=row.symbol,
+                    long_exchange=row.long_ex,
+                    short_exchange=row.short_ex,
+                    entry_value=row.entry_pct,
+                    exit_value=row.exit_pct,
+                    ts=now_ts,
+                )
+        try:
+            entry_hist, exit_hist = await fetch_spread_history(
+                symbol=symbol_upper,
+                long_exchange=long_key,
+                short_exchange=short_key,
+                timeframe_seconds=tf_value,
+                lookback_days=max(lookback_days, 1.0),
+            )
+            if entry_hist:
+                SPREAD_HISTORY.merge_external(
+                    "entry",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=entry_hist,
+                )
+            if exit_hist:
+                SPREAD_HISTORY.merge_external(
+                    "exit",
+                    symbol=symbol_upper,
+                    long_exchange=long_key,
+                    short_exchange=short_key,
+                    timeframe=tf_value,
+                    candles=exit_hist,
+                )
+        except Exception:
+            logger.exception("Failed to backfill spread history", exc_info=True)
         entry_series = list(
             SPREAD_HISTORY.get_candles(
                 "entry",
@@ -371,73 +357,6 @@ async def pair_spreads(
                 timeframe=tf_value,
             )
         )
-
-        need_backfill = not entry_series or not exit_series
-        cutoff_ts = int(now_dt.timestamp()) - lookback_seconds
-        if entry_series and entry_series[0].start_ts > cutoff_ts:
-            need_backfill = True
-        if exit_series and exit_series[0].start_ts > cutoff_ts:
-            need_backfill = True
-
-        if need_backfill:
-            now_ts = now_dt.timestamp()
-            rows = _rows_for_symbol(symbol)
-            if rows:
-                for row in rows:
-                    SPREAD_HISTORY.add_point(
-                        symbol=row.symbol,
-                        long_exchange=row.long_ex,
-                        short_exchange=row.short_ex,
-                        entry_value=row.entry_pct,
-                        exit_value=row.exit_pct,
-                        ts=now_ts,
-                    )
-            try:
-                entry_hist, exit_hist = await fetch_spread_history(
-                    symbol=symbol_upper,
-                    long_exchange=long_key,
-                    short_exchange=short_key,
-                    timeframe_seconds=tf_value,
-                    lookback_days=max(lookback_days, 1.0),
-                )
-                if entry_hist:
-                    SPREAD_HISTORY.merge_external(
-                        "entry",
-                        symbol=symbol_upper,
-                        long_exchange=long_key,
-                        short_exchange=short_key,
-                        timeframe=tf_value,
-                        candles=entry_hist,
-                    )
-                if exit_hist:
-                    SPREAD_HISTORY.merge_external(
-                        "exit",
-                        symbol=symbol_upper,
-                        long_exchange=long_key,
-                        short_exchange=short_key,
-                        timeframe=tf_value,
-                        candles=exit_hist,
-                    )
-            except Exception:
-                logger.exception("Failed to backfill spread history", exc_info=True)
-            entry_series = list(
-                SPREAD_HISTORY.get_candles(
-                    "entry",
-                    symbol=symbol_upper,
-                    long_exchange=long_key,
-                    short_exchange=short_key,
-                    timeframe=tf_value,
-                )
-            )
-            exit_series = list(
-                SPREAD_HISTORY.get_candles(
-                    "exit",
-                    symbol=symbol_upper,
-                    long_exchange=long_key,
-                    short_exchange=short_key,
-                    timeframe=tf_value,
-                )
-            )
 
     cutoff_ts = int(now_dt.timestamp()) - lookback_seconds
     entry_series = [c for c in entry_series if c.start_ts >= cutoff_ts]
