@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 
 # ``logging.disable`` raises the effective level for *all* loggers globally.
-# By setting it above ``CRITICAL`` we silence every logging call without the
+# By setting it to :data:`logging.WARNING` we silence debug, info and warning
+# messages while still letting error and critical messages through without the
 # need to touch individual modules or handlers.
-logging.disable(logging.CRITICAL + 1)
+logging.disable(logging.WARNING)
