@@ -16,7 +16,8 @@ from ..store import TickerStore
 from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
-WS_ENDPOINT = "wss://contract.mexc.com/ws"
+# MEXC futures WebSocket endpoint (new format)
+WS_ENDPOINT = "wss://contract.mexc.com/edge"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MAX_TOPICS_PER_CONN = 100
@@ -44,6 +45,11 @@ def _normalize_common_symbol(symbol: Symbol) -> str:
 
 
 async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
+    """Resolve configured symbols against discovered MEXC USDT perpetual markets.
+
+    If no symbols are explicitly configured, all discovered symbols are returned.
+    Falling back to a default list in case discovery fails.
+    """
     requested: list[Symbol] = []
     seen: set[str] = set()
     for symbol in symbols:
@@ -143,11 +149,17 @@ def _parse_interval(item) -> str:
 
 
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
+    """Entry point for the MEXC connector.
+
+    Resolves symbols, splits them into connection chunks and starts the WS
+    workers.  Restarts all workers if any connection crashes.
+    """
     subscribe = await _resolve_mexc_symbols(symbols)
     if not subscribe:
         logger.warning("No symbols resolved for MEXC connector; skipping startup")
         return
 
+    # Build list of (common_symbol, native_symbol) tuples.
     symbol_pairs: list[tuple[str, str]] = []
     for sym in subscribe:
         native = _to_mexc_contract(sym)
@@ -159,6 +171,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
         logger.warning("MEXC connector resolved symbols but produced no native pairs")
         return
 
+    # Split into chunks to stay within the subscription limit.
     chunks = [
         tuple(symbol_pairs[idx : idx + MAX_TOPICS_PER_CONN])
         for idx in range(0, len(symbol_pairs), MAX_TOPICS_PER_CONN)
@@ -169,7 +182,6 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 
     while True:
         tasks = [asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks]
-
         try:
             await asyncio.gather(*tasks)
             return
@@ -188,25 +200,21 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 async def _run_mexc_ws(
     store: TickerStore, symbol_pairs: Sequence[tuple[str, str]]
 ) -> None:
+    """Run a single WebSocket connection for a batch of symbols."""
     wanted_exchange = [native for _, native in symbol_pairs]
     if not wanted_exchange:
         return
-
     wanted_common = {common for common, _ in symbol_pairs if common}
     if not wanted_common:
         return
-
     books: Dict[str, _MexcOrderBookState] = {}
-
     async for ws in _reconnect_ws():
         heartbeat: asyncio.Task | None = None
         try:
             await _send_mexc_subscriptions(ws, symbol_pairs)
-
             heartbeat = asyncio.create_task(
                 _ws_heartbeat(ws, interval=HEARTBEAT_INTERVAL, name="mexc")
             )
-
             async for raw in ws:
                 _log_ws_raw_frame("mexc", raw)
                 msg = _decode_ws_message(raw)
@@ -214,21 +222,19 @@ async def _run_mexc_ws(
                     logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
                     continue
-
+                # Ignore ack and error messages
                 raw_message = str(msg)
-
                 if _is_mexc_ack(msg):
                     logger.info("MEXC WS ack: %s", raw_message[:500])
                     continue
-
                 if isinstance(msg, dict) and msg.get("channel") == "rs.error":
                     logger.error("MEXC WS error: %s", raw_message[:500])
                     continue
-
                 if _is_ping(msg):
                     await _reply_pong(ws, msg)
                     continue
 
+                # Extract order book updates
                 depth_payload = _extract_depth_message(msg)
                 if depth_payload:
                     snapshot, data, sym_raw = depth_payload
@@ -249,22 +255,17 @@ async def _run_mexc_ws(
                             raw_message[:500],
                         )
                         continue
-
                     if sym_common not in wanted_common:
                         continue
-
                     bids_raw = data.get("bids") or data.get("b") or data.get("buy")
                     asks_raw = data.get("asks") or data.get("a") or data.get("sell")
-
                     book = books.setdefault(sym_common, _MexcOrderBookState())
                     if snapshot:
                         book.snapshot(bids_raw, asks_raw)
                     else:
                         book.update(bids_raw, asks_raw)
-
                     bids, asks = book.top_levels()
                     last_price = _extract_last_price(data)
-
                     store.upsert_order_book(
                         "mexc",
                         sym_common,
@@ -273,7 +274,6 @@ async def _run_mexc_ws(
                         ts=time.time(),
                         last_price=last_price,
                     )
-
                     if bids and asks:
                         best_bid = bids[0][0]
                         best_ask = asks[0][0]
@@ -287,12 +287,11 @@ async def _run_mexc_ws(
                             )
                         )
                     continue
-
+                # Handle other payloads: funding rate, ticker
                 now = time.time()
                 for sym_raw, payload in _iter_mexc_payloads(msg):
                     if not isinstance(payload, dict):
                         continue
-
                     sym_common = _from_mexc_symbol(sym_raw)
                     logger.info(
                         "WS PARSE exchange=%s native=%s -> common=%s",
@@ -308,36 +307,31 @@ async def _run_mexc_ws(
                             raw_message[:500],
                         )
                         continue
-
                     if sym_common not in wanted_common:
                         continue
-
                     if _looks_like_depth(payload):
                         continue
-
                     rate = _extract_funding_rate(payload)
                     if rate is not None:
                         interval = _parse_interval(payload)
-                        store.upsert_funding("mexc", sym_common, rate=rate, interval=interval, ts=now)
+                        store.upsert_funding(
+                            "mexc", sym_common, rate=rate, interval=interval, ts=now
+                        )
                         continue
-
                     bid = _extract_bid(payload)
                     ask = _extract_ask(payload)
-                    if bid <= 0 or ask <= 0:
-                        continue
-
-                    store.upsert_ticker(
-                        Ticker(exchange="mexc", symbol=sym_common, bid=bid, ask=ask, ts=now)
-                    )
-
-                    last_price = _extract_last_price(payload)
-                    if last_price:
-                        store.upsert_order_book(
-                            "mexc",
-                            sym_common,
-                            last_price=last_price,
-                            last_price_ts=now,
+                    if bid > 0 and ask > 0:
+                        store.upsert_ticker(
+                            Ticker(exchange="mexc", symbol=sym_common, bid=bid, ask=ask, ts=now)
                         )
+                        last_price = _extract_last_price(payload)
+                        if last_price:
+                            store.upsert_order_book(
+                                "mexc",
+                                sym_common,
+                                last_price=last_price,
+                                last_price_ts=now,
+                            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -358,6 +352,11 @@ async def _reconnect_ws():
                 ping_timeout=None,
                 close_timeout=5,
                 extra_headers=MEXC_HEADERS,
+                # Keep deflate compression enabled for legacy support.  Messages
+                # should arrive uncompressed due to ``gzip": false`` in our
+                # subscription requests, but the server may still use RFC 7692
+                # per-frame compression (deflate) which the websockets library
+                # can handle automatically.
                 compression="deflate",
             ) as ws:
                 delay = WS_RECONNECT_INITIAL
@@ -372,9 +371,15 @@ async def _reconnect_ws():
 async def _send_mexc_subscriptions(
     ws, symbols: Sequence[tuple[str, str]]
 ) -> None:
+    """
+    Send subscription requests for ticker, order book and funding rate topics.
+
+    Each request includes a ``method`` key and a ``param`` dict with the
+    contract symbol.  A ``gzip`` flag set to ``False`` requests plaintext
+    responses.  See: https://www.mexc.com/api-docs/futures/websocket-api
+    """
     if not symbols:
         return
-
     unique: list[tuple[str, str]] = []
     seen: set[str] = set()
     for common, native in symbols:
@@ -384,23 +389,34 @@ async def _send_mexc_subscriptions(
             continue
         seen.add(native)
         unique.append((common, native))
-
     if not unique:
         return
-
     for common, native in unique:
+        # Subscribe to per-contract ticker (best bid/ask, last price).
         logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
-        ticker_payload = {"op": "sub.ticker", "symbol": native}
+        ticker_payload = {
+            "method": "sub.ticker",
+            "param": {"symbol": native},
+            "gzip": False,
+        }
         await _send_json_with_retry(ws, ticker_payload)
         await asyncio.sleep(WS_SUB_DELAY)
-
+        # Subscribe to full order book depth (step0) for the symbol.
         logger.debug("MEXC subscribe depth -> %s", native)
-        depth_payload = {"op": "sub.depth", "symbol": native, "type": "step0"}
+        depth_payload = {
+            "method": "sub.depth",
+            "param": {"symbol": native},
+            "gzip": False,
+        }
         await _send_json_with_retry(ws, depth_payload)
         await asyncio.sleep(WS_SUB_DELAY)
-
+        # Subscribe to funding rate updates.
         logger.debug("MEXC subscribe funding -> %s", native)
-        funding_payload = {"op": "sub.funding_rate", "symbol": native}
+        funding_payload = {
+            "method": "sub.funding.rate",
+            "param": {"symbol": native},
+            "gzip": False,
+        }
         await _send_json_with_retry(ws, funding_payload)
         await asyncio.sleep(WS_SUB_DELAY)
 
@@ -416,7 +432,6 @@ async def _send_json_with_retry(ws, payload: dict) -> None:
 def _decode_ws_bytes(data: bytes) -> str | None:
     if not data:
         return None
-
     for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
         try:
             text = decoder(data)
@@ -446,7 +461,6 @@ def _decode_zlib(data: bytes) -> str:
 def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
-
     if isinstance(message, (bytes, bytearray)):
         logger.debug(
             "%s WS RX raw frame (%d bytes)",
@@ -454,7 +468,6 @@ def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
             len(message),
         )
         return
-
     logger.debug(
         "%s WS RX raw frame: %s",
         exchange.upper(),
@@ -465,7 +478,6 @@ def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
 def _is_mexc_ack(message: dict) -> bool:
     if not isinstance(message, dict):
         return False
-
     channel = message.get("channel")
     if isinstance(channel, str) and channel in {
         "rs.sub",
@@ -475,13 +487,10 @@ def _is_mexc_ack(message: dict) -> bool:
         "rs.query",
     }:
         return True
-
-    if message.get("op") in {"sub", "unsub"} and message.get("success") is True:
+    if message.get("method") in {"sub", "unsub"} and message.get("success") is True:
         return True
-
     if message.get("success") is True and not message.get("data"):
         return True
-
     return False
 
 
@@ -514,14 +523,11 @@ def _decode_ws_message(message: str | bytes) -> dict | None:
         raw = _decode_ws_bytes(bytes(message))
     else:
         return None
-
     if not raw:
         return None
-
     raw = raw.strip()
     if not raw:
         return None
-
     try:
         return json.loads(raw)
     except Exception:
@@ -552,7 +558,7 @@ async def _reply_pong(ws, message: dict) -> None:
 def _extract_depth_message(message: dict) -> tuple[bool, dict, str] | None:
     if not isinstance(message, dict):
         return None
-
+    # Legacy depth update (depth.update method).  Format: {"method":"depth.update", "params":[snapshot,data,symbol]}
     method = message.get("method")
     if isinstance(method, str) and method.lower() == "depth.update":
         params = message.get("params")
@@ -564,15 +570,15 @@ def _extract_depth_message(message: dict) -> tuple[bool, dict, str] | None:
         if not isinstance(symbol, str):
             return None
         return snapshot, data, symbol
-
+    # New format: channel contains "depth"
     channel = message.get("channel") or message.get("topic")
     if isinstance(channel, str) and "depth" in channel.lower():
         data = message.get("data")
         if isinstance(data, dict):
             symbol = message.get("symbol") or data.get("symbol")
             if isinstance(symbol, str):
+                # Treat as snapshot for "push.depth"/"push.depth.step" messages
                 return True, data, symbol
-
     return None
 
 
@@ -634,31 +640,24 @@ def _extract_funding_rate(payload: dict) -> float | None:
 def _iter_mexc_payloads(message) -> Iterable[Tuple[str, dict]]:
     if not isinstance(message, dict):
         return []
-
     default_symbol: str | None = None
-
     sym_candidate = message.get("symbol") or message.get("s")
     if isinstance(sym_candidate, str) and sym_candidate:
         default_symbol = sym_candidate
-
     params = message.get("params")
     if isinstance(params, list):
         for item in reversed(params):
             if isinstance(item, str) and item:
                 default_symbol = item
                 break
-
     payload_candidates = []
     for key in ("data", "tick", "ticker", "tickers", "result", "payload"):
         if key in message:
             payload_candidates.append(message[key])
-
     if isinstance(params, list):
         payload_candidates.append(params)
-
     if not payload_candidates:
         payload_candidates.append(message)
-
     seen: set[tuple[str, int]] = set()
     items: list[tuple[str, dict]] = []
     for candidate in payload_candidates:
@@ -674,9 +673,7 @@ def _iter_mexc_payloads(message) -> Iterable[Tuple[str, dict]]:
 def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[str, dict]]:
     if payload is None:
         return []
-
     items: list[tuple[str, dict]] = []
-
     if isinstance(payload, dict):
         dict_values = list(payload.values())
         if dict_values and all(isinstance(v, dict) for v in dict_values):
@@ -691,7 +688,6 @@ def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[s
             if symbol:
                 items.append((symbol, payload))
         return items
-
     if isinstance(payload, list):
         for value in payload:
             if not isinstance(value, dict):
@@ -700,7 +696,6 @@ def _iter_payload_items(payload, default_symbol: str | None) -> Iterable[tuple[s
             if symbol:
                 items.append((symbol, value))
         return items
-
     return items
 
 
@@ -709,10 +704,8 @@ def _extract_symbol(payload: dict, fallback_key: str | None, default_symbol: str
         val = payload.get(key)
         if isinstance(val, str) and val:
             return val
-
     if fallback_key:
         return fallback_key
-
     return default_symbol
 
 
@@ -759,22 +752,18 @@ def _parse_level(level) -> Tuple[float | None, float | None]:
 class _MexcOrderBookState:
     bids: Dict[float, float] = field(default_factory=dict)
     asks: Dict[float, float] = field(default_factory=dict)
-
     def snapshot(self, bids, asks) -> None:
         self.bids.clear()
         self.asks.clear()
         self._apply(self.bids, bids)
         self._apply(self.asks, asks)
-
     def update(self, bids, asks) -> None:
         self._apply(self.bids, bids)
         self._apply(self.asks, asks)
-
     def top_levels(self, depth: int = 5) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         bids_sorted = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
         asks_sorted = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]
         return bids_sorted, asks_sorted
-
     def _apply(self, side: Dict[float, float], updates) -> None:
         if not updates:
             return
@@ -791,7 +780,6 @@ class _MexcOrderBookState:
             trimmed = dict(ordered[:200])
             side.clear()
             side.update(trimmed)
-
 
 
 async def authenticate_ws(ws: Any, creds: ApiCreds | None) -> None:
