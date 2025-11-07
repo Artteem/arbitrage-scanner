@@ -5,6 +5,8 @@ import gzip
 import json
 import logging
 import time
+import re
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -17,6 +19,7 @@ from .credentials import ApiCreds
 from .discovery import discover_mexc_usdt_perp
 
 # MEXC futures WebSocket endpoint (new format)
+MEXC_REST_BASE = "https://contract.mexc.com"
 WS_ENDPOINT = "wss://contract.mexc.com/edge"
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
@@ -39,6 +42,137 @@ MEXC_HEADERS = {
 
 logger = logging.getLogger(__name__)
 
+class MexcPerpConnector(...):
+    def __init__(self, ...):
+        ...
+        self._native_symbols: set[str] = set()
+
+    async def start(self):
+        # 1) загрузим whitelist контрактов перед WS
+        await self._load_contract_whitelist()
+        # дальше как было: запуск WS тасков/подписок
+        await self._run_ws_forever()
+
+    async def _load_contract_whitelist(self):
+        """
+        Тянем у MEXC список USDT-перпетуалов и строим set вида {'BTC_USDT', 'ETH_USDT', ...}
+        """
+        try:
+            url = f"{MEXC_REST_BASE}/api/v1/contract/detail"
+            # В разных версиях API встречается еще /api/v1/contract/detail? (без параметров).
+            # Ответ обычно: {"success":true,"code":0,"data":[{"symbol":"BTC_USDT", ...}, ...]}
+            async with httpx.AsyncClient(timeout=20.0) as cli:
+                r = await cli.get(url)
+                r.raise_for_status()
+                jd = r.json()
+                data = jd.get("data") or []
+                syms = set()
+                for it in data:
+                    sym = it.get("symbol")
+                    if not sym or not sym.endswith("_USDT"):
+                        continue
+                    # страхуемся от поставочных/квартальных — у перпетуалов обычно нет полей delivery
+                    # если в объекте есть "state" и он не "NORMAL" — можно отфильтровать
+                    syms.add(sym.upper())
+                self._native_symbols = syms
+                self.logger.info("MEXC: loaded %d futures symbols", len(self._native_symbols))
+        except Exception as e:
+            self.logger.exception("MEXC: failed to load contract whitelist: %s", e)
+            # на ошибке — пустой whitelist, лучше не подписываться ни на что:
+            self._native_symbols = set()
+
+    _MULTIPLIER_PREFIXES = ("1M", "1000", "10000", "10K", "1K")
+
+    @classmethod
+    def _strip_multipliers(cls, base: str) -> str:
+        # убираем лидирующие множители — 1000SHIB -> SHIB, 1MSATS -> SATS
+        for pref in cls._MULTIPLIER_PREFIXES:
+            if base.startswith(pref):
+                return base[len(pref):]
+        return base
+
+    @staticmethod
+    def _is_delivery_or_cross(sym_norm: str) -> bool:
+        # отсекаем кроссы (ETHBTC_USDT и т.п.) и датированные фьючи (ETHUSDT07NOV25)
+        base, _, quote = sym_norm.partition("_")
+        if quote != "USDT":
+            return True
+        # ETHBTC_USDT — база содержит несколько токенов
+        if any(k in base for k in ("BTC", "ETH", "XRP", "BNB")) and base not in ("BTC","ETH","XRP","BNB"):
+            # грубая эвристика для ETHBTC, BTCETH и т.п.
+            return True
+        # датированное окончание в base (напр. ETHUSDT07NOV25 — переделано нормализацией в base=ETHUSDT07NOV25)
+        if re.search(r"\d{2}[A-Z]{3}\d{2,4}$", base):
+            return True
+        return False
+
+    def resolve_symbol_for_mexc(self, norm_sym: str) -> str | None:
+        """
+        Пробуем сопоставить нормализованный символ проекта к нативному символу MEXC.
+        Возвращаем строку вида 'BTC_USDT' или None, если не нашли.
+        """
+        s = norm_sym.upper()
+        # Нормализация на случай точек/дефисов
+        s = s.replace("-", "_").replace("/", "_")
+
+        # Ожидаем формат BASE_USDT
+        if "_USDT" not in s:
+            return None
+
+        if self._is_delivery_or_cross(s):
+            return None
+
+        base = s.split("_USDT", 1)[0]
+        # снимем множители
+        base2 = self._strip_multipliers(base)
+
+        candidates = []
+        # candidate 1: как есть
+        candidates.append(f"{base}_USDT")
+        # candidate 2: без множителя
+        candidates.append(f"{base2}_USDT")
+
+        for c in candidates:
+            if c in self._native_symbols:
+                return c
+        return None
+
+    async def _safe_subscribe_symbol(self, ws, norm_sym: str):
+        """
+        Обертка подписки на один символ: резолвим и подписываемся только если символ существует на MEXC.
+        """
+        native = self.resolve_symbol_for_mexc(norm_sym)
+        if not native:
+            # Тихо пропускаем несуществующие символы, чтобы не спамить rs.error
+            self.logger.debug("MEXC: skip symbol %s (no mapping to native contract)", norm_sym)
+            return
+
+        # Отправляем три подписки (тикер/стакан/фандинг) согласно новой схеме
+        msgs = [
+            {"method": "sub.ticker", "param": {"symbol": native}, "gzip": False},
+            {"method": "sub.depth", "param": {"symbol": native}, "gzip": False},
+            {"method": "sub.funding.rate", "param": {"symbol": native}, "gzip": False},
+        ]
+        for m in msgs:
+            await ws.send_json(m)
+            await asyncio.sleep(0.01)  # чутка троттлим, чтобы не зафлудить
+        self.logger.debug("MEXC: subscribed to %s", native)
+
+    async def _subscribe_all(self, ws):
+        """
+        Замените ваш прежний цикл подписок на символы этим:
+        """
+        if not self._native_symbols:
+            self.logger.error("MEXC: no native symbols loaded, skip subscriptions")
+            return
+
+        # self._symbols — это ваши нормализованные символы проекта (из discovery)
+        for sym in list(self._symbols):
+            try:
+                await self._safe_subscribe_symbol(ws, sym)
+            except Exception:
+                self.logger.exception("MEXC: failed to subscribe %s", sym)
+                await asyncio.sleep(0.05)
 
 def _normalize_common_symbol(symbol: Symbol) -> str:
     return str(symbol).replace("-", "").replace("_", "").upper()
