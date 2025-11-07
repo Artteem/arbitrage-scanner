@@ -1,23 +1,13 @@
-from __future__ import annotations
-
+# -*- coding: utf-8 -*-
 import asyncio
-import gzip
 import json
 import logging
-import time
 import re
+import time
+from typing import Any, Dict, Iterable, Optional, Set
+
 import httpx
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional, Set
-
 import websockets
-import zlib
-
-from ..domain import Symbol, Ticker
-from ..store import TickerStore
-from .credentials import ApiCreds
-from .discovery import discover_mexc_usdt_perp
-
 
 LOGGER = logging.getLogger("arbitrage_scanner.connectors.mexc_perp")
 
