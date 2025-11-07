@@ -1,5 +1,26 @@
 from __future__ import annotations
 
+"""
+Modified MEXC USDT‑perpetual connector.
+
+This version aligns the MEXC integration with the simplified pattern used by
+the Binance and Bybit connectors.  In particular it:
+
+* Limits the number of contracts per WebSocket connection to 10.  The
+  official MEXC documentation states that each WebSocket connection may
+  subscribe to at most 30 topics【740259858122821†L30-L42】, and this
+  connector subscribes to three topics per contract (ticker, order book depth
+  and funding rate).  Therefore 10 contracts per connection ensure we never
+  exceed 30 topics.
+* Leaves the existing message decoding and order book management logic
+  intact.  MEXC uses a bespoke WebSocket protocol with separate `sub.*`
+  methods for each channel, and these routines handle the specifics.
+* Adds documentation comments for maintainers on symbol formats and limits.
+
+To add new symbols, simply pass a list of `Symbol` objects to `run_mexc`; the
+connector will fall back to discovery if fewer than one symbol is provided.
+"""
+
 import asyncio
 import gzip
 import json
@@ -13,42 +34,56 @@ import zlib
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
-from .credentials import ApiCreds
+from .credentials import ApiCreds  # noqa: F401 – reserved for future use
 from .discovery import discover_mexc_usdt_perp
 
-# MEXC futures WebSocket endpoint (new format)
+# MEXC futures WebSocket endpoint (contract API v1).  See
+# https://www.mexc.com/api-docs/futures/websocket-api for reference.
 WS_ENDPOINT = "wss://contract.mexc.com/edge"
+
+# Reconnect backoff times.
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
-MAX_TOPICS_PER_CONN = 100
-WS_SUB_DELAY = 0.1
-HEARTBEAT_INTERVAL = 20.0
-MIN_SYMBOL_THRESHOLD = 1
-FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
-MEXC_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Origin": "https://www.mexc.com",
-    "Referer": "https://www.mexc.com/",
-    "Accept": "application/json, text/plain, */*",
-}
+# The maximum number of **contracts** per WebSocket connection.  MEXC allows up
+# to 30 subscription topics per connection【740259858122821†L30-L42】.  Since this
+# connector subscribes to three topics per contract (ticker, depth and funding
+# rate), a batch of 10 contracts corresponds to 30 topics.
+MAX_TOPICS_PER_CONN = 10
+
+# Delay between successive subscription messages (in seconds).  Leaving a
+# small delay helps prevent the exchange from rate limiting initial
+# subscriptions.
+WS_SUB_DELAY = 0.1
+
+# Interval (in seconds) for sending heartbeat pings.  Websockets does not send
+# its own pings because the server handles the heartbeat.
+HEARTBEAT_INTERVAL = 20.0
+
+# If the user supplies fewer than this many symbols the connector will fall
+# back to discovering all MEXC USDT perpetual symbols via
+# `discover_mexc_usdt_perp`.
+MIN_SYMBOL_THRESHOLD = 1
+
+# Fallback list used when discovery fails completely.  The common symbol
+# representation removes separators (e.g. BTCUSDT).
+FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_common_symbol(symbol: Symbol) -> str:
+    """Normalize a symbol by removing dashes/underscores and upper‑casing."""
     return str(symbol).replace("-", "").replace("_", "").upper()
 
 
 async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
-    """Resolve configured symbols against discovered MEXC USDT perpetual markets.
+    """Resolve user‑provided symbols against discovered MEXC USDT perpetual contracts.
 
     If no symbols are explicitly configured, all discovered symbols are returned.
-    Falling back to a default list in case discovery fails.
+    If discovery fails, a static fallback list is used.  This mirrors the
+    behaviour of the Binance/Bybit connectors, which default to the full
+    contract list when only a few symbols are provided.
     """
     requested: list[Symbol] = []
     seen: set[str] = set()
@@ -107,6 +142,7 @@ def _as_float(value) -> float:
 
 
 def _to_mexc_contract(symbol: Symbol) -> str:
+    """Convert a common symbol into MEXC contract format (e.g. BTCUSDT → BTC_USDT)."""
     sym = str(symbol).replace('-', '').replace(' ', '')
     if "_" in sym:
         return sym
@@ -116,6 +152,7 @@ def _to_mexc_contract(symbol: Symbol) -> str:
 
 
 def _from_mexc_symbol(symbol: str | None) -> Symbol | None:
+    """Convert a MEXC contract symbol back into the common (separator‑less) form."""
     if not symbol:
         return None
     return symbol.replace("_", "")
@@ -140,6 +177,7 @@ def _extract_ask(item) -> float:
 
 
 def _parse_interval(item) -> str:
+    """Extract a funding interval from the payload, defaulting to 8h."""
     interval = item.get("fundingInterval") or item.get("interval")
     if isinstance(interval, (int, float)):
         return f"{interval}h"
@@ -151,8 +189,10 @@ def _parse_interval(item) -> str:
 async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
     """Entry point for the MEXC connector.
 
-    Resolves symbols, splits them into connection chunks and starts the WS
-    workers.  Restarts all workers if any connection crashes.
+    Resolves symbols, splits them into connection batches and starts a worker
+    for each batch.  If all workers exit normally the connector returns; if
+    any worker crashes the entire set of workers is restarted.  This behaviour
+    mirrors the Binance/Bybit connectors.
     """
     subscribe = await _resolve_mexc_symbols(symbols)
     if not subscribe:
@@ -171,7 +211,9 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
         logger.warning("MEXC connector resolved symbols but produced no native pairs")
         return
 
-    # Split into chunks to stay within the subscription limit.
+    # Split into chunks to stay within the subscription limit.  Each chunk
+    # contains up to MAX_TOPICS_PER_CONN contracts (10), resulting in up to 30
+    # topics per WebSocket connection.
     chunks = [
         tuple(symbol_pairs[idx : idx + MAX_TOPICS_PER_CONN])
         for idx in range(0, len(symbol_pairs), MAX_TOPICS_PER_CONN)
@@ -200,7 +242,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 async def _run_mexc_ws(
     store: TickerStore, symbol_pairs: Sequence[tuple[str, str]]
 ) -> None:
-    """Run a single WebSocket connection for a batch of symbols."""
+    """Run a single WebSocket connection for a batch of contracts."""
     wanted_exchange = [native for _, native in symbol_pairs]
     if not wanted_exchange:
         return
@@ -218,6 +260,7 @@ async def _run_mexc_ws(
             async for raw in ws:
                 _log_ws_raw_frame("mexc", raw)
                 msg = _decode_ws_message(raw)
+                # Periodically emit a debug sample
                 if int(time.time()) % 10 == 0:
                     logger.debug("WS RX sample: %s", str(msg)[:300])
                 if msg is None:
@@ -343,6 +386,7 @@ async def _run_mexc_ws(
 
 
 async def _reconnect_ws():
+    """Yield a connected WebSocket client, reconnecting with exponential backoff."""
     delay = WS_RECONNECT_INITIAL
     while True:
         try:
@@ -355,7 +399,7 @@ async def _reconnect_ws():
                 # Keep deflate compression enabled for legacy support.  Messages
                 # should arrive uncompressed due to ``gzip": false`` in our
                 # subscription requests, but the server may still use RFC 7692
-                # per-frame compression (deflate) which the websockets library
+                # per‑frame compression (deflate) which the websockets library
                 # can handle automatically.
                 compression="deflate",
             ) as ws:
@@ -371,13 +415,7 @@ async def _reconnect_ws():
 async def _send_mexc_subscriptions(
     ws, symbols: Sequence[tuple[str, str]]
 ) -> None:
-    """
-    Send subscription requests for ticker, order book and funding rate topics.
-
-    Each request includes a ``method`` key and a ``param`` dict with the
-    contract symbol.  A ``gzip`` flag set to ``False`` requests plaintext
-    responses.  See: https://www.mexc.com/api-docs/futures/websocket-api
-    """
+    """Send subscription requests for ticker, order book and funding rate topics."""
     if not symbols:
         return
     unique: list[tuple[str, str]] = []
@@ -392,7 +430,7 @@ async def _send_mexc_subscriptions(
     if not unique:
         return
     for common, native in unique:
-        # Subscribe to per-contract ticker (best bid/ask, last price).
+        # Subscribe to per‑contract ticker (best bid/ask, last price).
         logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
         ticker_payload = {
             "method": "sub.ticker",
