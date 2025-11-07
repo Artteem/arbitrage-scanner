@@ -1,5 +1,28 @@
 from __future__ import annotations
-import asyncio, json, logging, math, sys, time
+
+"""
+This is a modified version of the main application entry point for the
+arbitrage scanner.  The key change from upstream is a smarter symbol
+selection during startup: instead of blindly subscribing to the union
+of all USDT‑perpetual contracts across every enabled exchange, the
+startup routine now attempts to compute the intersection of symbols
+available on all exchanges.  This dramatically reduces the number of
+symbols the scanner tracks (and hence the number of WebSocket
+subscriptions) while still covering the universe of pairs that could
+actually be arbitraged.  If no non‑empty intersection is available
+(for example, when different exchanges list entirely disjoint sets of
+contracts), the code falls back to the union as before.
+
+The remainder of this file follows the original `app.py` closely and
+should behave identically aside from the improved symbol selection.
+"""
+
+import asyncio
+import json
+import logging
+import math
+import sys
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Iterable, Sequence
 
@@ -15,31 +38,44 @@ from .engine.spread_history import SpreadHistory
 from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.status import get_auth_statuses, get_rest_limit_modes
-from .connectors.discovery import discover_symbols_for_connectors
-from .connectors.mexc_perp import run_mexc
-from .connectors.gate_perp import run_gate
-from .connectors.bingx_perp import run_bingx
+from .connectors.discovery import (
+    discover_symbols_for_connectors,
+    discover_common_symbols,
+)
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
+# Explicit imports of connector modules force loggers to be configured early.
+from .connectors.mexc_perp import run_mexc  # noqa: F401
+from .connectors.gate_perp import run_gate  # noqa: F401
+from .connectors.bingx_perp import run_bingx  # noqa: F401
+
+
 app = FastAPI(title="Arbitrage Scanner API", version="1.2.0")
 
+# The central store for tickers, order books and funding rates.
 store = TickerStore()
+
+# Global state mutated during startup.
 _tasks: list[asyncio.Task] = []
-SYMBOLS: list[Symbol] = []   # наполним на старте
+SYMBOLS: list[Symbol] = []  # will be filled on startup
 CONNECTOR_SYMBOLS: dict[ExchangeName, list[Symbol]] = {}
 
+# Load connector specs based on enabled exchanges.
 CONNECTORS: tuple[ConnectorSpec, ...] = tuple(load_connectors(settings.enabled_exchanges))
 EXCHANGES: tuple[ExchangeName, ...] = tuple(c.name for c in CONNECTORS)
 
+# Assemble taker fees from defaults and connector overrides.
 TAKER_FEES = {**DEFAULT_TAKER_FEES}
 for connector in CONNECTORS:
     if connector.taker_fee is not None:
         TAKER_FEES[connector.name] = connector.taker_fee
 
+# Basic fallback symbol list and mandatory perpetual contracts.
 FALLBACK_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 FORCE_PERP = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
+# Shared spread history and refresh interval.
 SPREAD_HISTORY = SpreadHistory(timeframes=(60, 300, 3600), max_candles=15000)
 SPREAD_REFRESH_INTERVAL = 0.5
 SPREAD_EVENT: asyncio.Event = asyncio.Event()
@@ -57,7 +93,7 @@ logger = logging.getLogger(__name__)
 ORDER_BOOK_POLL_INTERVAL = 0.5
 PAIR_POLL_INTERVAL = 0.5
 
-  
+
 def _parse_timeframe(value: str | int) -> int:
     if isinstance(value, int):
         candidate = value
@@ -99,6 +135,7 @@ def _rows_for_symbol(symbol: Symbol) -> list[Row]:
 
 
 async def _spread_loop() -> None:
+    """Periodically compute spreads and update the global LAST_ROWS cache."""
     global LAST_ROWS, LAST_ROWS_TS
     while True:
         try:
@@ -131,8 +168,19 @@ async def _spread_loop() -> None:
 
 @app.on_event("startup")
 async def startup():
-    # 1) Синхронизируем метаданные бирж и исторические данные
+    """
+    Perform startup tasks:
+
+    1) Discover tradable symbols for all enabled exchanges and compute a common
+       subset to avoid subscribing to symbols that exist on only one venue.
+    2) Synchronize metadata and start WebSocket readers for each connector.
+    3) Launch the periodic spread computation loop.
+    """
     global SYMBOLS, CONNECTOR_SYMBOLS
+
+    # Configure logging for heavy connectors before they start.  This ensures
+    # that INFO messages from the MEXC, Gate and BingX modules do not get
+    # dropped due to missing handlers.
     for name in (
         "arbitrage_scanner.connectors.mexc_perp",
         "arbitrage_scanner.connectors.gate_perp",
@@ -149,20 +197,38 @@ async def startup():
                 )
             )
             lg.addHandler(h)
+
     try:
+        # Discover symbols per connector.
         discovery = await discover_symbols_for_connectors(CONNECTORS)
-        if discovery.symbols_union:
+        # Try to compute intersection of symbols across exchanges.
+        common_symbols: list[str] = []
+        try:
+            common_symbols = await discover_common_symbols(CONNECTORS)
+        except Exception:
+            common_symbols = []
+        if common_symbols:
+            # Use the intersection if available.
+            SYMBOLS = common_symbols
+            CONNECTOR_SYMBOLS = {}
+            for spec in CONNECTORS:
+                symbols_for = discovery.per_connector.get(spec.name) or []
+                # Filter each connector's list down to the common set.
+                CONNECTOR_SYMBOLS[spec.name] = [sym for sym in symbols_for if sym in common_symbols]
+        elif discovery.symbols_union:
+            # Otherwise, fall back to the union of discovered symbols.
             SYMBOLS = discovery.symbols_union
             CONNECTOR_SYMBOLS = discovery.per_connector
         else:
+            # If discovery returned nothing, use the fallback symbols.
             SYMBOLS = FALLBACK_SYMBOLS
             CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
     except Exception:
+        # On discovery failure, use fallback symbols.
         SYMBOLS = FALLBACK_SYMBOLS
         CONNECTOR_SYMBOLS = {spec.name: FALLBACK_SYMBOLS[:] for spec in CONNECTORS}
 
-    # 2) Запустим периодическую синхронизацию истории
-    # 3) Запустим ридеры бирж
+    # Launch tasks: one per connector, plus the spread loop.
     for connector in CONNECTORS:
         symbols_for_connector = CONNECTOR_SYMBOLS.get(connector.name) or SYMBOLS
         _tasks.append(asyncio.create_task(connector.run(store, symbols_for_connector)))
@@ -229,6 +295,7 @@ def _serialize_pair_entry(entry: dict | None) -> dict | None:
 @app.get("/ui")
 async def ui():
     from .web.ui import html
+
     return HTMLResponse(html())
 
 
@@ -469,7 +536,6 @@ async def ws_orderbook(ws: WebSocket):
     if not symbol or not exchange:
         await ws.close(code=4400, reason="symbol and exchange query params are required")
         return
-
     last_payload: str | None = None
     try:
         while True:
@@ -501,9 +567,8 @@ async def ws_pair(ws: WebSocket):
     long_exchange = (ws.query_params.get("long") or "").lower()
     short_exchange = (ws.query_params.get("short") or "").lower()
     volume_param = ws.query_params.get("volume")
-    volume: float | None
     if volume_param is None or volume_param == "":
-        volume = None
+        volume: float | None = None
     else:
         try:
             volume = float(volume_param)
@@ -516,7 +581,6 @@ async def ws_pair(ws: WebSocket):
     if not symbol or not long_exchange or not short_exchange:
         await ws.close(code=4400, reason="symbol, long and short query params are required")
         return
-
     last_payload: str | None = None
     try:
         while True:
@@ -529,13 +593,11 @@ async def ws_pair(ws: WebSocket):
                     if row_payload is not None:
                         row_payload["_ts"] = ts
                     break
-
             symbol_state = store.by_symbol(symbol)
             long_state_raw = symbol_state.get(long_exchange)
             short_state_raw = symbol_state.get(short_exchange)
             long_state = _serialize_pair_entry(long_state_raw)
             short_state = _serialize_pair_entry(short_state_raw)
-
             funding_spread: float | None = None
             long_funding = long_state_raw.get("funding") if long_state_raw else None
             short_funding = short_state_raw.get("funding") if short_state_raw else None
@@ -544,7 +606,6 @@ async def ws_pair(ws: WebSocket):
                     funding_spread = float(long_funding.rate) - float(short_funding.rate)
                 except Exception:
                     funding_spread = None
-
             history_point: dict | None = None
             if row_payload is not None:
                 entry_value = row_payload.get("entry_pct")
@@ -555,7 +616,6 @@ async def ws_pair(ws: WebSocket):
                         "entry_pct": float(entry_value),
                         "exit_pct": float(exit_value),
                     }
-
             payload = {
                 "symbol": symbol,
                 "long_exchange": long_exchange,
@@ -568,7 +628,6 @@ async def ws_pair(ws: WebSocket):
                 "history_point": history_point,
                 "ts": ts,
             }
-
             message = json.dumps(payload)
             if message != last_payload:
                 await ws.send_text(message)
