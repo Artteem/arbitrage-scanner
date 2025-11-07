@@ -16,9 +16,6 @@ from .connectors.base import ConnectorSpec
 from .connectors.loader import load_connectors
 from .connectors.status import get_auth_statuses, get_rest_limit_modes
 from .connectors.discovery import discover_symbols_for_connectors
-from .connectors.mexc_perp import run_mexc
-from .connectors.gate_perp import run_gate
-from .connectors.bingx_perp import run_bingx
 from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
