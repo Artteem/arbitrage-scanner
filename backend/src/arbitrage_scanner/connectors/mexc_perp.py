@@ -67,6 +67,17 @@ MIN_SYMBOL_THRESHOLD = 1
 # exchange format (e.g. BTC_USDT).
 FALLBACK_NATIVE_SYMBOLS: tuple[Symbol, ...] = ("BTC_USDT", "ETH_USDT", "SOL_USDT")
 
+MEXC_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Origin": "https://www.mexc.com",
+    "Referer": "https://www.mexc.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
 logger = logging.getLogger(__name__)
 
 
