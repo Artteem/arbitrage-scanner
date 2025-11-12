@@ -24,5 +24,7 @@ pytest -q
 3. Add the exchange name to the `ENABLED_EXCHANGES` environment variable (comma separated)
    if you need to load *additional* connectors.  By default the scanner enables
    all bundled exchanges (Binance, Bybit, MEXC, BingX, Gate).  Prefix an entry
-   with `-` to exclude it, e.g. `-gate` removes Gate from the default set.
+   with `-` to exclude it, e.g. `-gate` removes Gate from the default set.  You
+   can also toggle individual connectors with environment variables like
+   `CONNECTOR_GATE=0` or `CONNECTOR_BINANCE=1`.
 4. Restart the backend — the exchange will be loaded automatically.
