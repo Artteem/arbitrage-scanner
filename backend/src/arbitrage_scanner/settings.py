@@ -70,9 +70,52 @@ def _parse_enabled_exchanges(raw: str | None) -> List[str]:
     return ordered
 
 
+def _apply_connector_overrides(enabled: List[str]) -> List[str]:
+    """Apply per-connector enable/disable overrides from environment variables."""
+
+    toggles: dict[str, bool] = {}
+    prefix = "CONNECTOR_"
+    truthy = {"1", "true", "yes", "on"}
+    falsy = {"0", "false", "no", "off"}
+
+    for key, value in os.environ.items():
+        if not key.startswith(prefix):
+            continue
+        name = key[len(prefix) :].strip().lower()
+        if not name:
+            continue
+        val_normalized = (value or "").strip().lower()
+        if val_normalized in truthy:
+            toggles[name] = True
+        elif val_normalized in falsy:
+            toggles[name] = False
+
+    if not toggles:
+        return enabled
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+
+    for value in enabled:
+        name = value.lower()
+        if name in toggles and not toggles[name]:
+            continue
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    for name, enabled_state in toggles.items():
+        if enabled_state and name not in seen:
+            ordered.append(name)
+            seen.add(name)
+
+    return ordered
+
+
 def _build_enabled_exchanges() -> List[str]:
     env_value = os.getenv("ENABLED_EXCHANGES")
     enabled = _parse_enabled_exchanges(env_value)
+    enabled = _apply_connector_overrides(enabled)
     if enabled:
         return enabled
     return list(DEFAULT_ENABLED_EXCHANGES)
