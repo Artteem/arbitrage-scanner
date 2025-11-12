@@ -1,10 +1,16 @@
+import asyncio
 import gzip
 import json
 
 from arbitrage_scanner.connectors.gate_perp import (
+    WS_ORDERBOOK_DEPTH,
+    WS_ORDERBOOK_INTERVAL,
     _decode_ws_message,
     _handle_orderbook,
+    _handle_ping,
     _handle_tickers,
+    _perform_initial_ping,
+    _send_subscriptions,
 )
 from arbitrage_scanner.store import TickerStore
 
@@ -61,3 +67,71 @@ def test_gate_decode_ws_message_handles_gzip():
     decoded = _decode_ws_message(compressed)
 
     assert decoded == payload
+
+
+def test_gate_send_subscriptions_uses_documented_orderbook_payload():
+    class DummyWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data))
+
+    ws = DummyWS()
+    asyncio.run(_send_subscriptions(ws, [("BTCUSDT", "BTC_USDT")]))
+
+    depth_messages = [
+        message
+        for message in ws.sent
+        if message.get("channel") == "futures.order_book"
+    ]
+    assert depth_messages
+    depth_payload = depth_messages[0]["payload"]
+    assert depth_payload == [
+        "BTC_USDT",
+        str(WS_ORDERBOOK_DEPTH),
+        WS_ORDERBOOK_INTERVAL,
+    ]
+
+
+def test_gate_initial_ping_subscribes_and_resolves_ack():
+    class DummyWS:
+        def __init__(self, responses):
+            self.sent = []
+            self._responses = responses
+
+        async def send(self, data):
+            self.sent.append(json.loads(data))
+
+        async def recv(self):
+            if not self._responses:
+                raise RuntimeError("no responses queued")
+            return json.dumps(self._responses.pop(0))
+
+    responses = [
+        {"channel": "futures.ping", "event": "subscribe", "result": "success"}
+    ]
+    ws = DummyWS(responses)
+
+    assert asyncio.run(_perform_initial_ping(ws)) is True
+    assert ws.sent
+    assert ws.sent[0]["channel"] == "futures.ping"
+    assert ws.sent[0]["event"] == "subscribe"
+
+
+def test_gate_handle_ping_replies_to_update_messages():
+    class DummyWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data))
+
+    ws = DummyWS()
+    message = {"channel": "futures.ping", "event": "update"}
+
+    handled = asyncio.run(_handle_ping(ws, message))
+
+    assert handled is True
+    assert ws.sent
+    assert ws.sent[0]["event"] == "pong"
