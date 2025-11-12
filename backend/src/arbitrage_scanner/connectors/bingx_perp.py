@@ -312,6 +312,24 @@ def _to_bingx_ws_symbol(symbol: Symbol) -> str | None:
     return None  # <--- Не подписываемся, если не смогли распознать
 
 
+def _build_fallback_ws_symbol_map(symbols: Sequence[Symbol]) -> dict[str, str]:
+    """Construct a minimal websocket symbol map from static fallbacks."""
+
+    requested = list(_collect_wanted_common(symbols))
+    if not requested:
+        requested = [str(sym) for sym in FALLBACK_SYMBOLS]
+    fallback_map: dict[str, str] = {}
+    for candidate in requested:
+        normalized = _normalize_common_symbol(candidate)
+        if not normalized:
+            continue
+        native = _to_bingx_ws_symbol(normalized)
+        if not native:
+            continue
+        fallback_map[normalized] = native
+    return fallback_map
+
+
 def _from_bingx_symbol(symbol: str | None) -> str | None:
     """
     Мягкая нормализация входящих имён инструментов из BingX.
@@ -327,18 +345,59 @@ def _from_bingx_symbol(symbol: str | None) -> str | None:
 
 async def run_bingx(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     # ИСПРАВЛЕНИЕ: Убираем логику 'subscribe_all', она была некорректной
+    startup_backoff = WS_RECONNECT_INITIAL
+    attempt = 0
+    symbol_map: dict[str, str] = {}
+    while not symbol_map:
+        attempt += 1
+        try:
+            symbol_map = await _load_bingx_ws_symbol_map()
+            if not symbol_map:
+                logger.warning(
+                    "BingX REST returned empty contract list (attempt %d)", attempt
+                )
+        except Exception:
+            logger.exception(
+                "Failed to load BingX symbol map (attempt %d)", attempt
+            )
+            symbol_map = {}
+        if not symbol_map:
+            cached = _BINGX_WS_SYMBOL_CACHE or {}
+            if cached:
+                symbol_map = dict(cached)
+                logger.warning(
+                    "BingX using cached websocket symbol map with %d entries",
+                    len(symbol_map),
+                )
+        if not symbol_map:
+            symbol_map = _build_fallback_ws_symbol_map(symbols)
+            if symbol_map:
+                logger.warning(
+                    "BingX using fallback websocket symbol list with %d entries",
+                    len(symbol_map),
+                )
+        if not symbol_map:
+            logger.error(
+                "BingX failed to obtain websocket symbols; retrying in %.1fs",
+                startup_backoff,
+            )
+            await asyncio.sleep(startup_backoff + random.uniform(0, 0.5))
+            startup_backoff = min(startup_backoff * 2, WS_RECONNECT_MAX)
     try:
-        symbol_map = await _load_bingx_ws_symbol_map()
+        subscribe, _ = await _resolve_bingx_symbols(symbols)
     except Exception:
-        logger.exception("Failed to load BingX symbol map; aborting startup")
-        return
-    if not symbol_map:
-        logger.warning("BingX REST returned empty contract list; aborting startup")
-        return
-    subscribe, _ = await _resolve_bingx_symbols(symbols)
+        logger.exception("Failed to resolve BingX symbols from discovery; using fallback list")
+        subscribe = []
     if not subscribe:
-        logger.warning("No symbols resolved for BingX connector; skipping startup")
-        return
+        subscribe = sorted(symbol_map.keys())
+        if subscribe:
+            logger.warning(
+                "BingX falling back to cached/fallback subscription list with %d symbols",
+                len(subscribe),
+            )
+        else:
+            logger.error("BingX connector has no symbols to subscribe")
+            return
     chunks = [
         tuple(chunk) for chunk in _chunk_bingx_symbols(subscribe, MAX_TOPICS_PER_CONN)
     ]
