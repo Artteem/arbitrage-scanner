@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import json
 
+from arbitrage_scanner.connectors import gate_perp
 from arbitrage_scanner.connectors.gate_perp import (
     WS_ORDERBOOK_DEPTH,
     WS_ORDERBOOK_INTERVAL,
@@ -135,3 +136,58 @@ def test_gate_handle_ping_replies_to_update_messages():
     assert handled is True
     assert ws.sent
     assert ws.sent[0]["event"] == "pong"
+
+
+def test_run_gate_uses_fallback_when_discovery_returns_empty(monkeypatch, caplog):
+    recorded_chunks: list[tuple[tuple[str, str], ...]] = []
+
+    async def empty_resolve(symbols):
+        return []
+
+    async def record_ws(store, chunk):
+        recorded_chunks.append(tuple(chunk))
+
+    monkeypatch.setattr(gate_perp, "_resolve_gate_symbols", empty_resolve)
+    monkeypatch.setattr(gate_perp, "_run_gate_ws", record_ws)
+
+    store = TickerStore()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(gate_perp.run_gate(store, symbols=[]))
+
+    assert recorded_chunks, "websocket worker should run when using fallback"
+    flattened = {common for chunk in recorded_chunks for common, _ in chunk}
+    assert {"BTCUSDT", "ETHUSDT", "SOLUSDT"}.intersection(flattened)
+    assert any("using fallback" in message for message in caplog.messages)
+
+
+def test_run_gate_retries_discovery_before_start(monkeypatch):
+    resolve_calls = 0
+    sleep_calls: list[float] = []
+    recorded_chunks: list[tuple[tuple[str, str], ...]] = []
+
+    async def failing_then_successful(symbols):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls < 2:
+            return []
+        return ["BTC_USDT"]
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    async def record_ws(store, chunk):
+        recorded_chunks.append(tuple(chunk))
+
+    monkeypatch.setattr(gate_perp, "_resolve_gate_symbols", failing_then_successful)
+    monkeypatch.setattr(gate_perp, "_run_gate_ws", record_ws)
+    monkeypatch.setattr(gate_perp, "FALLBACK_NATIVE_SYMBOLS", tuple(), raising=False)
+    monkeypatch.setattr(gate_perp.asyncio, "sleep", fake_sleep)
+
+    store = TickerStore()
+
+    asyncio.run(gate_perp.run_gate(store, symbols=[]))
+
+    assert resolve_calls == 2, "resolver should be retried"
+    assert sleep_calls and sleep_calls[0] == gate_perp.WS_RECONNECT_INITIAL
+    assert recorded_chunks and recorded_chunks[0][0] == ("BTCUSDT", "BTC_USDT")
