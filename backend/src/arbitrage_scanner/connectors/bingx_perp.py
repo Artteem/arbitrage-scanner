@@ -19,6 +19,7 @@ message parsing for the exchange's USDT perpetual swap API.
 """
 
 import asyncio, json, gzip, io, time, random
+import inspect
 import zlib
 import logging
 import re
@@ -93,6 +94,20 @@ BINGX_HEADERS = {
     "Referer": "https://bingx.com/",
     "Accept": "application/json, text/plain, */*",
 }
+
+try:
+    _WEBSOCKETS_CONNECT_SIGNATURE = inspect.signature(websockets.connect)
+except (TypeError, ValueError):
+    _WEBSOCKETS_CONNECT_SIGNATURE = None
+
+
+def _ws_connect_supports(name: str) -> bool:
+    if _WEBSOCKETS_CONNECT_SIGNATURE is None:
+        return False
+    params = _WEBSOCKETS_CONNECT_SIGNATURE.parameters
+    if name in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
 
 _BINGX_WS_SYMBOL_CACHE: dict[str, str] | None = None
 _BINGX_WS_SYMBOL_CACHE_TS = 0.0
@@ -517,17 +532,18 @@ class _BingxWsClient:
             try:
                 self.ws_url = endpoint
                 self.log.info('Connecting to BingX WS endpoint %s', endpoint)
-                self._ws = await websockets.connect(
-                    endpoint,
+                connect_kwargs = dict(
                     ping_interval=None,
                     ping_timeout=None,
                     max_size=32 * 1024 * 1024,
                     compression=None,
                     close_timeout=3,
-                    read_limit=2**20,
                     max_queue=1024,
                     extra_headers=BINGX_HEADERS,
                 )
+                if _ws_connect_supports("read_limit"):
+                    connect_kwargs["read_limit"] = 2**20
+                self._ws = await websockets.connect(endpoint, **connect_kwargs)
                 self._rx_task = asyncio.create_task(self._ws_reader())
                 self._hb_task = asyncio.create_task(self._ws_heartbeat())
                 return
