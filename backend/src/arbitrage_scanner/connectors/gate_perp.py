@@ -75,51 +75,55 @@ WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 1
 
 # Default fallback set if discovery fails.
-FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+FALLBACK_NATIVE_SYMBOLS: tuple[Symbol, ...] = ("BTC_USDT", "ETH_USDT", "SOL_USDT")
 
 logger = logging.getLogger(__name__)
 
 
-def _normalize_common_symbol(symbol: Symbol) -> str:
-    """Normalize an incoming symbol by removing separators and upper‑casing."""
-    return str(symbol).replace("-", "").replace("_", "").upper()
+async def _resolve_gate_symbols(symbols: Sequence[Symbol]) -> list[str]:
+    """Resolve user‑provided symbols into Gate native contract identifiers."""
 
-
-async def _resolve_gate_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
-    """Resolve user‑provided symbols against discovered Gate USDT perpetual contracts."""
-    requested: list[Symbol] = []
+    requested: list[str] = []
     seen: set[str] = set()
     for symbol in symbols:
         if not symbol:
             continue
-        normalized = _normalize_common_symbol(symbol)
-        if not normalized or normalized in seen:
+        native = str(symbol).strip().upper()
+        if not native:
             continue
-        seen.add(normalized)
-        requested.append(normalized)
+        native = native.replace("-", "_")
+        if native.endswith("USDT") and "_" not in native:
+            native = f"{native[:-4]}_USDT"
+        if native in seen:
+            continue
+        seen.add(native)
+        requested.append(native)
 
-    discovered: set[str] = set()
+    if len(requested) >= MIN_SYMBOL_THRESHOLD:
+        return requested
+
     try:
         discovered = await discover_gate_usdt_perp()
     except Exception:
         discovered = set()
 
     if discovered:
-        discovered_normalized = {_normalize_common_symbol(sym) for sym in discovered}
-        filtered: list[Symbol] = []
-        used: set[str] = set()
-        for symbol in requested:
-            if symbol in discovered_normalized and symbol not in used:
-                filtered.append(symbol)
-                used.add(symbol)
-        if filtered:
-            return filtered
-        # If none of the requested symbols exist, fall back to the full list
-        return sorted(discovered_normalized)
-    # Discovery failed; fall back to either the user‑supplied symbols or defaults
-    if not requested:
-        return list(FALLBACK_SYMBOLS)
-    return requested
+        discovered_native: set[str] = set()
+        for sym in discovered:
+            native = _to_gate_symbol(sym)
+            if not native:
+                continue
+            discovered_native.add(str(native).upper())
+        if requested:
+            filtered = [native for native in requested if native in discovered_native]
+            if filtered:
+                return filtered
+        if discovered_native:
+            return sorted(discovered_native)
+
+    if requested:
+        return requested
+    return list(FALLBACK_NATIVE_SYMBOLS)
 
 
 def _to_gate_symbol(symbol: Symbol) -> str:
@@ -244,16 +248,19 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     error occurs, at which point all workers are restarted.  This mirrors the
     behaviour of the Binance and Bybit connectors.
     """
-    subscribe = await _resolve_gate_symbols(symbols)
-    if not subscribe:
+    subscribe_native = await _resolve_gate_symbols(symbols)
+    if not subscribe_native:
         return
     # Build list of (common_symbol, native_symbol) tuples.
     symbol_pairs: list[tuple[str, str]] = []
-    for sym in subscribe:
-        native = _to_gate_symbol(sym)
-        if not native:
+    for native in subscribe_native:
+        ws_symbol = _to_gate_symbol(native)
+        if not ws_symbol:
             continue
-        symbol_pairs.append((sym, native))
+        common = _from_gate_symbol(ws_symbol)
+        if not common:
+            continue
+        symbol_pairs.append((common, ws_symbol))
     if not symbol_pairs:
         return
     # Split into chunks to avoid overloading a single connection.  This

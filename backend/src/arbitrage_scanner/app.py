@@ -204,7 +204,7 @@ async def startup():
         # Try to compute intersection of symbols across exchanges.
         common_symbols: list[str] = []
         try:
-            common_symbols = await discover_common_symbols(CONNECTORS)
+            common_symbols = await discover_common_symbols(CONNECTORS, prefetched=discovery)
         except Exception:
             common_symbols = []
         if common_symbols:
@@ -212,13 +212,22 @@ async def startup():
             SYMBOLS = common_symbols
             CONNECTOR_SYMBOLS = {}
             for spec in CONNECTORS:
-                symbols_for = discovery.per_connector.get(spec.name) or []
-                # Filter each connector's list down to the common set.
-                CONNECTOR_SYMBOLS[spec.name] = [sym for sym in symbols_for if sym in common_symbols]
+                native_symbols = discovery.native_per_connector.get(spec.name) or []
+                mapping = discovery.native_to_normalized.get(spec.name) or {}
+                filtered = [
+                    native
+                    for native in native_symbols
+                    if mapping.get(native) in common_symbols
+                ]
+                CONNECTOR_SYMBOLS[spec.name] = filtered
+            for spec in CONNECTORS:
+                CONNECTOR_SYMBOLS.setdefault(spec.name, [])
         elif discovery.symbols_union:
             # Otherwise, fall back to the union of discovered symbols.
             SYMBOLS = discovery.symbols_union
-            CONNECTOR_SYMBOLS = discovery.per_connector
+            CONNECTOR_SYMBOLS = dict(discovery.native_per_connector)
+            for spec in CONNECTORS:
+                CONNECTOR_SYMBOLS.setdefault(spec.name, [])
         else:
             # If discovery returned nothing, use the fallback symbols.
             SYMBOLS = FALLBACK_SYMBOLS

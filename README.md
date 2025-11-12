@@ -1,341 +1,78 @@
-# AY-Trade Arbitrage Scanner — README
+# Arbitrage Scanner
 
-Сервис для поиска спредов между одинаковыми бессрочными фьючерсными контрактами на разных биржах (perps). 
-Основная идея — **реал-тайм мониторинг бид/аск**, **нормализация тикеров**, расчет **входа/выхода** и выдача результатов через **HTTP API** и (опционально) **WebSocket**.
+Monorepo for a crypto arbitrage scanner (backend + frontend).  
+Tech stack: **Python 3.11 / FastAPI** (backend), **TypeScript / Next.js** (frontend).
 
----
-
-## 📦 Состав репозитория
+## Structure
 
-```
-arbitrage-scanner/
-├─ backend/
-│  └─ src/
-│     ├─ arbitrage_scanner/
-│     │  ├─ app.py                 # FastAPI приложение (REST + WS)
-│     │  ├─ discovery.py           # Поиск/кэш контрактов, нормализация тикеров и маппинг по биржам
-│     │  ├─ exchanges/
-│     │  │  ├─ mexc_perp.py        # Адаптер MEXC Perpetual
-│     │  │  ├─ gate_perp.py        # Адаптер Gate Perpetual
-│     │  │  └─ bingx_perp.py       # Адаптер BingX Perpetual
-│     │  └─ ...
-│     └─ ...
-├─ frontend/                        # Ваш Next.js фронтенд (парные виды/спреды)
-└─ README.md                        # Этот файл
-```
-
-> Если структура у вас немного отличается — ориентируйтесь по именам модулей. В этом README даны **готовые файлы** (см. ниже) и инструкция, как их положить.
+- backend/ — FastAPI service, business logic and integrations.
+- frontend/ — Next.js app (dashboard for spreads, see below).
+- docs/ — Architecture, decisions, and runbooks.
+- scripts/ — Utility scripts.
+- .github/workflows/ — CI configs.
 
----
+## Quickstart
 
-## ⚙️ Что делает сервис
+See docs/02-setup.md for environment setup and docs/03-backend-dev.md to run the API locally.
 
-1. **При старте**:
-   - Подтягивает список бессрочных фьючерсных контрактов с бирж: **MEXC**, **BingX**, **Gate** (REST).
-   - Нормализует названия в унифицированный вид: `BASEQUOTE` (например, `BTCUSDT`) и `BASE_QUOTE`/`BASE-QUOTE` при необходимости.
-   - Строит **кросс-биржевой маппинг одинаковых инструментов**.
+## Frontend
 
-2. **В процессе работы**:
-   - Подписывается на **WS лучшего бид/аск** по *всем* контрактам на каждой бирже.
-   - Получает **ставки финансирования** и **расчётные периоды**, когда доступно (через REST/WS).
-   - Считает кандидаты на арбитраж (**вход**/**выход**) и отдаёт их наружу.
-
-3. **Выдача данных**:
-   - **HTTP API** (FastAPI) с `GET /stats`, `GET /pairs`, `GET /health` и др.
-   - **WebSocket** канал обновлений (опционально): потоковые обновления спредов/квот.
-
----
-
-## 🔌 Поддерживаемые биржи и источники
-
-- **MEXC (Perpetual)**  
-  Контракты: `https://contract.mexc.com/api/v1/contract/detail`  
-  Пример тикеров: `BTC_USDT`, `ETH_USDT`, ...
-
-- **BingX (Perpetual)**  
-  Контракты: `https://open-api.bingx.com/openApi/swap/v2/quote/contracts`  
-  Пример тикеров: `BTC-USDT` → нормализуем в `BTCUSDT`.
-
-- **Gate (Perpetual)**  
-  Контракты: публичный REST `/futures/usdt/contracts` (или аналог для perp), тикеры вида `BTC_USDT` → нормализуем.
-
-Адаптеры (`mexc_perp.py`, `bingx_perp.py`, `gate_perp.py`) уже реализуют:
-- загрузку контрактов,
-- нормализацию названий,
-- WS‑подписки на best bid/ask,
-- (когда доступно) ставки финансирования.
-
----
-
-## 🚀 Быстрый старт (Backend)
-
-### 1) Зависимости
-
-Python 3.10+ (рекомендовано 3.11/3.12).
-
-```bash
-cd backend/src
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -U pip wheel
-pip install -r requirements.txt  # если есть; иначе установите fastapi uvicorn websockets httpx pydantic
-```
-
-Минимальный набор:
-```bash
-pip install fastapi uvicorn[standard] httpx websockets pydantic==2.*
-```
-
-### 2) Переменные окружения
-
-Создайте `.env` (или задайте в systemd):
-```
-HOST=127.0.0.1
-PORT=8010
-ROOT_PATH=/api
-
-# Тогглы бирж (1/0)
-EXCH_MEXC=1
-EXCH_BINGX=1
-EXCH_GATE=1
-
-# Тайминги и настройки
-DISCOVERY_TTL_SEC=1800        # как часто обновлять список контрактов
-WS_RECONNECT_DELAY_SEC=3
-BOOTSTRAP_DELAY_SEC=1.0
-```
-
-> API‑ключи **не требуются** для публичных котировок/контрактов. Для приватных функций (торговля) потребуются отдельные ключи — вне рамок этого README.
-
-### 3) Запуск локально
-
-```bash
-uvicorn arbitrage_scanner.app:app \
-  --host ${HOST:-127.0.0.1} --port ${PORT:-8010} \
-  --root-path ${ROOT_PATH:-/api} --proxy-headers
-```
-
-Проверки:
-```bash
-curl -s http://127.0.0.1:8010/health
-curl -s http://127.0.0.1:8010/stats | jq
-curl -s http://127.0.0.1:8010/pairs | jq | head
-```
-
-### 4) systemd юнит (прод)
-
-`/etc/systemd/system/aytrade-api.service`
-
-```ini
-[Unit]
-Description=AYTRADE FastAPI (Uvicorn)
-After=network.target
-
-[Service]
-User=aytrade
-WorkingDirectory=/opt/aytrade/app/backend/src
-Environment="HOST=127.0.0.1"
-Environment="PORT=8010"
-Environment="ROOT_PATH=/api"
-Environment="EXCH_MEXC=1"
-Environment="EXCH_BINGX=1"
-Environment="EXCH_GATE=1"
-ExecStart=/opt/aytrade/venv/bin/uvicorn arbitrage_scanner.app:app \
-  --host ${HOST} --port ${PORT} \
-  --root-path ${ROOT_PATH} \
-  --proxy-headers
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now aytrade-api.service
-sudo systemctl status aytrade-api.service
-```
-
-### 5) Nginx (reverse proxy)
-
-Сайт `aytrade.space` (фронтенд) обычно проксирует `/api` на бэкенд:
-
-```nginx
-location /api/ {
-  proxy_pass         http://127.0.0.1:8010/api/;
-  proxy_http_version 1.1;
-  proxy_set_header   Upgrade $http_upgrade;
-  proxy_set_header   Connection "upgrade";
-  proxy_set_header   Host $host;
-  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header   X-Forwarded-Proto $scheme;
-}
-```
-
-Проверка:
-```bash
-curl -s http://aytrade.space/api/health
-curl -s http://aytrade.space/api/stats | jq | head
-```
-
----
-
-## 🧠 Нормализация тикеров
-
-Цель — свести все символы к каноническому `BASEQUOTE`:
-
-- `BTC_USDT` → `BTCUSDT`
-- `BTC-USDT` → `BTCUSDT`
-- `ETH_USD`  → `ETHUSD`
-
-Правила в `discovery.py`:
-- удаляем разделители (`_`, `-`),
-- оставляем заглавные,
-- для некоторых бирж сохраняем оригинал и маппинг `canonical → {per_exchange_symbol}`.
-
-Пример JSON пары (упрощённо):
-```json
-{
-  "canonical": "BTCUSDT",
-  "exchanges": {
-    "MEXC": "BTC_USDT",
-    "BINGX": "BTC-USDT",
-    "GATE": "BTC_USDT"
-  }
-}
-```
-
----
-
-## 📡 Потоки и котировки
-
-Каждый адаптер:
-- Делает REST‑дискавери контрактов.
-- Открывает WS‑подписки на лучшие цены (best bid/ask) по всем поддерживаемым контрактам.
-- При реконнекте — **автоматически переподписывается**.
-- Отправляет апдейты в общий агрегатор, где уже считается спред между биржами для одинаковых `canonical`.
-
----
-
-## 📚 HTTP API (основные)
-
-Базовый префикс соответствует `ROOT_PATH` (по умолчанию `/api`).
+The frontend directory contains a Next.js 14 dashboard that consumes the deployed FastAPI service. To run it locally:
 
-- `GET /health` — здоровье приложения.  
-  Ответ: `{"status": "ok", "exchanges": {...}}`
-
-- `GET /stats` — сводка по подпискам/количеству символов/аптайму.  
-  Полезно для диагностики.
-
-- `GET /pairs` — список нормализованных пар и доступность на биржах.  
-  Параметры:  
-  - `q` — фильтр по подстроке (например, `BTC`),
-  - `ex` — фильтр по бирже (`MEXC|BINGX|GATE`),
-  - `limit` — ограничить кол-во.
+cd frontend  
+npm install  
+npm run dev
 
-- `GET /spreads` — текущие кросс‑биржевые спреды по доступным парам.  
-  Параметры:  
-  - `min_abs` — минимальный абсолютный спред в %,
-  - `top` — вернуть топ-N по модулю спреда,
-  - `symbols` — список интересующих `canonical` через запятую.
+By default the UI connects to http://localhost:8000. Override the API URL by setting the NEXT_PUBLIC_API_BASE_URL environment variable before starting the dev server.
 
-*(Если у вас нет эндпоинта `GET /spreads`, включите его в `app.py` — каркас уже предусмотрен.)*
+## Exchange connectors
 
----
+The backend includes WebSocket connectors for a number of USDT‑perpetual futures exchanges. Each connector implements unified logic for discovering symbols, managing WebSocket subscriptions within the exchange's limits, and updating a shared TickerStore with real‑time order book, ticker and funding data. The connectors for Binance and Bybit were used as the reference implementation, and connectors for MEXC, Gate.io and BingX have been refactored to follow the same pattern.
 
-## 🧪 Быстрые проверки (реальные команды)
+### High‑level workflow
 
-MEXC:
-```bash
-curl -sS 'https://contract.mexc.com/api/v1/contract/detail' | jq '.data | length'
-curl -sS 'https://contract.mexc.com/api/v1/contract/detail' | jq -r '.data[0:10][]?.symbol'
-```
+- **Symbol discovery**: Each connector provides a discover_\* function that returns the list of active USDT‑perpetual contracts on the exchange. When the run_\* function is called with a list of symbols, the connector resolves the provided list against the discovered set. If fewer than a small threshold of symbols are given, the connector falls back to the full discovered list, ensuring that it streams all relevant contracts by default.
+- **Subscription batching**: Exchanges impose limits on the number of topics (subscriptions) per WebSocket connection. Because a single contract usually maps to multiple topics (e.g. ticker, order book and funding rate), connectors divide the symbol list into batches small enough to respect the limit. For example, MEXC permits at most 30 topics per connection [\[1\]](https://www.mexc.com/api-docs/spot-v3/websocket-market-streams#:~:text=,the%20parameters%20returned%20in%20the); since each contract requires three topics, the MEXC connector groups symbols into batches of ten.
+- **Heartbeat and reconnection**: WebSocket workers send periodic heartbeat pings and listen for server pings to keep connections alive. If any worker crashes or the connection is closed, the connector automatically restarts all workers with exponential backoff.
 
-BingX:
-```bash
-curl -sS 'https://open-api.bingx.com/openApi/swap/v2/quote/contracts' | jq -r '.data[0:10][]?.symbol'
-curl -sS 'https://open-api.bingx.com/openApi/swap/v2/quote/contracts' | jq -r '.data[].symbol | gsub("-"; "")' | head
-```
+### Exchange‑specific notes
 
-После запуска бэка проверьте агрегированные пары/статус:
-```bash
-curl -s http://127.0.0.1:8010/health
-curl -s http://127.0.0.1:8010/pairs  | jq | head
-curl -s http://127.0.0.1:8010/stats  | jq
-```
+| Exchange | Symbol format | Subscription limit | Notes |
+| --- | --- | --- | --- |
+| **Binance** | BTCUSDT | No strict limit documented | Provides book ticker and mark price streams. |
+| **Bybit** | BTCUSDT | No strict limit documented | Linear USDT perpetual contracts; similar to Binance. |
+| **MEXC** | BTC_USDT for API; the connector normalises to BTCUSDT | 30 topics per connection[\[1\]](https://www.mexc.com/api-docs/spot-v3/websocket-market-streams#:~:text=,the%20parameters%20returned%20in%20the) (10 contracts × 3 topics) | Uses separate sub.ticker, sub.depth and sub.funding.rate methods for each contract[\[2\]](https://mexcdevelop.github.io/apidocs/contract_v1_en/#:~:text=p%20decimal%20transaction%20price%20v,No%20t%20long%20transaction%20time). |
+| **Gate.io** | BTC_USDT | Avoid duplicate order book subscriptions for a contract[\[3\]](https://www.gate.com/docs/developers/futures/ws/en/#:~:text=Note%3A) | Order book channels use ob.&lt;symbol&gt;.100; depths of 50 and 400 are also available. |
+| **BingX** | BTCUSDT | 200 topics per connection[\[4\]](https://bingx.com/en/support/articles/36544879951641-adjustment-of-websocket-subscription-limits-for-spot-trading#:~:text=With%20the%20growing%20number%20of,to%20prevent%20any%20subscription%20issues) (100 contracts × 2 topics) | WebSocket endpoint is wss://open-api-swap.bingx.com/swap-market; the connector subscribes to ticker and depth5 topics. |
 
----
+### Adding a new exchange
 
-## 🧩 Интеграция с фронтендом
+To support a new USDT‑perpetual exchange in the arbitrage scanner, follow these guidelines:
 
-Фронт (Next.js) получает данные:
-- периодическими `fetch` к `/api/spreads` и `/api/pairs`,
-- либо через **WS** (если включён в `app.py`):  
-  `wss://aytrade.space/api/ws` (пример; проверьте свой роут).
+1.  **Create a discovery function**: Implement a function discover_&lt;exchange&gt;\_usdt_perp that retrieves the list of active USDT‑perpetual contracts from the exchange's REST API. The function should return symbols in a common format (e.g. without underscores) and cache results for a reasonable period to avoid rate limits. Use httpx.AsyncClient with proxies from settings.httpx_proxies if necessary.
+2.  **Implement REST helpers**: Provide functions to fetch contract metadata (taker fees, leverage limits), historical quotes and funding history. These helpers should raise exceptions on network errors and cache results to reduce load on the exchange.
+3.  **Write a WebSocket runner**: Create a run_&lt;exchange&gt; coroutine similar to run_binance/run_bybit. It should:
+4.  Accept a TickerStore and a sequence of Symbol values.
+5.  Resolve the requested symbols via the discovery function; fall back to the full discovered list if the user passes fewer than a threshold number.
+6.  Determine the exchange's topic limit and compute the number of topics per contract (ticker, depth, funding). Divide the symbol list into batches whose topic count does not exceed the limit.
+7.  For each batch, open a WebSocket connection to the exchange's endpoint, send subscription messages for the relevant topics, handle heartbeat pings/pongs, parse incoming messages and update the TickerStore. On errors, reconnect with an exponential backoff.
+8.  **Register the connector**: Add a short &lt;exchange&gt;.py module in backend/src/arbitrage_scanner/connectors that imports your WebSocket runner and discovery functions and returns a ConnectorSpec instance. See binance.py or bybit.py for examples.
+9.  **Document your integration**: Update the table above with the exchange's symbol format, subscription limits and any quirks (e.g. whether depth channels require unique subscriptions). Provide code comments in your connector explaining how you derived the limits and any workarounds.
 
-> Важно: **задержка < 1 сек** достигается только при постоянной WS‑подписке на бэке и минимальной обработке на фронте. Избегайте тяжёлых агрегатов на клиенте — считайте спреды на бэке и отдавайте уже готовые значения.
+By adhering to this template you ensure that new connectors integrate cleanly with the existing infrastructure and behave consistently across different exchanges.
 
----
+[\[1\]](https://www.mexc.com/api-docs/spot-v3/websocket-market-streams#:~:text=,the%20parameters%20returned%20in%20the) Websocket Market Streams | MEXC API
 
-## 🧱 Частые проблемы
+https://www.mexc.com/api-docs/spot-v3/websocket-market-streams
 
-1. **Нет данных/мало пар**:  
-   - Проверьте, что `EXCH_*=1` и биржи действительно возвращают контракты.
-   - Убедитесь, что совпадает тип рынка (perpetual/USDT‑margined).
+[\[2\]](https://mexcdevelop.github.io/apidocs/contract_v1_en/#:~:text=p%20decimal%20transaction%20price%20v,No%20t%20long%20transaction%20time) MXC CONTRACT API
 
-2. **WS не работает за Nginx**:  
-   - Не забывайте `proxy_set_header Upgrade` и `Connection "upgrade"` в локации `/api/`.
+https://mexcdevelop.github.io/apidocs/contract_v1_en/
 
-3. **Высокая задержка/лаг**:  
-   - Проверьте CPU/сеть VPS, лимиты `ulimit`, отключите лишние логи.
-   - Уменьшите объём сериализации (отдавайте только нужные поля).
+[\[3\]](https://www.gate.com/docs/developers/futures/ws/en/#:~:text=Note%3A) Gate Futures WebSocket v4 | Gate API v4
 
-4. **Разные имена тикеров**:  
-   - Смотрите маппинг `canonical → per_exchange_symbol` из `discovery.py`.
-   - При необходимости добавляйте хардкод‑алиасы (редко нужно).
+https://www.gate.com/docs/developers/futures/ws/en/
 
----
+[\[4\]](https://bingx.com/en/support/articles/36544879951641-adjustment-of-websocket-subscription-limits-for-spot-trading#:~:text=With%20the%20growing%20number%20of,to%20prevent%20any%20subscription%20issues) Adjustment of Websocket Subscription Limits for Spot Trading
 
-## 🔄 Обновление/Деплой
-
-```bash
-cd /opt/aytrade/app
-git fetch origin
-git checkout main
-git reset --hard origin/main
-
-# Обновите виртуалку при изменениях зависимостей
-source /opt/aytrade/venv/bin/activate
-pip install -r backend/src/requirements.txt  # если файл используется
-
-# Перезапуск
-sudo systemctl restart aytrade-api.service
-journalctl -u aytrade-api.service -n 200 -f
-```
-
----
-
-## 📁 Готовые файлы для замены
-
-Если вы получили от меня следующие файлы, положите их так:
-
-- `backend/src/arbitrage_scanner/app.py`
-- `backend/src/arbitrage_scanner/discovery.py`
-- `backend/src/arbitrage_scanner/exchanges/mexc_perp.py`
-- `backend/src/arbitrage_scanner/exchanges/gate_perp.py`
-- `backend/src/arbitrage_scanner/exchanges/bingx_perp.py`
-
-После замены — перезапуск сервиса (см. выше).
-
----
-
-## 📝 Лицензия
-
-MIT — используйте свободно, но без гарантий. Автор и контрибьюторы не несут ответственности за возможные убытки от торговли. Крипторынки высокорискованные; используйте на свой страх и риск.
-
----
-
-## ❓Вопросы
-
-Пишите в тред/чат проекта или поднимайте Issue в GitHub репозитории: `Artteem/arbitrage-scanner`.
+https://bingx.com/en/support/articles/36544879951641-adjustment-of-websocket-subscription-limits-for-spot-trading
