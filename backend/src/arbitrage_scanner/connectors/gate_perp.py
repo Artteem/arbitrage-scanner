@@ -58,6 +58,11 @@ MAX_TOPICS_PER_CONN = 100
 # or 400; using 100 provides a mid‑range snapshot without overwhelming the
 # client.
 WS_ORDERBOOK_DEPTH = 100
+# Per the Gate Futures WebSocket documentation the order book channel accepts a
+# depth parameter and an optional update interval expressed as a string (for
+# example "100ms").  Supplying both keeps the subscription payload aligned with
+# the documented format and avoids relying on server defaults.
+WS_ORDERBOOK_INTERVAL = "100ms"
 
 # Delay between successive subscription messages in seconds.
 WS_SUB_DELAY = 0.1
@@ -405,7 +410,7 @@ async def _send_subscriptions(ws, symbols: Sequence[tuple[str, str]]) -> None:
             "time": now,
             "channel": "futures.order_book",
             "event": "subscribe",
-            "payload": [native, WS_ORDERBOOK_DEPTH],
+            "payload": [native, str(WS_ORDERBOOK_DEPTH), WS_ORDERBOOK_INTERVAL],
         }
         await _send_ws_payload(ws, depth_payload)
         await asyncio.sleep(WS_SUB_DELAY)
@@ -477,7 +482,7 @@ async def _perform_initial_ping(ws) -> bool:
     message = {
         "time": int(time.time()),
         "channel": "futures.ping",
-        "event": "ping",
+        "event": "subscribe",
     }
     try:
         await ws.send(json.dumps(message))
@@ -496,9 +501,12 @@ async def _perform_initial_ping(ws) -> bool:
             continue
         event = str(payload.get("event") or "").lower()
         channel = str(payload.get("channel") or "")
-        if event == "pong" or channel == "futures.ping":
+        if channel == "futures.ping" and _is_gate_ack(payload):
             return True
-        if event == "ping" or channel.endswith(".ping"):
+        if channel == "futures.ping" and event == "pong":
+            return True
+        is_ping_channel = channel.endswith(".ping")
+        if event == "ping" or (is_ping_channel and event in {"ping", "update"}):
             reply = {
                 "time": int(time.time()),
                 "channel": channel or "futures.ping",
@@ -521,9 +529,14 @@ async def _handle_ping(ws, message: dict) -> bool:
         return False
     event = str(message.get("event") or "").lower()
     channel = str(message.get("channel") or "")
-    if event not in {"ping", "pong"} and not channel.endswith(".ping"):
+    is_ping_channel = channel.endswith(".ping")
+    if not is_ping_channel and event not in {"ping", "pong"}:
         return False
-    if event == "ping" or channel.endswith(".ping"):
+    if is_ping_channel and _is_gate_ack(message):
+        return True
+    if event == "pong":
+        return True
+    if event == "ping" or (is_ping_channel and event in {"ping", "update"}):
         reply = {
             "time": int(time.time()),
             "channel": channel or "futures.ping",
@@ -534,7 +547,7 @@ async def _handle_ping(ws, message: dict) -> bool:
         except Exception:
             pass
         return True
-    return event == "pong"
+    return False
 
 
 def _is_gate_ack(message: dict) -> bool:
