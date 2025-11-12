@@ -37,7 +37,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
-from .base import ConnectorSpec
+from .base import ConnectorContract, ConnectorSpec
 from .bingx_utils import normalize_bingx_symbol
 from ..domain import ExchangeName, Symbol
 from ..settings import settings  # type: ignore
@@ -441,39 +441,117 @@ class DiscoveryResult:
     """Result of auto-discovery for connectors.
 
     Attributes:
-        symbols_union: Flat list of all discovered symbols across exchanges.
-        per_connector: Mapping from exchange name to its list of symbols.
+        symbols_union: Normalized symbol union across exchanges.
+        per_connector: Mapping from exchange name to its list of normalized symbols.
+        native_per_connector: Mapping from exchange name to the native (REST) symbols.
+        native_to_normalized: Mapping from native symbol to normalized symbol per exchange.
     """
+
     symbols_union: List[Symbol]
     per_connector: Dict[ExchangeName, List[Symbol]]
+    native_per_connector: Dict[ExchangeName, List[str]]
+    native_to_normalized: Dict[ExchangeName, Dict[str, Symbol]]
 
-async def discover_symbols_for_connectors(connectors: Iterable[ConnectorSpec]) -> DiscoveryResult:
-    """Collect USDT-perpetual symbols for each connector.
 
-    Returns a union list and a per-connector dictionary.  If discovery
-    fails on a particular exchange, it is ignored and will not abort the
-    entire process.
-    """
-    discovered: Dict[ExchangeName, Set[Symbol]] = {}
+def _extract_symbol_sets(
+    contracts: Sequence[ConnectorContract],
+) -> tuple[List[Symbol], List[str], Dict[str, Symbol]]:
+    native_seen: set[str] = set()
+    normalized_seen: set[Symbol] = set()
+    normalized_list: List[Symbol] = []
+    native_list: List[str] = []
+    mapping: Dict[str, Symbol] = {}
+    for contract in contracts:
+        native = str(contract.original_symbol).strip()
+        normalized = str(contract.normalized_symbol).strip().upper()
+        if not native or not normalized:
+            continue
+        native_upper = native.upper()
+        normalized_symbol = Symbol(normalized)
+        mapping[native_upper] = normalized_symbol
+        if native_upper not in native_seen:
+            native_seen.add(native_upper)
+            native_list.append(native_upper)
+        if normalized_symbol not in normalized_seen:
+            normalized_seen.add(normalized_symbol)
+            normalized_list.append(normalized_symbol)
+    return normalized_list, native_list, mapping
+
+
+async def discover_symbols_for_connectors(
+    connectors: Iterable[ConnectorSpec],
+) -> DiscoveryResult:
+    """Collect contract metadata for each connector using REST listings."""
+
+    per_connector: Dict[ExchangeName, List[Symbol]] = {}
+    native_per_connector: Dict[ExchangeName, List[str]] = {}
+    native_to_normalized: Dict[ExchangeName, Dict[str, Symbol]] = {}
+
     for connector in connectors:
-        if connector.discover_symbols is None:
-            continue
-        try:
-            symbols = await connector.discover_symbols()
-        except Exception:
-            continue
-        symbol_set = {Symbol(str(sym)) for sym in symbols if str(sym)}
-        if symbol_set:
-            discovered[connector.name] = symbol_set
-    if not discovered:
-        return DiscoveryResult(symbols_union=[], per_connector={})
-    union = sorted(set.union(*discovered.values()))
-    per_connector = {name: sorted(values) for name, values in discovered.items()}
-    return DiscoveryResult(symbols_union=union, per_connector=per_connector)
+        contracts: Sequence[ConnectorContract] = []
+        if connector.fetch_contracts is not None:
+            try:
+                contracts = await connector.fetch_contracts()
+            except Exception:
+                contracts = []
+        if not contracts and connector.discover_symbols is not None:
+            try:
+                discovered = await connector.discover_symbols()
+            except Exception:
+                discovered = []
+            contracts = [
+                ConnectorContract(
+                    original_symbol=str(sym),
+                    normalized_symbol=Symbol(str(sym)),
+                    base_asset="",
+                    quote_asset="",
+                )
+                for sym in discovered
+                if str(sym)
+            ]
 
-async def discover_common_symbols(connectors: Iterable[ConnectorSpec]) -> List[str]:
-    """Return the sorted intersection of symbols across all connectors."""
-    result = await discover_symbols_for_connectors(connectors)
+        if not contracts:
+            continue
+
+        normalized_list, native_list, mapping = _extract_symbol_sets(contracts)
+        if not normalized_list or not native_list:
+            continue
+        per_connector[connector.name] = sorted(normalized_list)
+        native_per_connector[connector.name] = sorted(native_list)
+        native_to_normalized[connector.name] = mapping
+
+    if not per_connector:
+        return DiscoveryResult(
+            symbols_union=[],
+            per_connector={},
+            native_per_connector={},
+            native_to_normalized={},
+        )
+
+    union: set[Symbol] = set()
+    for symbols in per_connector.values():
+        union.update(symbols)
+
+    return DiscoveryResult(
+        symbols_union=sorted(union),
+        per_connector={name: sorted(symbols) for name, symbols in per_connector.items()},
+        native_per_connector={
+            name: sorted(symbols) for name, symbols in native_per_connector.items()
+        },
+        native_to_normalized={
+            name: dict(mapping) for name, mapping in native_to_normalized.items()
+        },
+    )
+
+
+async def discover_common_symbols(
+    connectors: Iterable[ConnectorSpec],
+    *,
+    prefetched: DiscoveryResult | None = None,
+) -> List[str]:
+    """Return the sorted intersection of normalized symbols across connectors."""
+
+    result = prefetched or await discover_symbols_for_connectors(connectors)
     if not result.per_connector:
         return []
     sets = [set(items) for items in result.per_connector.values() if items]

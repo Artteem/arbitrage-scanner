@@ -22,7 +22,6 @@ connector will fall back to discovery if fewer than one symbol is provided.
 """
 
 import asyncio
-import gzip
 import json
 import logging
 import time
@@ -30,7 +29,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
-import zlib
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
@@ -65,36 +63,34 @@ HEARTBEAT_INTERVAL = 20.0
 # `discover_mexc_usdt_perp`.
 MIN_SYMBOL_THRESHOLD = 1
 
-# Fallback list used when discovery fails completely.  The common symbol
-# representation removes separators (e.g. BTCUSDT).
-FALLBACK_SYMBOLS: tuple[Symbol, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+# Fallback list used when discovery fails completely.  Stored in native
+# exchange format (e.g. BTC_USDT).
+FALLBACK_NATIVE_SYMBOLS: tuple[Symbol, ...] = ("BTC_USDT", "ETH_USDT", "SOL_USDT")
 
 logger = logging.getLogger(__name__)
 
 
-def _normalize_common_symbol(symbol: Symbol) -> str:
-    """Normalize a symbol by removing dashes/underscores and upper‑casing."""
-    return str(symbol).replace("-", "").replace("_", "").upper()
+async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[str]:
+    """Resolve requested symbols into native MEXC contract identifiers."""
 
-
-async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
-    """Resolve user‑provided symbols against discovered MEXC USDT perpetual contracts.
-
-    If no symbols are explicitly configured, all discovered symbols are returned.
-    If discovery fails, a static fallback list is used.  This mirrors the
-    behaviour of the Binance/Bybit connectors, which default to the full
-    contract list when only a few symbols are provided.
-    """
-    requested: list[Symbol] = []
+    requested: list[str] = []
     seen: set[str] = set()
     for symbol in symbols:
         if not symbol:
             continue
-        normalized = _normalize_common_symbol(symbol)
-        if not normalized or normalized in seen:
+        native = str(symbol).strip().upper()
+        if not native:
             continue
-        seen.add(normalized)
-        requested.append(normalized)
+        native = native.replace("-", "_")
+        if native.endswith("USDT") and "_" not in native:
+            native = f"{native[:-4]}_USDT"
+        if native in seen:
+            continue
+        seen.add(native)
+        requested.append(native)
+
+    if len(requested) >= MIN_SYMBOL_THRESHOLD:
+        return requested
 
     try:
         discovered = await discover_mexc_usdt_perp()
@@ -102,23 +98,23 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
         logger.exception("Failed to discover MEXC symbols; falling back to configured list")
         discovered = set()
 
-    discovered_normalized: dict[str, Symbol] = {}
-    for sym in discovered:
-        normalized = _normalize_common_symbol(sym)
-        if normalized and normalized not in discovered_normalized:
-            discovered_normalized[normalized] = normalized
-
-    if discovered_normalized:
-        if not requested:
-            return sorted(discovered_normalized.keys())
-        filtered = [symbol for symbol in requested if symbol in discovered_normalized]
-        if filtered:
-            return filtered
-        logger.warning(
-            "Requested symbols are unavailable on MEXC; using discovered symbols",
-            extra={"requested": requested},
-        )
-        return sorted(discovered_normalized.keys())
+    if discovered:
+        discovered_native: set[str] = set()
+        for sym in discovered:
+            native = _to_mexc_contract(sym)
+            if not native:
+                continue
+            discovered_native.add(str(native).upper())
+        if requested:
+            filtered = [symbol for symbol in requested if symbol in discovered_native]
+            if filtered:
+                return filtered
+            logger.warning(
+                "Requested symbols are unavailable on MEXC; using discovered symbols",
+                extra={"requested": requested},
+            )
+        if discovered_native:
+            return sorted(discovered_native)
 
     if requested:
         logger.warning(
@@ -129,9 +125,9 @@ async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[Symbol]:
 
     logger.warning(
         "MEXC discovery unavailable; using fallback symbols",
-        extra={"fallback": FALLBACK_SYMBOLS},
+        extra={"fallback": FALLBACK_NATIVE_SYMBOLS},
     )
-    return list(FALLBACK_SYMBOLS)
+    return list(FALLBACK_NATIVE_SYMBOLS)
 
 
 def _as_float(value) -> float:
@@ -194,18 +190,21 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
     any worker crashes the entire set of workers is restarted.  This behaviour
     mirrors the Binance/Bybit connectors.
     """
-    subscribe = await _resolve_mexc_symbols(symbols)
-    if not subscribe:
+    subscribe_native = await _resolve_mexc_symbols(symbols)
+    if not subscribe_native:
         logger.warning("No symbols resolved for MEXC connector; skipping startup")
         return
 
     # Build list of (common_symbol, native_symbol) tuples.
     symbol_pairs: list[tuple[str, str]] = []
-    for sym in subscribe:
-        native = _to_mexc_contract(sym)
-        if not native:
+    for native in subscribe_native:
+        ws_symbol = _to_mexc_contract(native)
+        if not ws_symbol:
             continue
-        symbol_pairs.append((sym, native))
+        common = _from_mexc_symbol(ws_symbol)
+        if not common:
+            continue
+        symbol_pairs.append((common, ws_symbol))
 
     if not symbol_pairs:
         logger.warning("MEXC connector resolved symbols but produced no native pairs")
@@ -470,30 +469,10 @@ async def _send_json_with_retry(ws, payload: dict) -> None:
 def _decode_ws_bytes(data: bytes) -> str | None:
     if not data:
         return None
-    for decoder in (_decode_utf8, _decode_gzip, _decode_zlib):
-        try:
-            text = decoder(data)
-        except Exception:
-            continue
-        if text:
-            return text
-    return None
-
-
-def _decode_utf8(data: bytes) -> str:
-    return data.decode("utf-8", errors="strict")
-
-
-def _decode_gzip(data: bytes) -> str:
-    if len(data) < 2 or data[0] != 0x1F or data[1] != 0x8B:
-        raise ValueError("not gzip")
-    return gzip.decompress(data).decode("utf-8")
-
-
-def _decode_zlib(data: bytes) -> str:
-    if len(data) < 2 or data[0] != 0x78:
-        raise ValueError("not zlib")
-    return zlib.decompress(data).decode("utf-8")
+    try:
+        return data.decode("utf-8", errors="strict")
+    except Exception:
+        return None
 
 
 def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
