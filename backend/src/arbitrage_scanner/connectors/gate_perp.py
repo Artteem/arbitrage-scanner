@@ -253,21 +253,48 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     error occurs, at which point all workers are restarted.  This mirrors the
     behaviour of the Binance and Bybit connectors.
     """
-    subscribe_native = await _resolve_gate_symbols(symbols)
-    if not subscribe_native:
-        return
-    # Build list of (common_symbol, native_symbol) tuples.
+    discovery_backoff = WS_RECONNECT_INITIAL
+    subscribe_native: list[str] = []
     symbol_pairs: list[tuple[str, str]] = []
-    for native in subscribe_native:
-        ws_symbol = _to_gate_symbol(native)
-        if not ws_symbol:
-            continue
-        common = _from_gate_symbol(ws_symbol)
-        if not common:
-            continue
-        symbol_pairs.append((common, ws_symbol))
-    if not symbol_pairs:
-        return
+    while not symbol_pairs:
+        try:
+            subscribe_native = await _resolve_gate_symbols(symbols)
+        except Exception:
+            logger.exception("Failed to resolve Gate symbols from discovery")
+            subscribe_native = []
+
+        if not subscribe_native:
+            if FALLBACK_NATIVE_SYMBOLS:
+                logger.warning(
+                    "Gate discovery returned empty symbol list; using fallback with %d entries",
+                    len(FALLBACK_NATIVE_SYMBOLS),
+                )
+                subscribe_native = list(FALLBACK_NATIVE_SYMBOLS)
+            else:
+                logger.warning(
+                    "Gate discovery returned empty symbol list and fallback is empty"
+                )
+
+        symbol_pairs = []
+        for native in subscribe_native:
+            ws_symbol = _to_gate_symbol(native)
+            if not ws_symbol:
+                continue
+            common = _from_gate_symbol(ws_symbol)
+            if not common:
+                continue
+            symbol_pairs.append((common, ws_symbol))
+
+        if symbol_pairs:
+            break
+
+        logger.error(
+            "Gate connector has no valid symbols; retrying discovery in %.1fs",
+            discovery_backoff,
+        )
+        await asyncio.sleep(discovery_backoff)
+        discovery_backoff = min(discovery_backoff * 2, WS_RECONNECT_MAX)
+
     # Split into chunks to avoid overloading a single connection.  This
     # constant does not correspond to the number of topics but rather the
     # number of contracts; each contract results in three subscriptions
@@ -276,8 +303,6 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
         tuple(symbol_pairs[idx : idx + MAX_TOPICS_PER_CONN])
         for idx in range(0, len(symbol_pairs), MAX_TOPICS_PER_CONN)
     ]
-    if not chunks:
-        return
     while True:
         tasks: list[asyncio.Task] = [
             asyncio.create_task(_run_gate_ws(store, chunk)) for chunk in chunks
