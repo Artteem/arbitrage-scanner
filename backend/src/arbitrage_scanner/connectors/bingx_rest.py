@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib.parse import urlparse
+from collections import deque
 
 import httpx
 
@@ -38,6 +39,32 @@ _FUNDING_INTERVAL = "8h"
 
 _CONTRACT_CACHE: Dict[Symbol, ConnectorContract] = {}
 _TAKER_FEES: Dict[Symbol, float] = {}
+
+
+def _extract_payload_list(payload: Any) -> List[dict]:
+    """Return the first list of dicts embedded in a BingX REST response."""
+
+    queue: deque[Any] = deque([payload])
+    seen: set[int] = set()
+    while queue:
+        current = queue.popleft()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, list):
+            items = [item for item in current if isinstance(item, dict)]
+            if items:
+                return items
+        if isinstance(current, dict):
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+    if isinstance(payload, dict):
+        values = [value for value in payload.values() if isinstance(value, dict)]
+        if values:
+            return values
+    return []
 
 
 async def _signed_get(
@@ -102,8 +129,8 @@ async def get_bingx_contracts() -> List[ConnectorContract]:
 
     contracts: List[ConnectorContract] = []
     taker_fees: Dict[Symbol, float] = {}
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    for item in data:
+    data_items = _extract_payload_list(payload)
+    for item in data_items:
         if not isinstance(item, dict):
             continue
         quote = str(item.get("quoteAsset") or item.get("quoteSymbol") or "").upper()
@@ -181,8 +208,8 @@ async def get_bingx_historical_quotes(
         response = await _signed_get(client, _BINGX_KLINE, _PATH_KLINE, params=params)
         response.raise_for_status()
         payload = response.json()
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    for entry in data:
+    data_items = _extract_payload_list(payload)
+    for entry in data_items:
         if not isinstance(entry, dict):
             continue
         try:
@@ -222,8 +249,8 @@ async def get_bingx_funding_history(
         response = await _signed_get(client, _BINGX_FUNDING, _PATH_FUNDING, params=params)
         response.raise_for_status()
         payload = response.json()
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    for entry in data:
+    data_items = _extract_payload_list(payload)
+    for entry in data_items:
         if not isinstance(entry, dict):
             continue
         try:

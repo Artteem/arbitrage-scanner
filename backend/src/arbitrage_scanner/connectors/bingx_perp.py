@@ -22,6 +22,7 @@ import asyncio, json, gzip, io, time, random
 import zlib
 import logging
 import re
+from collections import deque
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import httpx
@@ -36,8 +37,33 @@ from .discovery import discover_bingx_usdt_perp
 
 logger = logging.getLogger(__name__)
 
+
+def _iter_contract_entries(payload: Any) -> Iterable[dict[str, Any]]:
+    """Yield contract dictionaries from nested BingX responses."""
+
+    queue: deque[Any] = deque([payload])
+    seen: set[int] = set()
+    symbol_keys = {"symbol", "contractSymbol", "tradingPair", "instId", "name", "pair"}
+    while queue:
+        current = queue.popleft()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, dict):
+            if any(current.get(key) for key in symbol_keys):
+                yield current
+            for value in current.values():
+                if isinstance(value, (dict, list, tuple, set)):
+                    queue.append(value)
+        elif isinstance(current, (list, tuple, set)):
+            for value in current:
+                if isinstance(value, (dict, list, tuple, set)):
+                    queue.append(value)
+
 # ИСПРАВЛЕНИЕ 1: Использовать ЕДИНСТВЕННЫЙ правильный WS endpoint для Perpetual Swap
 WS_ENDPOINTS = (
+    "wss://open-api-ws.bingx.com/swap-market",
     "wss://open-api-swap.bingx.com/swap-market",
 )
 # The maximum number of contracts per connection.  BingX allows up to 200
@@ -71,7 +97,7 @@ BINGX_HEADERS = {
 _BINGX_WS_SYMBOL_CACHE: dict[str, str] | None = None
 _BINGX_WS_SYMBOL_CACHE_TS = 0.0
 _BINGX_WS_SYMBOL_CACHE_TTL = 15 * 60
-BINGX_CONTRACTS_URL = "https://open-api.bingx.com/openApi/swap/v2/market/getAllContracts"
+BINGX_CONTRACTS_URL = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
 
 
 def _is_bingx_ack(msg: dict) -> bool:
@@ -169,10 +195,7 @@ async def _load_bingx_ws_symbol_map() -> dict[str, str]:
     except Exception:
         raise
     symbol_map: dict[str, str] = {}
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, list):
-        data = []
-    for item in data:
+    for item in _iter_contract_entries(payload):
         if not isinstance(item, dict):
             continue
         raw_symbol = (

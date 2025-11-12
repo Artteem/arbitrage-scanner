@@ -66,13 +66,20 @@ BINANCE_HEADERS = {
 _BINANCE_EXPECTED_MIN = 50
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
 
-# BingX: primary and fallback endpoints
-BINGX_CONTRACTS_PRIMARY = "https://open-api.bingx.com/openApi/swap/v2/market/getAllContracts"
-BINGX_CONTRACTS_QUOTE = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+# BingX: primary and fallback endpoints.  The exchange migrated the public
+# contract listing to ``v3`` in 2024; the ``v2`` URLs now redirect or return
+# empty payloads for some regions.  Keep both the market and quote endpoints as
+# fallbacks in case one of them is temporarily unavailable.
+BINGX_CONTRACTS_PRIMARY = "https://open-api.bingx.com/openApi/swap/v3/market/getAllContracts"
+BINGX_CONTRACTS_QUOTE = "https://open-api.bingx.com/openApi/swap/v3/quote/contracts"
+# Backwards compatibility for older tests/imports.
+BINGX_CONTRACTS = BINGX_CONTRACTS_PRIMARY
 
 # MEXC: primary and fallback endpoints
 MEXC_CONTRACTS_PRIMARY = "https://contract.mexc.com/api/v1/contract/detail"
 MEXC_CONTRACTS_ALTERNATE = "https://contract.mexc.com/api/v1/contract/contractInfos"
+# Newer public endpoint that returns the same payload without authentication.
+MEXC_CONTRACTS_LIST = "https://contract.mexc.com/api/v1/contract/list"
 
 GATE_CONTRACTS = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
 GATE_HEADERS = {
@@ -206,13 +213,52 @@ def _is_perpetual(kind: str) -> bool:
     k = kind.strip().lower()
     return "perpetual" in k or "swap" in k
 
+def _extract_nested_list(payload: Any, keys: Sequence[str]) -> List[Any]:
+    """Return the first list found under any of the provided keys."""
+
+    queue: deque[Any] = deque([payload])
+    seen: set[int] = set()
+    while queue:
+        current = queue.popleft()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, list):
+            return list(current)
+        if not isinstance(current, dict):
+            continue
+        for key in keys:
+            value = current.get(key)
+            if isinstance(value, list):
+                return list(value)
+            if isinstance(value, dict):
+                queue.append(value)
+        for value in current.values():
+            if isinstance(value, (dict, list)):
+                queue.append(value)
+    return []
+
+
 async def _fetch_mexc_contracts(url: str, client: httpx.AsyncClient) -> Set[str]:
     r = await client.get(url)
     r.raise_for_status()
     data = r.json()
     out: Set[str] = set()
-    # Some endpoints return data under "data", others under "result".
-    items = data.get("data") or data.get("result") or []
+    items = _extract_nested_list(
+        data,
+        (
+            "data",
+            "result",
+            "contracts",
+            "symbols",
+            "list",
+            "items",
+            "rows",
+        ),
+    )
+    if not items and isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
+        items = list(data.values())
     for item in items:
         sym = _mexc_symbol_to_common(item.get("symbol") or item.get("symbolName"))
         quote = str(
@@ -239,7 +285,7 @@ async def discover_mexc_usdt_perp() -> Set[str]:
     async with httpx.AsyncClient(**client_params) as client:
         out = set()
         errors: List[Exception] = []
-        for url in (MEXC_CONTRACTS_PRIMARY, MEXC_CONTRACTS_ALTERNATE):
+        for url in (MEXC_CONTRACTS_PRIMARY, MEXC_CONTRACTS_ALTERNATE, MEXC_CONTRACTS_LIST):
             try:
                 out = await _fetch_mexc_contracts(url, client)
             except Exception as exc:

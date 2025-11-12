@@ -37,7 +37,7 @@ from .discovery import discover_mexc_usdt_perp
 
 # MEXC futures WebSocket endpoint (contract API v1).  See
 # https://www.mexc.com/api-docs/futures/websocket-api for reference.
-WS_ENDPOINT = "wss://contract.mexc.com/edge"
+WS_ENDPOINT = "wss://contract.mexc.com/ws"
 
 # Reconnect backoff times.
 WS_RECONNECT_INITIAL = 1.0
