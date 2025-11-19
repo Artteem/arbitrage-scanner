@@ -28,6 +28,7 @@ python -m pip install --upgrade pip
 ## 2.1) Alternative way to install environment
 Install poetry: `python -m pip install poetry`
 Install dependencies: `poetry install`
+Run env: `poetry shell`
 
 ## 3) Install dev tooling
 ```bash
