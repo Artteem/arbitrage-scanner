@@ -4,8 +4,8 @@ __pycache__/
 .mypy_cache/
 
 # Python virtual envs
-.venv/
-venv/
+.venv
+venv
 
 # Node/npm artefacts
 frontend/node_modules/

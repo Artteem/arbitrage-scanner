@@ -25,6 +25,13 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 ```
 
+## 2.1) Alternative way to install environment
+Install poetry: `python -m pip install poetry`
+Install dependencies: `poetry install`
+Run env: `poetry shell`
+Go to `backend/src`
+Run server `uvicorn arbitrage_scanner.app:app --reload --port 8000`
+
 ## 3) Install dev tooling
 ```bash
 pip install -r backend/requirements-dev.txt

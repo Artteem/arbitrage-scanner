@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .base import ConnectorSpec
 from .discovery import discover_mexc_usdt_perp
-from .mexc_perp import run_mexc
+# from .mexc_perp import run_mexc
 from .mexc_rest import (
     get_mexc_contracts,
     get_mexc_funding_history,
@@ -10,10 +10,14 @@ from .mexc_rest import (
     get_mexc_taker_fee,
 )
 
+from .mexc_perp_class import MexcPerpConnector
+
+mexPerpConnector = MexcPerpConnector()
+
 
 connector = ConnectorSpec(
     name="mexc",
-    run=run_mexc,
+    run=mexPerpConnector.run_mexc,
     discover_symbols=discover_mexc_usdt_perp,
 
     taker_fee=0.0006,
