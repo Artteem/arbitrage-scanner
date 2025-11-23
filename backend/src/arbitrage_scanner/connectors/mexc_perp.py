@@ -449,7 +449,7 @@ async def _mexc_ws_connection():
         connect_kwargs.get("origin"),
         list((connect_kwargs.get("additional_headers") or {}).keys()),
     )
-    async with websockets.connect(WS_ENDPOINT, **connect_kwargs) as ws:
+    async with websockets.connect(WS_ENDPOINT) as ws:
         yield ws
 
 
@@ -474,7 +474,6 @@ async def _send_mexc_subscriptions(
 ) -> None:
     """Send subscription requests for ticker, order book and funding rate topics."""
     if not symbols:
-        #print("_send_mexc_subscriptions return 0")
         return
     unique: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -486,11 +485,9 @@ async def _send_mexc_subscriptions(
         seen.add(native)
         unique.append((common, native))
     if not unique:
-        #print("_send_mexc_subscriptions return 1")
         return
     for common, native in unique:
         # Subscribe to per‑contract ticker (best bid/ask, last price).
-        print("print MEXC subscribe ticker -> %s (native=%s)", common, native)
         logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
         ticker_payload = {
             "method": "sub.ticker",
@@ -525,8 +522,6 @@ async def _send_json_with_retry(ws, payload: dict) -> None:
     try:
         await ws.send(json.dumps(payload))
         logger.debug("MEXC WS send -> %s", json.dumps(payload)[:200])
-        result = await ws.recv()
-        print(result)
     except Exception as e:
         logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
         # print("Exception while _send_json_with_retry(): " + str(e))
