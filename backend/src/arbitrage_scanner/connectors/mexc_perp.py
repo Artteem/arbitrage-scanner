@@ -24,11 +24,14 @@ connector will fall back to discovery if fewer than one symbol is provided.
 import asyncio
 import json
 import logging
+import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import websockets
+from websockets.protocol import State
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
@@ -37,7 +40,7 @@ from .discovery import discover_mexc_usdt_perp
 
 # MEXC futures WebSocket endpoint (contract API v1).  See
 # https://www.mexc.com/api-docs/futures/websocket-api for reference.
-WS_ENDPOINT = "wss://contract.mexc.com/ws"
+WS_ENDPOINT = "wss://contract.mexc.com/edge"
 
 # Reconnect backoff times.
 WS_RECONNECT_INITIAL = 1.0
@@ -54,8 +57,8 @@ MAX_TOPICS_PER_CONN = 10
 # subscriptions.
 WS_SUB_DELAY = 0.1
 
-# Interval (in seconds) for sending heartbeat pings.  Websockets does not send
-# its own pings because the server handles the heartbeat.
+# Interval (in seconds) for heartbeat liveness checks.  We don't send client
+# pings because the exchange pushes its own heartbeat messages.
 HEARTBEAT_INTERVAL = 20.0
 
 # If the user supplies fewer than this many symbols the connector will fall
@@ -67,18 +70,42 @@ MIN_SYMBOL_THRESHOLD = 1
 # exchange format (e.g. BTC_USDT).
 FALLBACK_NATIVE_SYMBOLS: tuple[Symbol, ...] = ("BTC_USDT", "ETH_USDT", "SOL_USDT")
 
+MEXC_ORIGIN = "https://futures.mexc.com"
+MEXC_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 MEXC_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Origin": "https://www.mexc.com",
-    "Referer": "https://www.mexc.com/",
+    "Referer": "https://futures.mexc.com/exchange/USDT",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_logger_configured() -> None:
+    """Attach a stdout handler so DEBUG logs are always visible (even after reconfig)."""
+    global logger
+    existing = [
+        h for h in logger.handlers if getattr(h, "_mexc_stdout_handler", False)
+    ]
+    if not existing:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s")
+        )
+        handler._mexc_stdout_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+
+_ensure_logger_configured()
 
 
 async def _resolve_mexc_symbols(symbols: Sequence[Symbol]) -> list[str]:
@@ -201,6 +228,9 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
     any worker crashes the entire set of workers is restarted.  This behaviour
     mirrors the Binance/Bybit connectors.
     """
+
+    _ensure_logger_configured()
+    #print("Running MEXC")
     subscribe_native = await _resolve_mexc_symbols(symbols)
     if not subscribe_native:
         logger.warning("No symbols resolved for MEXC connector; skipping startup")
@@ -231,7 +261,7 @@ async def run_mexc(store: TickerStore, symbols: Sequence[Symbol]):
 
     if not chunks:
         return
-
+ 
     while True:
         tasks = [asyncio.create_task(_run_mexc_ws(store, chunk)) for chunk in chunks]
         try:
@@ -254,13 +284,16 @@ async def _run_mexc_ws(
 ) -> None:
     """Run a single WebSocket connection for a batch of contracts."""
     wanted_exchange = [native for _, native in symbol_pairs]
+
     if not wanted_exchange:
         return
     wanted_common = {common for common, _ in symbol_pairs if common}
+    
     if not wanted_common:
         return
     books: Dict[str, _MexcOrderBookState] = {}
     async for ws in _reconnect_ws():
+        #print("connectd")
         heartbeat: asyncio.Task | None = None
         try:
             await _send_mexc_subscriptions(ws, symbol_pairs)
@@ -395,29 +428,43 @@ async def _run_mexc_ws(
                 await asyncio.gather(heartbeat, return_exceptions=True)
 
 
+def _mexc_connect_kwargs() -> dict[str, Any]:
+    return {
+        "ping_interval": None,
+        "ping_timeout": None,
+        "close_timeout": 5,
+        "compression": "deflate",
+        "origin": MEXC_ORIGIN,
+        "user_agent_header": MEXC_USER_AGENT,
+        "additional_headers": MEXC_HEADERS,
+    }
+
+
+@asynccontextmanager
+async def _mexc_ws_connection():
+    """Open a websocket connection with the required MEXC headers."""
+    connect_kwargs = _mexc_connect_kwargs()
+    logger.debug(
+        "MEXC WS connect origin=%s headers=%s",
+        connect_kwargs.get("origin"),
+        list((connect_kwargs.get("additional_headers") or {}).keys()),
+    )
+    async with websockets.connect(WS_ENDPOINT, **connect_kwargs) as ws:
+        yield ws
+
+
 async def _reconnect_ws():
     """Yield a connected WebSocket client, reconnecting with exponential backoff."""
     delay = WS_RECONNECT_INITIAL
     while True:
         try:
-            async with websockets.connect(
-                WS_ENDPOINT,
-                ping_interval=None,
-                ping_timeout=None,
-                close_timeout=5,
-                extra_headers=MEXC_HEADERS,
-                # Keep deflate compression enabled for legacy support.  Messages
-                # should arrive uncompressed due to ``gzip": false`` in our
-                # subscription requests, but the server may still use RFC 7692
-                # per‑frame compression (deflate) which the websockets library
-                # can handle automatically.
-                compression="deflate",
-            ) as ws:
+            async with _mexc_ws_connection() as ws:
                 delay = WS_RECONNECT_INITIAL
                 yield ws
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as e:
             raise
-        except Exception:
+        except Exception as e :
+            logger.exception("MEXC websocket connect failed: %s", e)
             await asyncio.sleep(delay)
             delay = min(delay * 2, WS_RECONNECT_MAX)
 
@@ -427,6 +474,7 @@ async def _send_mexc_subscriptions(
 ) -> None:
     """Send subscription requests for ticker, order book and funding rate topics."""
     if not symbols:
+        #print("_send_mexc_subscriptions return 0")
         return
     unique: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -438,9 +486,11 @@ async def _send_mexc_subscriptions(
         seen.add(native)
         unique.append((common, native))
     if not unique:
+        #print("_send_mexc_subscriptions return 1")
         return
     for common, native in unique:
         # Subscribe to per‑contract ticker (best bid/ask, last price).
+        print("print MEXC subscribe ticker -> %s (native=%s)", common, native)
         logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
         ticker_payload = {
             "method": "sub.ticker",
@@ -450,6 +500,7 @@ async def _send_mexc_subscriptions(
         await _send_json_with_retry(ws, ticker_payload)
         await asyncio.sleep(WS_SUB_DELAY)
         # Subscribe to full order book depth (step0) for the symbol.
+        # print("MEXC subscribe depth -> %s", native)
         logger.debug("MEXC subscribe depth -> %s", native)
         depth_payload = {
             "method": "sub.depth",
@@ -459,6 +510,7 @@ async def _send_mexc_subscriptions(
         await _send_json_with_retry(ws, depth_payload)
         await asyncio.sleep(WS_SUB_DELAY)
         # Subscribe to funding rate updates.
+        # print("MEXC subscribe funding -> %s", native)
         logger.debug("MEXC subscribe funding -> %s", native)
         funding_payload = {
             "method": "sub.funding.rate",
@@ -473,8 +525,11 @@ async def _send_json_with_retry(ws, payload: dict) -> None:
     try:
         await ws.send(json.dumps(payload))
         logger.debug("MEXC WS send -> %s", json.dumps(payload)[:200])
-    except Exception:
+        result = await ws.recv()
+        print(result)
+    except Exception as e:
         logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
+        # print("Exception while _send_json_with_retry(): " + str(e))
 
 
 def _decode_ws_bytes(data: bytes) -> str | None:
@@ -490,17 +545,9 @@ def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
     if isinstance(message, (bytes, bytearray)):
-        logger.debug(
-            "%s WS RX raw frame (%d bytes)",
-            exchange.upper(),
-            len(message),
-        )
+        print(f"{ exchange.upper()} WS RX raw frame ({len(message)} bytes)")
         return
-    logger.debug(
-        "%s WS RX raw frame: %s",
-        exchange.upper(),
-        str(message)[:512],
-    )
+    print(f"{exchange.upper()} WS RX raw frame: {str(message)[:512]}")
 
 
 def _is_mexc_ack(message: dict) -> bool:
@@ -526,13 +573,9 @@ async def _ws_heartbeat(ws, *, interval: float, name: str) -> None:
     try:
         while True:
             await asyncio.sleep(interval)
-            if ws.closed:
+            state = getattr(ws, "state", None)
+            if state in (State.CLOSING, State.CLOSED):
                 raise ConnectionError(f"{name} websocket closed during heartbeat")
-            try:
-                pong = await ws.ping()
-                await asyncio.wait_for(pong, timeout=interval)
-            except asyncio.TimeoutError as exc:
-                raise ConnectionError(f"{name} websocket heartbeat timeout") from exc
     except asyncio.CancelledError:
         raise
     except Exception:
