@@ -545,9 +545,9 @@ def _log_ws_raw_frame(exchange: str, message: str | bytes | bytearray) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
     if isinstance(message, (bytes, bytearray)):
-        print(f"{ exchange.upper()} WS RX raw frame ({len(message)} bytes)")
+        #print(f"{ exchange.upper()} WS RX raw frame ({len(message)} bytes)")
         return
-    print(f"{exchange.upper()} WS RX raw frame: {str(message)[:512]}")
+    #print(f"{exchange.upper()} WS RX raw frame: {str(message)[:512]}")
 
 
 def _is_mexc_ack(message: dict) -> bool:
