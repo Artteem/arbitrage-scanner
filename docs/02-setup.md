@@ -29,6 +29,8 @@ python -m pip install --upgrade pip
 Install poetry: `python -m pip install poetry`
 Install dependencies: `poetry install`
 Run env: `poetry shell`
+Go to `backend/src`
+Run server `uvicorn arbitrage_scanner.app:app --reload --port 8000`
 
 ## 3) Install dev tooling
 ```bash
