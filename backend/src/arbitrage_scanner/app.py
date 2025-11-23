@@ -46,7 +46,7 @@ from .exchanges.limits import fetch_limits as fetch_exchange_limits
 from .exchanges.history import fetch_spread_history
 
 # Explicit imports of connector modules force loggers to be configured early.
-from .connectors.mexc_perp import run_mexc  # noqa: F401
+# from .connectors.mexc_perp import run_mexc  # noqa: F401
 from .connectors.gate_perp import run_gate  # noqa: F401
 from .connectors.bingx_perp import run_bingx  # noqa: F401
 

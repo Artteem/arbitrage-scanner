@@ -487,34 +487,11 @@ async def _send_mexc_subscriptions(
     if not unique:
         return
     for common, native in unique:
-        # Subscribe to per‑contract ticker (best bid/ask, last price).
-        logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
-        ticker_payload = {
-            "method": "sub.ticker",
-            "param": {"symbol": native},
-            "gzip": False,
-        }
-        await _send_json_with_retry(ws, ticker_payload)
+        await _subscribe_ticker(ws, common, native)
         await asyncio.sleep(WS_SUB_DELAY)
-        # Subscribe to full order book depth (step0) for the symbol.
-        # print("MEXC subscribe depth -> %s", native)
-        logger.debug("MEXC subscribe depth -> %s", native)
-        depth_payload = {
-            "method": "sub.depth",
-            "param": {"symbol": native},
-            "gzip": False,
-        }
-        await _send_json_with_retry(ws, depth_payload)
+        await _subscribe_depth(ws, native)
         await asyncio.sleep(WS_SUB_DELAY)
-        # Subscribe to funding rate updates.
-        # print("MEXC subscribe funding -> %s", native)
-        logger.debug("MEXC subscribe funding -> %s", native)
-        funding_payload = {
-            "method": "sub.funding.rate",
-            "param": {"symbol": native},
-            "gzip": False,
-        }
-        await _send_json_with_retry(ws, funding_payload)
+        await _subscribe_funding(ws, native)
         await asyncio.sleep(WS_SUB_DELAY)
 
 
@@ -525,6 +502,36 @@ async def _send_json_with_retry(ws, payload: dict) -> None:
     except Exception as e:
         logger.exception("Failed to send MEXC subscription", extra={"payload": payload})
         # print("Exception while _send_json_with_retry(): " + str(e))
+
+
+async def _subscribe_ticker(ws, common: str, native: str) -> None:
+    logger.debug("MEXC subscribe ticker -> %s (native=%s)", common, native)
+    payload = {
+        "method": "sub.ticker",
+        "param": {"symbol": native},
+        "gzip": False,
+    }
+    await _send_json_with_retry(ws, payload)
+
+
+async def _subscribe_depth(ws, native: str) -> None:
+    logger.debug("MEXC subscribe depth -> %s", native)
+    payload = {
+        "method": "sub.depth",
+        "param": {"symbol": native},
+        "gzip": False,
+    }
+    await _send_json_with_retry(ws, payload)
+
+
+async def _subscribe_funding(ws, native: str) -> None:
+    logger.debug("MEXC subscribe funding -> %s", native)
+    payload = {
+        "method": "sub.funding.rate",
+        "param": {"symbol": native},
+        "gzip": False,
+    }
+    await _send_json_with_retry(ws, payload)
 
 
 def _decode_ws_bytes(data: bytes) -> str | None:

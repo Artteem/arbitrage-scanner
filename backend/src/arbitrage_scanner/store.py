@@ -186,6 +186,25 @@ class TickerStore:
                 ts=ts_value,
             )
 
+    def set_last_price(
+        self,
+        exchange: ExchangeName,
+        symbol: Symbol,
+        last_price: float,
+        ts: float | None = None,
+    ) -> None:
+        """
+        Update only the last price for a symbol (with timestamp) without altering book sides.
+        """
+        if ts is None:
+            ts = time.time()
+        self.upsert_order_book(
+            exchange,
+            symbol,
+            last_price=last_price,
+            last_price_ts=ts,
+        )
+
     def stats(self) -> dict:
         return {
             "ticker_updates": self._ticker_updates,
