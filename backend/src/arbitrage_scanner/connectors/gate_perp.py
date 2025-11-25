@@ -1,153 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import time
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Set
 
-import gate_api
+import websockets
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from ..domain import Symbol, Ticker
+from ..domain import Symbol
 from ..store import TickerStore
-from .credentials import get_credentials_provider
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 1.5  # seconds between REST polls
-ORDER_BOOK_DEPTH = 50
+# Gate USDT-settled perpetuals WebSocket endpoint
+WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+
+# Как часто слать application-level ping (сек)
+HEARTBEAT_INTERVAL = 20.0
 
 
-async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+def _symbol_to_contract(symbol: Symbol) -> str:
     """
-    Simple Gate.io USDT‑perp connector using the official gateapi-python package.
-    Polls tickers and order books over REST and upserts into the shared store.
+    Конвертируем внутренний символ (например, BTCUSDT) в контракт Gate (BTC_USDT).
     """
-    api = _create_api_client()
-    contracts = await _resolve_contracts(api, symbols)
-    if not contracts:
-        logger.warning("Gate connector: no USDT perpetual contracts resolved")
-        return
-
-    logger.info("Gate connector starting", extra={"contracts": contracts})
-    while True:
-        start = time.time()
-        for contract in contracts:
-            await _process_contract(api, store, contract)
-        elapsed = time.time() - start
-        await asyncio.sleep(max(POLL_INTERVAL - elapsed, 0.0))
+    code = str(symbol).upper()
+    if code.endswith("USDT"):
+        base = code[:-4]
+        return f"{base}_USDT"
+    # Fallback – если случайно уже пришло BTC_USDT
+    if "_" in code:
+        return code
+    return code
 
 
-def _create_api_client() -> gate_api.FuturesApi:
-    cfg = gate_api.Configuration(host="https://api.gateio.ws/api/v4")
-    provider = get_credentials_provider()
-    creds = provider.get("gate") if provider else None
-    if creds:
-        cfg.key = creds.api_key
-        cfg.secret = creds.api_secret
-    client = gate_api.ApiClient(cfg)
-    return gate_api.FuturesApi(client)
-
-
-async def _resolve_contracts(api: gate_api.FuturesApi, symbols: Sequence[Symbol]) -> list[str]:
-    all_contracts = await asyncio.to_thread(api.list_futures_contracts, "usdt")
-    available = {
-        c.name: c for c in all_contracts if getattr(c, "quanto_multiplier", None) is not None
-    }
-    if symbols:
-        desired = {_to_native(sym) for sym in symbols if sym}
-        resolved = [sym for sym in desired if sym in available]
-    else:
-        resolved = list(available.keys())
-    resolved.sort()
-    return resolved
-
-
-async def _process_contract(api: gate_api.FuturesApi, store: TickerStore, contract: str) -> None:
-    ticker = await _fetch_ticker(api, contract)
-    if ticker:
-        _upsert_ticker(store, ticker)
-    book = await _fetch_order_book(api, contract)
-    if book:
-        _upsert_order_book(store, contract, book)
-
-
-async def _fetch_ticker(api: gate_api.FuturesApi, contract: str):
-    try:
-        tickers = await asyncio.to_thread(api.list_futures_tickers, "usdt", contract=contract)
-        return tickers[0] if tickers else None
-    except Exception as exc:
-        logger.debug("Gate ticker fetch failed", exc_info=exc, extra={"contract": contract})
-        return None
-
-
-async def _fetch_order_book(api: gate_api.FuturesApi, contract: str):
-    try:
-        return await asyncio.to_thread(
-            api.list_futures_order_book,
-            "usdt",
-            contract=contract,
-            limit=ORDER_BOOK_DEPTH,
-        )
-    except Exception as exc:
-        logger.debug("Gate order book fetch failed", exc_info=exc, extra={"contract": contract})
-        return None
-
-
-def _upsert_ticker(store: TickerStore, ticker) -> None:
-    bid = _as_float(getattr(ticker, "highest_bid", None))
-    ask = _as_float(getattr(ticker, "lowest_ask", None))
-    if bid <= 0 or ask <= 0:
-        return
-    ts = _timestamp(getattr(ticker, "time", None) or getattr(ticker, "t", None))
-    symbol = Symbol(str(getattr(ticker, "contract", "")).replace("_", ""))
-
-    store.upsert_ticker(Ticker(exchange="gate", symbol=symbol, bid=bid, ask=ask, ts=ts))
-    rate = _maybe_float(getattr(ticker, "funding_rate", None))
-    if rate is not None:
-        store.upsert_funding("gate", symbol, rate=rate, interval="8h", ts=ts)
-
-    last_price = _maybe_float(getattr(ticker, "last", None))
-    if last_price:
-        store.set_last_price("gate", symbol, last_price=last_price, ts=ts)
-
-def _upsert_order_book(store: TickerStore, contract: str, book) -> None:
-    bids = _parse_levels(getattr(book, "bids", None))
-    asks = _parse_levels(getattr(book, "asks", None))
-    if not bids and not asks:
-        return
-    ts = _timestamp(getattr(book, "t", None))
-    symbol = Symbol(str(contract).replace("_", ""))
-    store.upsert_order_book("gate", symbol, bids=bids or None, asks=asks or None, ts=ts)
-
-
-def _parse_levels(levels: Iterable) -> List[Tuple[float, float]]:
-    parsed: List[Tuple[float, float]] = []
-    if not levels:
-        return parsed
-    for entry in levels:
-        try:
-            price = float(entry.p)
-            size = float(entry.s)
-            if price > 0 and size > 0:
-                parsed.append((price, size))
-        except Exception as e:
-            continue
-    return parsed
-
-
-def _to_native(symbol: Symbol) -> str:
-    sym = str(symbol).strip().upper().replace("-", "_")
-    if "_" not in sym and sym.endswith("USDT"):
-        sym = f"{sym[:-4]}_USDT"
-    return sym
-
-
-def _timestamp(raw) -> float:
-    try:
-        val = float(raw)
-        return val / 1000.0 if val > 1e12 else val
-    except Exception:
-        return time.time()
+def _contract_to_symbol(contract: str) -> Symbol:
+    """
+    Обратное преобразование: BTC_USDT -> BTCUSDT.
+    """
+    return Symbol(contract.replace("_", ""))
 
 
 def _as_float(val) -> float:
@@ -158,8 +51,165 @@ def _as_float(val) -> float:
         return 0.0
 
 
-def _maybe_float(val):
-    try:
-        return float(val)
-    except Exception:
-        return None
+async def _send_heartbeat(ws) -> None:
+    """
+    Application-layer ping. Протокольные ping/pong WebSocket’а
+    библиотека websockets обрабатывает сама, но Gate ещё понимает futures.ping.
+    """
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        try:
+            msg = {
+                "time": int(time.time()),
+                "channel": "futures.ping",
+            }
+            await ws.send(json.dumps(msg))
+        except Exception:
+            # Вылетаем наверх — внешний цикл переподключится
+            logger.warning("Gate WS heartbeat failed, closing connection")
+            raise
+
+
+async def _consume_book_ticker(
+    store: TickerStore,
+    ws,
+    contracts: Set[str],
+) -> None:
+    """
+    Читаем сообщения канала futures.book_ticker и обновляем стаканы в TickerStore.
+    """
+    while True:
+        raw = await ws.recv()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            logger.debug("Gate WS: failed to decode JSON: %s", raw)
+            continue
+
+        if data.get("channel") != "futures.book_ticker":
+            # Может прилетать pong, ошибки и т.п. – игнорируем
+            continue
+        if data.get("event") != "update":
+            continue
+
+        result = data.get("result") or {}
+        contract = result.get("s")
+        if not contract or contract not in contracts:
+            continue
+
+        symbol = _contract_to_symbol(contract)
+
+        bid = _as_float(result.get("b"))
+        ask = _as_float(result.get("a"))
+        bid_size = _as_float(result.get("B"))
+        ask_size = _as_float(result.get("A"))
+
+        ts_ms = result.get("t") or data.get("time_ms") or int(time.time() * 1000)
+        ts = float(ts_ms) / 1000.0
+
+        bids: List[Tuple[float, float]] = []
+        asks: List[Tuple[float, float]] = []
+
+        if bid > 0:
+            bids.append((bid, bid_size))
+        if ask > 0:
+            asks.append((ask, ask_size))
+
+        # Обновляем стакан
+        try:
+            store.upsert_order_book("gate", symbol, bids, asks, ts)
+        except Exception:
+            logger.exception("Gate WS: failed to upsert order book for %s", symbol)
+
+        # Для спредов одновременно обновим last_price по mid
+        mid = 0.0
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+        elif bid > 0:
+            mid = bid
+        elif ask > 0:
+            mid = ask
+
+        if mid > 0:
+            try:
+                store.set_last_price("gate", symbol, mid, ts)
+            except Exception:
+                logger.exception("Gate WS: failed to set last price for %s", symbol)
+
+
+async def _ws_loop(store: TickerStore, contracts: Set[str]) -> None:
+    """
+    Основной цикл: подключаемся к WS, подписываемся и читаем обновления.
+    При обрыве соединения — переподключаемся с экспоненциальным backoff.
+    """
+    if not contracts:
+        logger.warning("Gate WS: no contracts to subscribe")
+        return
+
+    backoff = 3.0
+
+    while True:
+        try:
+            logger.info(
+                "Connecting to Gate WS (%s), %d contracts",
+                WS_URL,
+                len(contracts),
+            )
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                # Подписка на best bid/ask
+                sub = {
+                    "time": int(time.time()),
+                    "channel": "futures.book_ticker",
+                    "event": "subscribe",
+                    "payload": sorted(contracts),
+                }
+                await ws.send(json.dumps(sub))
+                logger.info(
+                    "Gate WS subscribed to futures.book_ticker: %s",
+                    ", ".join(sorted(contracts)),
+                )
+
+                # Запускаем heartbeat параллельно с чтением
+                heartbeat_task = asyncio.create_task(_send_heartbeat(ws))
+                try:
+                    await _consume_book_ticker(store, ws, contracts)
+                finally:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await heartbeat_task
+
+        except (ConnectionClosedError, ConnectionClosedOK) as exc:
+            logger.warning("Gate WS connection closed: %s", exc)
+        except Exception:
+            logger.exception("Gate WS: unexpected error, will reconnect")
+
+        logger.info("Gate WS: reconnecting in %.1f seconds", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60.0)
+
+
+async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
+    """
+    Точка входа коннектора Gate, используется в ConnectorSpec.run.
+
+    * Преобразует список Symbol в список Gate-контрактов (BTC_USDT и т.п.).
+    * Запускает бесконечный цикл WebSocket-подключения.
+    """
+    if not symbols:
+        logger.warning(
+            "run_gate: empty symbol list – nothing to subscribe on Gate",
+        )
+        return
+
+    contracts: Set[str] = {_symbol_to_contract(sym) for sym in symbols}
+    contracts = {c for c in contracts if c}  # на всякий случай
+
+    if not contracts:
+        logger.warning("run_gate: no Gate contracts resolved from symbols")
+        return
+
+    await _ws_loop(store, contracts)
