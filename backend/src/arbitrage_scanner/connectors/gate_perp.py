@@ -24,6 +24,7 @@ SUB_DEPTH = 50
 SUB_INTERVAL = "0"
 
 
+
 def _symbol_to_contract(symbol: Symbol) -> str:
     """
     Convert internal symbol representation (e.g. BTCUSDT) to Gate contract form (e.g. BTC_USDT).
@@ -189,11 +190,13 @@ async def _consume_messages(
                 "Gate WS: subscribed futures.order_book payload=%s", data.get("result")
             )
             continue
+
         if event == "error":
             logger.error("Gate WS: subscription error %s", data)
             continue
         if event != "update":
             continue
+
 
         ts = _now_ts(data.get("time") or data.get("time_ms"))
         for item in _extract_order_books(data.get("result")):
@@ -223,8 +226,10 @@ async def _consume_messages(
                     bids=top_bids or None,
                     asks=top_asks or None,
                     ts=book.ts or ts,
+
                     last_price=last_price or None,
                     last_price_ts=book.ts or ts,
+
                 )
             except Exception:
                 logger.exception("Gate WS: failed to upsert order book for %s", symbol)
@@ -264,7 +269,7 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             )
             async with websockets.connect(
                 WS_URL, ping_interval=20, ping_timeout=20
-            ) as ws:
+
                 payloads = [
                     {
                         "time": int(time.time()),
@@ -276,6 +281,7 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                 ]
                 for msg in payloads:
                     await ws.send(json.dumps(msg))
+
 
                 heartbeat_task = asyncio.create_task(_send_heartbeat(ws))
                 consume_task = asyncio.create_task(
