@@ -4,10 +4,10 @@ import asyncio
 import json
 import logging
 import time
-from typing import Sequence, Set, Tuple, List
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import websockets
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from ..domain import Symbol, Ticker
 from ..store import TickerStore
@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # Websocket endpoint for Gate USDT-margined perpetual futures.
 WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 HEARTBEAT_INTERVAL = 20.0  # seconds
+WS_RECONNECT_INITIAL = 1.0
+WS_RECONNECT_MAX = 60.0
+MIN_SYMBOL_THRESHOLD = 5
 
 
 def _symbol_to_contract(symbol: Symbol) -> str:
@@ -34,13 +37,11 @@ def _contract_to_symbol(contract: str) -> Symbol:
     """
     Convert Gate contract (e.g. BTC_USDT) back to internal symbol (e.g. BTCUSDT).
     """
-    return Symbol(contract.replace("_", ""))
+    return Symbol(contract.replace("_", "").upper())
 
 
 def _safe_float(value) -> float | None:
-    """
-    Try to convert a value to float. Returns None for invalid values.
-    """
+    """Try to convert a value to float. Returns None for invalid values."""
     try:
         if value is None:
             return None
@@ -50,6 +51,61 @@ def _safe_float(value) -> float | None:
         return f
     except Exception:
         return None
+
+
+def _now_ts(raw: float | int | None = None) -> float:
+    if raw is None:
+        return time.time()
+    try:
+        ts_val = float(raw)
+    except (TypeError, ValueError):
+        return time.time()
+    if ts_val > 1_000_000_000_000:
+        ts_val /= 1000.0
+    return ts_val if ts_val > 0 else time.time()
+
+
+def _iter_levels(levels: Iterable[Iterable]) -> Iterable[tuple[float, float]]:
+    for entry in levels:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        price = _safe_float(entry[0])
+        size = _safe_float(entry[1])
+        if price and price > 0 and size and size > 0:
+            yield price, size
+
+
+@dataclass
+class _OrderBookState:
+    bids: Dict[float, float] = field(default_factory=dict)
+    asks: Dict[float, float] = field(default_factory=dict)
+    ts: float = 0.0
+
+    def snapshot(self, bids, asks, ts: float) -> None:
+        self.bids.clear()
+        self.asks.clear()
+        self._apply(self.bids, bids)
+        self._apply(self.asks, asks)
+        self.ts = ts
+
+    def update(self, bids, asks, ts: float) -> None:
+        self._apply(self.bids, bids)
+        self._apply(self.asks, asks)
+        self.ts = ts
+
+    def top_levels(
+        self, depth: int = 5
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        best_bids = sorted(self.bids.items(), key=lambda kv: kv[0], reverse=True)[:depth]
+        best_asks = sorted(self.asks.items(), key=lambda kv: kv[0])[:depth]
+        return best_bids, best_asks
+
+    def _apply(self, side: Dict[float, float], updates) -> None:
+        for price, size in _iter_levels(updates or []):
+            if size <= 0:
+                side.pop(price, None)
+            else:
+                side[price] = size
 
 
 async def _send_heartbeat(ws) -> None:
@@ -67,9 +123,43 @@ async def _send_heartbeat(ws) -> None:
             }
             await ws.send(json.dumps(msg))
         except Exception:
-            # Propagate the exception so the caller can reconnect
             logger.warning("Gate WS heartbeat failed, closing connection")
             raise
+
+
+def _extract_order_books(result) -> Iterable[dict]:
+    if isinstance(result, dict):
+        if {"bids", "asks"} & set(result.keys()):
+            yield result
+        return
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                yield item
+
+
+async def _resolve_contracts(symbols: Sequence[Symbol]) -> List[str]:
+    unique: List[Symbol] = []
+    seen: set[str] = set()
+    for sym in symbols:
+        if not sym:
+            continue
+        normalized = str(sym).strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(Symbol(normalized))
+
+    if len(unique) < MIN_SYMBOL_THRESHOLD:
+        try:
+            from .discovery import discover_gate_usdt_perp
+
+            discovered = await discover_gate_usdt_perp()
+        except Exception:
+            discovered = set()
+        if discovered:
+            unique = sorted({Symbol(sym) for sym in discovered})
+    return [_symbol_to_contract(sym) for sym in unique if sym]
 
 
 async def _consume_messages(
@@ -79,6 +169,7 @@ async def _consume_messages(
     Consume order book messages from the websocket and update the ticker and order book
     in the shared TickerStore. Only messages for contracts in the provided set are processed.
     """
+    books: Dict[str, _OrderBookState] = {}
     while True:
         raw = await ws.recv()
         try:
@@ -90,105 +181,59 @@ async def _consume_messages(
         channel = data.get("channel")
         event = data.get("event")
         if channel != "futures.order_book":
-            # Ignore all other channels (e.g. subscription acks or ticker updates).
             continue
         if event == "subscribe":
-            # Subscription acknowledgement; nothing further to do here.
             logger.info(
                 "Gate WS: subscribed to futures.order_book: %s", data.get("result")
             )
             continue
         if event != "update":
-            # Only handle update events.
             continue
 
-        result = data.get("result")
-        if not result:
-            continue
-
-        # Gate may send a dict or a list of dicts for result; normalise to a list.
-        items: List[dict] = []
-        if isinstance(result, dict):
-            items = [result]
-        elif isinstance(result, list):
-            items = [x for x in result if isinstance(x, dict)]
-        else:
-            continue
-
-        ts_raw = data.get("time") or data.get("time_ms") or 0
-        # Convert ms to seconds if necessary.
-        if isinstance(ts_raw, (int, float)) and ts_raw > 1_000_000_000_000:
-            ts = ts_raw / 1000.0
-        else:
-            ts = float(ts_raw) if ts_raw else time.time()
-
-        for item in items:
+        ts = _now_ts(data.get("time") or data.get("time_ms"))
+        for item in _extract_order_books(data.get("result")):
             contract = str(item.get("s") or item.get("contract") or "")
             if not contract or contract not in contracts:
                 continue
             symbol = _contract_to_symbol(contract)
+            book = books.setdefault(contract, _OrderBookState())
 
-            # Extract bids and asks; Gate may use "bids"/"asks" or "b"/"a".
-            raw_bids = item.get("bids") or item.get("b") or []
-            raw_asks = item.get("asks") or item.get("a") or []
-            bids: List[Tuple[float, float]] = []
-            asks: List[Tuple[float, float]] = []
+            bids = item.get("bids") or item.get("b")
+            asks = item.get("asks") or item.get("a")
 
-            # Parse bids: entries are [price, size]; best bid has highest price.
-            for entry in raw_bids:
-                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                    continue
-                price = _safe_float(entry[0])
-                size = _safe_float(entry[1])
-                if price is None or size is None:
-                    continue
-                if price <= 0 or size <= 0:
-                    continue
-                bids.append((price, size))
-            if bids:
-                bids.sort(key=lambda x: -x[0])
+            if str(data.get("type") or "").lower() == "snapshot":
+                book.snapshot(bids, asks, ts)
+            else:
+                book.update(bids, asks, ts)
 
-            # Parse asks: entries are [price, size]; best ask has lowest price.
-            for entry in raw_asks:
-                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                    continue
-                price = _safe_float(entry[0])
-                size = _safe_float(entry[1])
-                if price is None or size is None:
-                    continue
-                if price <= 0 or size <= 0:
-                    continue
-                asks.append((price, size))
-            if asks:
-                asks.sort(key=lambda x: x[0])
-
-            # Require both sides to update the ticker; otherwise skip.
-            if not bids or not asks:
+            top_bids, top_asks = book.top_levels()
+            if not top_bids and not top_asks:
                 continue
 
-            best_bid = bids[0][0]
-            best_ask = asks[0][0]
-
-            # Update the top-of-book ticker.
-            try:
-                ticker = Ticker(
-                    exchange="gate", symbol=symbol, bid=best_bid, ask=best_ask, ts=ts
-                )
-                store.upsert_ticker(ticker)
-            except Exception:
-                logger.exception("Gate WS: failed to upsert ticker for %s", symbol)
-
-            # Update the order book (limit to 5 levels on each side).
             try:
                 store.upsert_order_book(
                     "gate",
                     symbol,
-                    bids=bids[:5] or None,
-                    asks=asks[:5] or None,
-                    ts=ts,
+                    bids=top_bids or None,
+                    asks=top_asks or None,
+                    ts=book.ts or ts,
+                    last_price=_safe_float(item.get("last")) or None,
                 )
             except Exception:
                 logger.exception("Gate WS: failed to upsert order book for %s", symbol)
+
+            if top_bids and top_asks:
+                try:
+                    ticker = Ticker(
+                        exchange="gate",
+                        symbol=symbol,
+                        bid=top_bids[0][0],
+                        ask=top_asks[0][0],
+                        ts=book.ts or ts,
+                    )
+                    store.upsert_ticker(ticker)
+                except Exception:
+                    logger.exception("Gate WS: failed to upsert ticker for %s", symbol)
 
 
 async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
@@ -199,24 +244,12 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
     list of symbols to Gate contract names and subscribes to depth updates via the
     futures.order_book channel. The function returns only if there are no symbols to subscribe to.
     """
-    # Resolve the list of contracts we need to subscribe to.
-    contracts: Set[str] = set()
-    for s in symbols:
-        try:
-            c = _symbol_to_contract(s)
-            if c:
-                contracts.add(c)
-        except Exception:
-            # Skip invalid symbols gracefully.
-            continue
-
-    # Log the start of the run for troubleshooting.
-    print("Gate WS: run_gate STARTED, symbols =", sorted(list(contracts)), flush=True)
+    contracts = await _resolve_contracts(symbols)
     if not contracts:
         logger.warning("Gate WS: no contracts to subscribe")
         return
 
-    backoff = 3.0
+    backoff = WS_RECONNECT_INITIAL
     while True:
         try:
             logger.info(
@@ -225,7 +258,6 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             async with websockets.connect(
                 WS_URL, ping_interval=20, ping_timeout=20
             ) as ws:
-                # Subscribe to order book updates for all contracts.
                 sub = {
                     "time": int(time.time()),
                     "channel": "futures.order_book",
@@ -234,32 +266,25 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
                 }
                 await ws.send(json.dumps(sub))
 
-                # Start heartbeat and consumer tasks concurrently.
                 heartbeat_task = asyncio.create_task(_send_heartbeat(ws))
                 consume_task = asyncio.create_task(
-                    _consume_messages(store, ws, contracts)
+                    _consume_messages(store, ws, set(contracts))
                 )
-                # Wait until one of the tasks raises an exception.
                 done, pending = await asyncio.wait(
                     {heartbeat_task, consume_task},
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
-                # Cancel the other task if one fails.
                 for task in pending:
                     task.cancel()
-                # Propagate exceptions.
                 for task in done:
                     if task.exception():
                         raise task.exception()
 
-            # If we exit the context manager normally, reset backoff.
-            backoff = 3.0
+            backoff = WS_RECONNECT_INITIAL
         except asyncio.CancelledError:
-            # Propagate cancellations to allow graceful shutdown.
             raise
         except Exception:
             logger.exception("Gate WS: unexpected error, will reconnect")
             logger.info("Gate WS: reconnecting in %.1f seconds", backoff)
-            # Sleep for backoff seconds before reconnecting.
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.5, 60.0)
+            backoff = min(backoff * 2, WS_RECONNECT_MAX)
