@@ -20,9 +20,6 @@ HEARTBEAT_INTERVAL = 20.0  # seconds
 WS_RECONNECT_INITIAL = 1.0
 WS_RECONNECT_MAX = 60.0
 MIN_SYMBOL_THRESHOLD = 5
-SUB_DEPTH = 50
-SUB_INTERVAL = "0"
-
 
 
 def _symbol_to_contract(symbol: Symbol) -> str:
@@ -187,16 +184,11 @@ async def _consume_messages(
             continue
         if event == "subscribe":
             logger.info(
-                "Gate WS: subscribed futures.order_book payload=%s", data.get("result")
+                "Gate WS: subscribed to futures.order_book: %s", data.get("result")
             )
-            continue
-
-        if event == "error":
-            logger.error("Gate WS: subscription error %s", data)
             continue
         if event != "update":
             continue
-
 
         ts = _now_ts(data.get("time") or data.get("time_ms"))
         for item in _extract_order_books(data.get("result")):
@@ -219,17 +211,13 @@ async def _consume_messages(
                 continue
 
             try:
-                last_price = _safe_float(item.get("last"))
                 store.upsert_order_book(
                     "gate",
                     symbol,
                     bids=top_bids or None,
                     asks=top_asks or None,
                     ts=book.ts or ts,
-
-                    last_price=last_price or None,
-                    last_price_ts=book.ts or ts,
-
+                    last_price=_safe_float(item.get("last")) or None,
                 )
             except Exception:
                 logger.exception("Gate WS: failed to upsert order book for %s", symbol)
@@ -269,19 +257,14 @@ async def run_gate(store: TickerStore, symbols: Sequence[Symbol]) -> None:
             )
             async with websockets.connect(
                 WS_URL, ping_interval=20, ping_timeout=20
-
-                payloads = [
-                    {
-                        "time": int(time.time()),
-                        "channel": "futures.order_book",
-                        "event": "subscribe",
-                        "payload": [contract, str(SUB_DEPTH), SUB_INTERVAL],
-                    }
-                    for contract in sorted(contracts)
-                ]
-                for msg in payloads:
-                    await ws.send(json.dumps(msg))
-
+            ) as ws:
+                sub = {
+                    "time": int(time.time()),
+                    "channel": "futures.order_book",
+                    "event": "subscribe",
+                    "payload": sorted(list(contracts)),
+                }
+                await ws.send(json.dumps(sub))
 
                 heartbeat_task = asyncio.create_task(_send_heartbeat(ws))
                 consume_task = asyncio.create_task(
