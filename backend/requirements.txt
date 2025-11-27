@@ -6,4 +6,3 @@ httpx>=0.27.0
 SQLAlchemy[asyncio]>=2.0.32
 asyncpg>=0.29.0
 alembic>=1.13.2
-gate-api>=7.1.30,<8.0.0
